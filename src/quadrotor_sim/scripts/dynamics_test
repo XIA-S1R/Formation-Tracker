@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# 启动脚本 dynamics_test，用于测试四旋翼仿真
+# 自动启动 roscore, rviz, 仿真节点, 然后轨迹发送脚本
+
+# 获取脚本目录和工作空间目录
+SCRIPT_DIR=$(dirname "$0")
+WORKSPACE_DIR=$(realpath "$SCRIPT_DIR/../../..")
+
+# 设置ROS环境
+source /opt/ros/noetic/setup.bash
+source "$WORKSPACE_DIR/devel/setup.bash"
+
+echo "Starting roscore in new terminal..."
+gnome-terminal --working-directory="$WORKSPACE_DIR" -- bash -c "source /opt/ros/noetic/setup.bash; source ./devel/setup.bash; roscore"
+sleep 3  # 等待roscore启动
+
+echo "Starting RViz in new terminal..."
+gnome-terminal --working-directory="$WORKSPACE_DIR" -- bash -c "source /opt/ros/noetic/setup.bash; source ./devel/setup.bash; roslaunch quadrotor_sim rviz.launch"
+sleep 3
+
+echo "Starting quadrotor simulation node in new terminal..."
+gnome-terminal --working-directory="$WORKSPACE_DIR" -- bash -c "source /opt/ros/noetic/setup.bash; source ./devel/setup.bash; rosrun quadrotor_sim quadrotor_sim_node"
+sleep 5
+
+echo "Starting trajectory publisher in new terminal..."
+gnome-terminal --working-directory="$WORKSPACE_DIR" -- bash -c "source /opt/ros/noetic/setup.bash; source ./devel/setup.bash; cd ./src/quadrotor_sim/scripts && python3 publish_trajectory.py"
+
+echo "All terminals started."

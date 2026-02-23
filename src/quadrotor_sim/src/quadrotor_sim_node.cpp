@@ -4,6 +4,8 @@
 #include <sensor_msgs/Imu.h>
 #include <visualization_msgs/Marker.h>
 #include <tf/transform_datatypes.h>
+#include <tf/tf.h>
+#include <tf/transform_broadcaster.h>
 #include <cmath>  // for atan2, M_PI
 #include "quadrotor_sim/quadrotor_dynamics.hpp"
 
@@ -19,9 +21,9 @@ public:
         marker_pub = nh.advertise<visualization_msgs::Marker>("visualization_marker", 1);
 
         // 初始化期望状态
-        desired_pose.position.x = 0;
-        desired_pose.position.y = 0;
-        desired_pose.position.z = 0;
+        desired_pose.position.x = 1.0;
+        desired_pose.position.y = 0.0;
+        desired_pose.position.z = 1.0;
         desired_pose.orientation = tf::createQuaternionMsgFromYaw(0);
 
         // 初始化当前加速度
@@ -39,6 +41,9 @@ public:
             ros::spinOnce();
             // 推进动力学：基于期望和当前状态解算运动
             quad.update(desired_pose, quad.pose, quad.twist, current_accel, 0.01);
+            ROS_INFO("Desired: x=%.2f y=%.2f z=%.2f, Current: x=%.2f y=%.2f z=%.2f", 
+                     desired_pose.position.x, desired_pose.position.y, desired_pose.position.z,
+                     quad.pose.position.x, quad.pose.position.y, quad.pose.position.z);
             publish();
             rate.sleep();
         }
@@ -68,26 +73,35 @@ private:
         imu.linear_acceleration = current_accel.linear;
         imu_pub.publish(imu);
 
-        // Marker：可视化无人机位置
+        // 发布TF变换
+        tf::Transform transform;
+        transform.setOrigin(tf::Vector3(quad.pose.position.x, quad.pose.position.y, quad.pose.position.z));
+        tf::Quaternion q(quad.pose.orientation.x, quad.pose.orientation.y, quad.pose.orientation.z, quad.pose.orientation.w);
+        transform.setRotation(q);
+        broadcaster.sendTransform(tf::StampedTransform(transform, now, "world", "quadrotor"));
+
+        // Marker：可视化无人机位置和姿态
         visualization_msgs::Marker marker;
         marker.header = odom.header;
         marker.id = 0;
-        marker.type = visualization_msgs::Marker::CUBE;
+        marker.type = visualization_msgs::Marker::MESH_RESOURCE;
         marker.action = visualization_msgs::Marker::ADD;
         marker.pose = quad.pose;
-        marker.scale.x = 0.5;
-        marker.scale.y = 0.5;
-        marker.scale.z = 0.1;
-        marker.color.r = 1.0;
-        marker.color.g = 0.0;
-        marker.color.b = 0.0;
+        marker.scale.x = 1.0;
+        marker.scale.y = 1.0;
+        marker.scale.z = 1.0;
+        marker.color.r = 0.5;
+        marker.color.g = 0.5;
+        marker.color.b = 0.5;
         marker.color.a = 1.0;
+        marker.mesh_resource = "package://quadrotor_sim/models/quadrotor.stl";
         marker_pub.publish(marker);
     }
 
     ros::NodeHandle nh;
     ros::Subscriber pose_sub;
     ros::Publisher odom_pub, imu_pub, marker_pub;
+    tf::TransformBroadcaster broadcaster;
     QuadrotorDynamics quad;
     geometry_msgs::Pose desired_pose;
     geometry_msgs::Accel current_accel;

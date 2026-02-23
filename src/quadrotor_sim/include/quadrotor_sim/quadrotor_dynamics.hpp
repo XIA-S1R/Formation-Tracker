@@ -1,12 +1,14 @@
 #ifndef QUADROTOR_DYNAMICS_HPP
 #define QUADROTOR_DYNAMICS_HPP
 
+#include <ros/ros.h>
 #include <geometry_msgs/Pose.h>
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/Accel.h>
 #include <tf/transform_datatypes.h>
 #include <Eigen/Dense>
 
+using namespace Eigen;
 using Vector3 = Eigen::Vector3d;
 
 class QuadrotorDynamics {
@@ -23,7 +25,10 @@ public:
         I(2,2) = 0.02;  // Iz
 
         // 位置控制增益 Kp
-        Kp = 1.0;
+        Kp = 5.0;
+
+        // 速度控制增益 Kd
+        Kd = 4.0;
 
         // 姿态控制增益KR和角速度控制增益Kw
         KR = 1.0;
@@ -31,6 +36,19 @@ public:
 
         // 重力向量
         g_vector = Eigen::Vector3d(0, 0, -g);
+
+        // 初始化状态
+        pose.position.x = 0;
+        pose.position.y = 0;
+        pose.position.z = 0;
+        pose.orientation = tf::createQuaternionMsgFromYaw(0);
+
+        twist.linear.x = 0;
+        twist.linear.y = 0;
+        twist.linear.z = 0;
+        twist.angular.x = 0;
+        twist.angular.y = 0;
+        twist.angular.z = 0;
     }
 
     // 更新动力学：基于期望位置/偏航 + 当前状态，解算运动
@@ -44,18 +62,26 @@ public:
                           desired_pose.position.y - current_pose.position.y,
                           desired_pose.position.z - current_pose.position.z);
 
-        // 所需推力加速度向量
-        Vector3 a_T = Kp * pos_error + g_vector;
+        // 速度误差向量
+        Vector3 vel_error(0-current_twist.linear.x,
+                          0-current_twist.linear.y,
+                          0-current_twist.linear.z);
+
+        // 所需推力加速度向量（PD控制）
+        Vector3 a_T = Kp * pos_error + Kd * vel_error - g_vector;
+        ROS_INFO("a_T: %f, %f, %f", a_T[0], a_T[1], a_T[2]);
+        // 作用于无人机上的总加速度
+        Vector3 a_total = a_T + g_vector;
 
         // 更新当前加速度
-        current_accel.linear.x = a_T[0];
-        current_accel.linear.y = a_T[1];
-        current_accel.linear.z = a_T[2];
+        current_accel.linear.x = a_total[0];
+        current_accel.linear.y = a_total[1];
+        current_accel.linear.z = a_total[2];
 
         // 积分加速度到速度
-        current_twist.linear.x += a_T[0] * dt;
-        current_twist.linear.y += a_T[1] * dt;
-        current_twist.linear.z += a_T[2] * dt;
+        current_twist.linear.x += a_total[0] * dt;
+        current_twist.linear.y += a_total[1] * dt;
+        current_twist.linear.z += a_total[2] * dt;
 
         // 积分速度到位置
         current_pose.position.x += current_twist.linear.x * dt;
@@ -63,10 +89,10 @@ public:
         current_pose.position.z += current_twist.linear.z * dt;
 
         // 构建期望姿态 R_desired
-        double norm_a_T = norm(a_T);
+        double norm_a_T = a_T.norm();
         if (norm_a_T > 1e-6) {  // 避免除零
             // 期望机体z轴方向 b3
-            Vector3 b3 = normalize(a_T);
+            Vector3 b3 = a_T.normalized();
 
             // 期望偏航角
             double desired_yaw = tf::getYaw(desired_pose.orientation);
@@ -75,15 +101,15 @@ public:
             Vector3 b1_c(cos(desired_yaw), sin(desired_yaw), 0);
 
             // 期望机体y轴方向 b2
-            Vector3 b2 = cross(b3, b1_c);
-            b2 = normalize(b2);
+            Vector3 b2 = b3.cross(b1_c);
+            b2 = b2.normalized();
             if (b2.norm() < 1e-6) {
                 // 如果 b2 为零，使用默认
                 b2 = Eigen::Vector3d(-sin(desired_yaw), cos(desired_yaw), 0);
             }
 
             // 期望机体x轴方向 b1
-            Vector3 b1 = cross(b2, b3);
+            Vector3 b1 = b2.cross(b3);
 
             // 期望旋转矩阵 R_desired
             Eigen::Matrix3d R_desired;
@@ -131,7 +157,9 @@ public:
         // 积分角速度到姿态
         Eigen::Quaterniond q_current(current_pose.orientation.w, current_pose.orientation.x, current_pose.orientation.y, current_pose.orientation.z);
         Eigen::Vector3d omega(current_twist.angular.x, current_twist.angular.y, current_twist.angular.z);
-        Eigen::Quaterniond q_dot = 0.5 * q_current * Eigen::Quaterniond(0, omega[0], omega[1], omega[2]);
+        Eigen::Quaterniond omega_quat(0, omega[0], omega[1], omega[2]);
+        Eigen::Quaterniond q_dot = q_current * omega_quat;
+        q_dot.coeffs() *= 0.5;
         q_current.coeffs() += q_dot.coeffs() * dt;
         q_current.normalize();
         current_pose.orientation.w = q_current.w();
@@ -141,10 +169,13 @@ public:
     }
 
     double mass, g;
-    double K;
+    double Kp;  
+    double Kd;
     Eigen::Matrix3d I;
     double KR, Kw;
     Vector3 g_vector;
+    geometry_msgs::Pose pose;  
+    geometry_msgs::Twist twist;  
 };
 
 #endif
