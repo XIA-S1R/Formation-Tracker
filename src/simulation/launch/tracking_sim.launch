@@ -1,0 +1,41 @@
+<launch>
+  <!-- Map generator -->
+  <node pkg="mockamap" type="mockamap_node" name="mockamap_node" output="screen">
+    <rosparam file="$(find uav_simulator)/config/mockamap.yaml"/>
+    <remap from="/mock_map" to="/global_map"/>
+  </node>
+
+  <!-- Target simulation -->
+  <group ns="target">
+    <node pkg="nodelet" type="nodelet" name="manager" args="manager" output="screen">
+      <param name="num_worker_threads" value="16"/>
+    </node>
+    <node pkg="nodelet" type="nodelet" name="so3_quadrotor" args="load so3_quadrotor/Nodelet manager" output="screen">
+      <rosparam file="$(find uav_simulator)/config/so3_quadrotor.yaml"/>
+      <param name="init_x" value="5" />
+      <param name="init_y" value="0" />
+      <param name="init_z" value="2" />
+      <remap from="~odom" to="odom"/>
+      <remap from="~imu" to="imu"/>
+    </node>
+  </group>
+
+  <!-- Target estimation -->
+  <node name="target_estimator" pkg="target_estimation" type="target_ekf_node" output="screen">
+    <remap from="~target_odom" to="/target_odom"/>
+  </node>
+
+  <!-- Swarm planning for drone 0 -->
+  <group ns="drone0">
+    <include file="$(find swarm_planning)/launch/run_in_sim.launch">
+      <arg name="drone_id" value="0"/>
+      <arg name="map_size_x_" value="20"/>
+      <arg name="map_size_y_" value="20"/>
+      <arg name="map_size_z_" value="5"/>
+      <arg name="target_z" value="2"/>
+    </include>
+  </group>
+
+  <!-- Add more drones as needed -->
+
+</launch>

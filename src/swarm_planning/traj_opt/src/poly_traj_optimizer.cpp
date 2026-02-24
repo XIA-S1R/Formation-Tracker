@@ -806,5 +806,6 @@ namespace ego_planner
              r e t u r n   t r u e ; 
          } 
          r e t u r n   f a l s e ; 
-     }  
+     } 
+ 
  
