@@ -1,5 +1,5 @@
 # Tracking-in-Formation
-这是一个融合 Elastic-Tracker 跟踪能力和 Swarm-Formation 编队优化的 ROS 项目，使无人机群体能够协作跟踪目标。
+这是一个融合跟踪能力和编队优化的 ROS 项目，使无人机群体能够协作跟踪目标。
 
 ## 安装
 1. 克隆项目到 catkin 工作空间。
