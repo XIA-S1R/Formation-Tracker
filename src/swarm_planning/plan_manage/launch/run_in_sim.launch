@@ -31,6 +31,7 @@
     <arg name="obstacle_clearance"/>
     <arg name="swarm_clearance"/>
     <arg name="replan_trajectory_time"/>
+    <arg name="target_type" value="0"/>
     
     <!-- topic of your odometry such as VIO or LIO -->
     <arg name="odom_topic"/>
@@ -96,6 +97,7 @@
         <arg name="point3_x" value="0.0" />
         <arg name="point3_y" value="0.0" />
         <arg name="point3_z" value="0.0" />
+        <arg name="target_type" value="$(arg target_type)" />
 
     </include>
     <!-- trajectory server -->

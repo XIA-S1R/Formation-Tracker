@@ -1,4 +1,3 @@
-
 cmake_minimum_required(VERSION 2.8.3)
 project(target_ekf)
 
@@ -12,6 +11,8 @@ find_package(catkin REQUIRED COMPONENTS
   nav_msgs
   geometry_msgs
   tracking_msgs
+  object_detection_msgs
+  quadrotor_msgs
   message_filters
   Eigen3 REQUIRED
 )

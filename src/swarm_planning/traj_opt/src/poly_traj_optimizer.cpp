@@ -758,6 +758,7 @@ namespace ego_planner
     nh.param("optimization/obstacle_clearance", obs_clearance_, -1.0);
     nh.param("optimization/swarm_clearance", swarm_clearance_, -1.0);
     nh.param("optimization/formation_type", formation_type_, -1);
+    nh.param("optimization/formation_size", formation_size_, 3);
     nh.param("optimization/max_vel", max_vel_, -1.0);
     nh.param("optimization/max_acc", max_acc_, -1.0);
 
@@ -787,25 +788,26 @@ namespace ego_planner
 
   void PolyTrajOptimizer::setDroneId(const int drone_id)
   {
-    drone_id_ = drone_id;}
+    drone_id_ = drone_id;
+  }
 
-}    v o i d   P o l y T r a j O p t i m i z e r : : t a r g e t C a l l b a c k ( c o n s t   n a v _ m s g s : : O d o m e t r y C o n s t P t r   & m s g ) 
-     { 
-         t a r g e t _ o d o m _   =   * m s g ; 
-     } 
- 
-     b o o l   P o l y T r a j O p t i m i z e r : : t r a c k i n g G r a d C o s t P ( c o n s t   E i g e n : : V e c t o r 3 d   & p ,   E i g e n : : V e c t o r 3 d   & g r a d p ,   d o u b l e   & c o s t p ) 
-     { 
-         E i g e n : : V e c t o r 3 d   t a r g e t _ p o s ( t a r g e t _ o d o m _ . p o s e . p o s e . p o s i t i o n . x ,   t a r g e t _ o d o m _ . p o s e . p o s e . p o s i t i o n . y ,   t a r g e t _ o d o m _ . p o s e . p o s e . p o s i t i o n . z ) ; 
-         E i g e n : : V e c t o r 3 d   d i f f   =   p   -   t a r g e t _ p o s ; 
-         d o u b l e   d i s t   =   d i f f . n o r m ( ) ; 
-         i f   ( d i s t   >   0 . 1 )     / /   i f   f a r   f r o m   t a r g e t 
-         { 
-             c o s t p   =   w e i _ t r a c k i n g _   *   d i s t   *   d i s t ; 
-             g r a d p   =   w e i _ t r a c k i n g _   *   2   *   d i f f ; 
-             r e t u r n   t r u e ; 
-         } 
-         r e t u r n   f a l s e ; 
-     } 
- 
- 
+  void PolyTrajOptimizer::targetCallback(const nav_msgs::OdometryConstPtr &msg)
+  {
+    target_odom_ = *msg;
+  }
+
+  bool PolyTrajOptimizer::trackingGradCostP(const Eigen::Vector3d &p, Eigen::Vector3d &gradp, double &costp)
+  {
+    Eigen::Vector3d target_pos(target_odom_.pose.pose.position.x, target_odom_.pose.pose.position.y, target_odom_.pose.pose.position.z);
+    Eigen::Vector3d diff = p - target_pos;
+    double dist = diff.norm();
+    if (dist > 0.1) // if far from target
+    {
+      costp = wei_tracking_ * dist * dist;
+      gradp = wei_tracking_ * 2 * diff;
+      return true;
+    }
+    return false;
+  }
+
+} // end of namespace

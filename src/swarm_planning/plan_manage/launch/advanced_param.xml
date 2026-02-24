@@ -35,6 +35,7 @@
   <arg name="use_distinctive_trajs"/>
   <arg name="obj_num_set"/>
   <arg name="drone_id"/>
+  <arg name="target_type"/>
   <!-- <arg name="formation_type"/>
   <arg name="weight_obstacle"/>
   <arg name="weight_swarm"/>
@@ -165,6 +166,7 @@
     <param name="optimization/max_vel"                      value="$(arg max_vel)" type="double"/>
     <param name="optimization/max_acc"                      value="$(arg max_acc)" type="double"/>
     <!-- <param name="optimization/formation_type"               value="$(arg formation_type)"/> -->
+    <param name="optimization/target_type"                  value="$(arg target_type)"/>
     
     <param name="optimization/record_opt" value="true"/>
   </node>

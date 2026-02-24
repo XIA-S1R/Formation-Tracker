@@ -1,3 +1,4 @@
+//目标状态估计节点，接收yolo检测结果和无人机里程计，经过坐标变换和EKF滤波，发布目标的状态估计结果（滤波后的和滤波前的）
 #include <ros/ros.h>
 #include <Eigen/Geometry>
 #include <message_filters/subscriber.h>
