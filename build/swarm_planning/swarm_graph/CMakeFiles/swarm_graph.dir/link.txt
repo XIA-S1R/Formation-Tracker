@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC   -shared -Wl,-soname,libswarm_graph.so -o /home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/devel/lib/libswarm_graph.so CMakeFiles/swarm_graph.dir/src/swarm_graph.cpp.o 

@@ -12,7 +12,7 @@
     <node pkg="target_ekf" name="target_ekf_sim_node" type="target_ekf_sim_node" output="screen">
       <rosparam command="load" file="$(find target_ekf)/config/camera.yaml" />
       <param name="pitch_thr" value="37"/>
-      <remap from="~yolo" to="/target/odom"/>
+      <remap from="~yolo" to="/target/odom"/><!-- 仿真中，对目标的观测直接采用读取目标的里程计的方式 -->
       <remap from="~odom" to="odom"/>
       <remap from="~target_odom" to="/target_ekf_odom"/>
     </node>

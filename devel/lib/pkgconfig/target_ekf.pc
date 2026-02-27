@@ -1,0 +1,8 @@
+prefix=/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/devel
+
+Name: target_ekf
+Description: Description of target_ekf
+Version: 0.0.0
+Cflags: -I/usr/include/eigen3
+Libs: -L${prefix}/lib 
+Requires: object_detection_msgs

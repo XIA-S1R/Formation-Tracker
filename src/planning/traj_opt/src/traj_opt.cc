@@ -427,7 +427,7 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
   return true;
 }
 
-void TrajOpt::addTimeIntPenalty(double& cost) {
+void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度约束、加速度约束代价，并加到总成本中；同时计算这些约束的梯度，并加到总梯度中
   Eigen::Vector3d pos, vel, acc, jer;
   Eigen::Vector3d grad_tmp;
   double cost_tmp;
@@ -439,27 +439,27 @@ void TrajOpt::addTimeIntPenalty(double& cost) {
   double omg;
 
   int innerLoop;
-  for (int i = 0; i < N_; ++i) {
-    const auto& c = jerkOpt_.b.block<6, 3>(i * 6, 0);
-    step = jerkOpt_.T1(i) / K_;
-    s1 = 0.0;
+  for (int i = 0; i < N_; ++i) {//i为每段轨迹的索引
+    const auto& c = jerkOpt_.b.block<6, 3>(i * 6, 0);//取多项式系数矩阵的第i段轨迹的系数矩阵
+    step = jerkOpt_.T1(i) / K_;//每段轨迹内的采样步长
+    s1 = 0.0;//s1为采样点在当前端轨迹的时间
     innerLoop = K_ + 1;
 
     const auto& hPoly = cfgHs_[i / 2];
-    for (int j = 0; j < innerLoop; ++j) {
+    for (int j = 0; j < innerLoop; ++j) {//j为每段轨迹内的采样点索引
       s2 = s1 * s1;
       s3 = s2 * s1;
       s4 = s2 * s2;
       s5 = s4 * s1;
-      beta0 << 1.0, s1, s2, s3, s4, s5;
-      beta1 << 0.0, 1.0, 2.0 * s1, 3.0 * s2, 4.0 * s3, 5.0 * s4;
-      beta2 << 0.0, 0.0, 2.0, 6.0 * s1, 12.0 * s2, 20.0 * s3;
-      beta3 << 0.0, 0.0, 0.0, 6.0, 24.0 * s1, 60.0 * s2;
-      alpha = 1.0 / K_ * j;
+      beta0 << 1.0, s1, s2, s3, s4, s5;//多项式轨迹就是a0+a1*s1+a2*s1^2+...，beta0就是每个系数前的s1的幂次项
+      beta1 << 0.0, 1.0, 2.0 * s1, 3.0 * s2, 4.0 * s3, 5.0 * s4;//多项式轨迹求导的速度表达式，beta1就是每个系数前的s1的幂次项
+      beta2 << 0.0, 0.0, 2.0, 6.0 * s1, 12.0 * s2, 20.0 * s3;//...
+      beta3 << 0.0, 0.0, 0.0, 6.0, 24.0 * s1, 60.0 * s2;//...
+      alpha = 1.0 / K_ * j;//alpha为当前采样点在当前段轨迹内的归一化时间，范围[0,1]
       pos = c.transpose() * beta0;
       vel = c.transpose() * beta1;
       acc = c.transpose() * beta2;
-      jer = c.transpose() * beta3;
+      jer = c.transpose() * beta3;//计算出采样点的pos到jerk
 
       omg = (j == 0 || j == innerLoop - 1) ? 0.5 : 1.0;
 

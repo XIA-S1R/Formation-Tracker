@@ -164,8 +164,8 @@ class MinJerkOpt {
   Eigen::Matrix3d headPVA;
   Eigen::Matrix3d tailPVA;
   Eigen::VectorXd T1;
-  BandedSystem A;
-  Eigen::MatrixXd b;
+  BandedSystem A;// 用于根据P和T求解多项式系数的辅助矩阵
+  Eigen::MatrixXd b;// 6N*3的矩阵，每6行对应一段轨迹的系数a5~a0，3列分别对应x/y/z维度
 
   // Temp variables
   Eigen::VectorXd T2;
@@ -276,7 +276,7 @@ class MinJerkOpt {
     return;
   }
 
-  inline void calGrads_CT() {
+  inline void calGrads_CT() {//计算jerk代价对T和C的梯度
     gdT.setZero();
     gdC.setZero();
     // addGradJbyC
@@ -303,7 +303,7 @@ class MinJerkOpt {
     return;
   }
 
-  inline void calGrads_PT() {
+  inline void calGrads_PT() {//原来：用多项式曲线(C(P,T),T)表示轨迹，计算代价对P和T的梯度。现在：用MINCO曲线(P,T)表示轨迹，计算代价对P和T的梯度。
     A.solveAdj(gdC);
     gdP.setZero();
     // addPropCtoP
@@ -357,7 +357,7 @@ class MinJerkOpt {
     return;
   }
 
-  inline double getTrajJerkCost() const {
+  inline double getTrajJerkCost() const {//计算jerk代价
     double objective = 0.0;
     for (int i = 0; i < N; i++) {
       objective += 36.0 * b.row(6 * i + 3).squaredNorm() * T1(i) +

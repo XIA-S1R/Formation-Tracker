@@ -1,0 +1,8 @@
+prefix=/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/install
+
+Name: swarm_graph
+Description: Description of swarm_graph
+Version: 0.0.0
+Cflags: -I${prefix}/include
+Libs: -L${prefix}/lib -lswarm_graph
+Requires: message_runtime roscpp std_msgs tf

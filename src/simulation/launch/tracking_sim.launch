@@ -10,7 +10,7 @@
     <node pkg="nodelet" type="nodelet" name="manager" args="manager" output="screen">
       <param name="num_worker_threads" value="16"/>
     </node>
-    <node pkg="nodelet" type="nodelet" name="so3_quadrotor" args="load so3_quadrotor/Nodelet manager" output="screen">
+    <node pkg="nodelet" type="nodelet" name="so3_quadrotor" args="load so3_quadrotor/Nodelet manager" output="screen"><!-- 目标无人机的动力学仿真节点，接收SO3指令，发布里程计、imu、可视化消息 -->
       <rosparam file="$(find uav_simulator)/config/so3_quadrotor.yaml"/>
       <param name="init_x" value="5" />
       <param name="init_y" value="0" />
@@ -20,7 +20,7 @@
       <remap from="~so3cmd" to="so3cmd"/>
       <remap from="~vis" to="vis"/>
     </node>
-    <node pkg="nodelet" type="nodelet" name="so3_controller" args="load so3_controller/Nodelet manager" output="screen">
+    <node pkg="nodelet" type="nodelet" name="so3_controller" args="load so3_controller/Nodelet manager" output="screen"><!-- 目标无人机的控制器节点，接收位置控制指令、里程计、imu，发布SO3指令给动力学仿真节点 -->
       <rosparam file="$(find uav_simulator)/config/so3_controller.yaml"/>
       <remap from="~odom" to="odom"/>
       <remap from="~imu" to="imu" />
@@ -52,21 +52,21 @@
 
       <param name="plan_hz" value="20"/>
 
-      <param name="K" value="8"/>
+      <param name="K" value="8"/> <!-- 计算代价时，每段轨迹内的采样点数 -->
       <param name="vmax" value="1.5"/>
       <param name="amax" value="2.5"/>
-      <param name="rhoT" value="100.0"/>
-      <param name="rhoP" value="10000.0"/>
-      <param name="rhoV" value="1000.0"/>
-      <param name="rhoA" value="1000.0"/>
-      <param name="clearance_d" value="0.2"/>
-      <param name="tolerance_d" value="0.5"/>
+      <param name="rhoT" value="100.0"/><!-- 轨迹总时间成本的权重 -->
+      <param name="rhoP" value="10000.0"/><!-- 避障成本的权重 -->
+      <param name="rhoV" value="1000.0"/><!-- 速度约束成本的权重 -->
+      <param name="rhoA" value="1000.0"/><!-- 加速度约束成本的权重 -->
+      <param name="clearance_d" value="0.2"/><!-- 距离障碍的安全间隙 -->
+      <param name="tolerance_d" value="0.5"/><!--与目标距离的容忍度，可以在这个幅度内有微小偏差 -->
       <param name="tracking_dist" value="3.0"/>
       <param name="debug" value="false"/>
       <param name="fake" value="true"/>
 
     </node>
-    <node pkg="planning" name="traj_server" type="traj_server" output="screen">
+    <node pkg="planning" name="traj_server" type="traj_server" output="screen"><!-- 轨迹发布节点，将规划的轨迹转化为位置控制指令发送给target/position_cmd话题 -->
       <remap from="~position_cmd" to="position_cmd"/>
       <remap from="~trajectory" to="trajectory"/>
       <remap from="~heartbeat" to="heartbeat"/>

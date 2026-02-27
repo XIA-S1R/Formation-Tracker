@@ -1,0 +1,8 @@
+prefix=/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/devel
+
+Name: plan_env
+Description: Description of plan_env
+Version: 0.0.0
+Cflags: -I/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/src/swarm_planning/plan_env/include
+Libs: -L${prefix}/lib -lplan_env
+Requires: roscpp std_msgs

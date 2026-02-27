@@ -438,14 +438,14 @@ class Nodelet : public nodelet::Nodelet {
     while (odom_lock_.test_and_set())
       ;
     auto odom_msg = odom_msg_;
-    odom_lock_.clear();
+    odom_lock_.clear();//odom_lock_用于保证读取odom_msg_时的线程安全
     Eigen::Vector3d odom_p(odom_msg.pose.pose.position.x,
                            odom_msg.pose.pose.position.y,
                            odom_msg.pose.pose.position.z);
     Eigen::Vector3d odom_v(odom_msg.twist.twist.linear.x,
                            odom_msg.twist.twist.linear.y,
                            odom_msg.twist.twist.linear.z);
-    if (!triger_received_) {
+    if (!triger_received_) {//目标需要收到RVIZ NavigateTo话题才会启动规划
       return;
     }
     // NOTE force-hover: waiting for the speed of drone small enough
@@ -456,7 +456,7 @@ class Nodelet : public nodelet::Nodelet {
     // NOTE local goal
     Eigen::Vector3d local_goal;
     Eigen::Vector3d delta = goal_ - odom_p;
-    if (delta.norm() < 15) {
+    if (delta.norm() < 15) {//规划半径15m
       local_goal = goal_;
     } else {
       local_goal = delta.normalized() * 15 + odom_p;
@@ -467,17 +467,17 @@ class Nodelet : public nodelet::Nodelet {
       ;
     gridmapPtr_->from_msg(map_msg_);
     replanStateMsg_.occmap = map_msg_;
-    gridmap_lock_.clear();
+    gridmap_lock_.clear();//gridmap_lock_用于保证读取map_msg_时的线程安全
 
     // NOTE determin whether to replan
-    bool no_need_replan = false;
+    bool no_need_replan = false;//一般情况下局部目标点不断更新，每有所更新就触发重规划
     if (!force_hover_ && !wait_hover_) {
-      double last_traj_t_rest = traj_poly_.getTotalDuration() - (ros::Time::now() - replan_stamp_).toSec();
-      bool new_goal = (local_goal - traj_poly_.getPos(traj_poly_.getTotalDuration())).norm() > tracking_dist_;
+      double last_traj_t_rest = traj_poly_.getTotalDuration() - (ros::Time::now() - replan_stamp_).toSec();//上次规划的轨迹剩余时间
+      bool new_goal = (local_goal - traj_poly_.getPos(traj_poly_.getTotalDuration())).norm() > tracking_dist_;//因为goal_是一直在更新的，local_goal也在一直更新。目前的轨迹是上一次基于上一次replan时的local_goal的，如果当前轨迹的终点和local_goal距离大于tracking_dist_，则认为有更新的目标
       if (!new_goal) {
         if (last_traj_t_rest < 1.0) {
           ROS_WARN("[planner] NEAR GOAL...");
-          no_need_replan = true;
+          no_need_replan = true;//没有更新的目标，当前轨迹的终点就是最终目标点。并且当前轨迹快要结束了，不需要重新规划
         } else if (validcheck(traj_poly_, replan_stamp_, last_traj_t_rest)) {
           ROS_WARN("[planner] NO NEED REPLAN...");
           double t_delta = traj_poly_.getTotalDuration() < 1.0 ? traj_poly_.getTotalDuration() : 1.0;
@@ -486,12 +486,12 @@ class Nodelet : public nodelet::Nodelet {
           Eigen::Vector3d dp = un_known_p - odom_p;
           double yaw = std::atan2(dp.y(), dp.x());
           pub_traj(traj_poly_, yaw, replan_stamp_);
-          no_need_replan = true;
+          no_need_replan = true;//没有更新的目标，当前轨迹的终点就是最终目标点。并且当前轨迹在剩余时间内都是安全的，那么不重新规划，并且微调轨迹让无人机偏航角正对行进方向
         }
       }
     }
     // NOTE determin whether to pub hover
-    if ((goal_ - odom_p).norm() < tracking_dist_ + tolerance_d_ && odom_v.norm() < 0.1) {
+    if ((goal_ - odom_p).norm() < tracking_dist_ + tolerance_d_ && odom_v.norm() < 0.1) {//已经接近目标点了，并且速度很小，认为到达目标点，可以悬停了
       if (!wait_hover_) {
         pub_hover_p(odom_p, ros::Time::now());
         wait_hover_ = true;
@@ -511,12 +511,12 @@ class Nodelet : public nodelet::Nodelet {
     Eigen::MatrixXd iniState;
     iniState.setZero(3, 3);
     ros::Time replan_stamp = ros::Time::now() + ros::Duration(0.03);
-    double replan_t = (replan_stamp - replan_stamp_).toSec();
-    if (force_hover_ || replan_t > traj_poly_.getTotalDuration()) {
+    double replan_t = (replan_stamp - replan_stamp_).toSec();//上次规划到现在的时间
+    if (force_hover_ || replan_t > traj_poly_.getTotalDuration()) {//上次规划的轨迹已经执行完了，就从当前状态重新规划
       // should replan from the hover state
       iniState.col(0) = odom_p;
       iniState.col(1) = odom_v;
-    } else {
+    } else {//上次规划的轨迹还没执行完就重规划，就从上次规划的轨迹状态重新规划，保证新轨迹和上次规划的轨迹衔接平滑
       // should replan from the last trajectory
       iniState.col(0) = traj_poly_.getPos(replan_t);
       iniState.col(1) = traj_poly_.getVel(replan_t);
@@ -528,10 +528,10 @@ class Nodelet : public nodelet::Nodelet {
 
     // NOTE generate an extra corridor
     Eigen::Vector3d p_start = iniState.col(0);
-    bool need_extra_corridor = iniState.col(1).norm() > 1.0;
+    bool need_extra_corridor = iniState.col(1).norm() > 1.0;//如果重规划时无人机速度很大就需要额外安全走廊
     Eigen::MatrixXd hPoly;
     std::pair<Eigen::Vector3d, Eigen::Vector3d> line;
-    if (need_extra_corridor) {
+    if (need_extra_corridor) {//额外安全走廊的规划逻辑就是当前位置沿着当前速度方向前进，直到碰撞或者前进1m，形成一个线段，然后以这个线段为中心生成一个走廊
       Eigen::Vector3d v_norm = iniState.col(1).normalized();
       line.first = p_start;
       double step = 0.1;
@@ -547,7 +547,7 @@ class Nodelet : public nodelet::Nodelet {
     }
     // NOTE path searching
     std::vector<Eigen::Vector3d> path;
-    bool generate_new_traj_success = envPtr_->astar_search(p_start, local_goal, path);
+    bool generate_new_traj_success = envPtr_->astar_search(p_start, local_goal, path);//env类中定义的A*搜索，已经集成了论文中所提的通向无遮挡区域的逻辑
     Trajectory traj;
     if (generate_new_traj_success) {
       visPtr_->visualize_path(path, "astar");
@@ -560,14 +560,14 @@ class Nodelet : public nodelet::Nodelet {
         keyPts.insert(keyPts.begin(), line);
       }
       envPtr_->visCorridor(hPolys);
-      visPtr_->visualize_pairline(keyPts, "keyPts");
+      visPtr_->visualize_pairline(keyPts, "keyPts");//生成了安全走廊hPolys（每个元素表示每段走廊的多边形数据），每段走廊的代表线段keyPts
 
       // NOTE trajectory optimization
       Eigen::MatrixXd finState;
       finState.setZero(3, 3);
       finState.col(0) = path.back();
       // return;
-      generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, hPolys, traj);
+      generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, hPolys, traj);//轨迹优化！！
       visPtr_->visualize_traj(traj, "traj");
     }
 

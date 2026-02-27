@@ -1,0 +1,18 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/src/uav_simulator/odom_vis/pose_utils/include/pose_utils.h
+iostream
+-
+armadillo
+/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/src/uav_simulator/odom_vis/pose_utils/include/armadillo
+
+/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/src/uav_simulator/odom_vis/pose_utils/src/pose_utils.cpp
+pose_utils.h
+/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/src/uav_simulator/odom_vis/pose_utils/src/pose_utils.h
+

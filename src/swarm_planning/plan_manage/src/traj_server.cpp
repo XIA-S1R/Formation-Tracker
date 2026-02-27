@@ -214,7 +214,7 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, ros:
   return yaw_yawdot;
 }
 
-void cmdCallback(const ros::TimerEvent &e)
+void cmdCallback(const ros::TimerEvent &e)//每隔0.01秒计算当前轨迹点位置、速度、加速度、偏航与偏航角速率，发布给/position_cmd
 {
   /* no publishing before receive traj_ */
   if (!receive_traj_)
@@ -241,10 +241,10 @@ void cmdCallback(const ros::TimerEvent &e)
     pos = traj_->getPos(t_cur);
     vel = traj_->getVel(t_cur);
     acc = traj_->getAcc(t_cur);
-    jerk = traj_->getJer(t_cur);
+    jerk = traj_->getJer(t_cur);//将轨迹点填充到指令中
 
     /*** calculate yaw ***/
-    yaw_yawdot = calculate_yaw(t_cur, pos, time_now, time_last);
+    yaw_yawdot = calculate_yaw(t_cur, pos, time_now, time_last);//yaw计算目前采用使偏航角对准前进方向的策略，未来可改进
     /*** calculate yaw ***/
 
     double tf = std::min(traj_duration_, t_cur + 2.0);
@@ -310,7 +310,7 @@ int main(int argc, char **argv)
   std::string name_drone = ros::this_node::getName();
   std::vector<std::string> v{explode(name_drone, '_')};
   // drone_id_ = std::stoi(v[1]);
-  result_file.open(result_dir+v[1]+"_vaj.txt", std::ios::out);
+  result_file.open(result_dir+v[1]+"_vaj.txt", std::ios::out);//记录无人机运行数据的报告文件
 
   ros::Subscriber poly_traj_sub = nh.subscribe("planning/trajectory", 10, polyTrajCallback);
   ros::Subscriber reached_sub = nh.subscribe("planning/finish", 10, finishCallback);

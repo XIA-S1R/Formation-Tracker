@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>simulation</name>
+  <version>0.0.0</version>
+  <description>Simulation for tracking in formation</description>
+  <maintainer email="user@todo.todo">user</maintainer>
+  <license>TODO</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>roscpp</depend>
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>uav_simulator</depend>
+  <depend>target_estimation</depend>
+  <depend>swarm_planning</depend>
+</package>

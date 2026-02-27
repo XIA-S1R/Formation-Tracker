@@ -160,17 +160,17 @@ static inline double objectiveFunc(void* ptrObj,
   Eigen::VectorXd T(obj.N_);
   Eigen::MatrixXd P(3, obj.N_ - 1);
   forwardT(t, T);
-  forwardP(p, obj.cfgVs_, P);
+  forwardP(p, obj.cfgVs_, P);//从x中提取出优化变量t和p，并映射出原先的优化变量T和P
 
-  obj.jerkOpt_.generate(P, T);
-  double cost = obj.jerkOpt_.getTrajJerkCost();
-  obj.jerkOpt_.calGrads_CT();
-  obj.addTimeIntPenalty(cost);
-  obj.jerkOpt_.calGrads_PT();
-  obj.jerkOpt_.gdT.array() += obj.rhoT_;
-  cost += obj.rhoT_ * T.sum();
+  obj.jerkOpt_.generate(P, T);//用当前P和T生成MINCO轨迹
+  double cost = obj.jerkOpt_.getTrajJerkCost();//计算MINCO轨迹的jerk成本
+  obj.jerkOpt_.calGrads_CT();//计算jerk代价对C和T的成本
+  obj.addTimeIntPenalty(cost);//计算位置走廊约束、速度约束、加速度约束转化成的成本，并将它们加到总成本中；同时计算这些约束的梯度，并加到总梯度中
+  obj.jerkOpt_.calGrads_PT();//现在综合jerk代价和时间积分代价，它们对多项式曲线参数(C(P,T),T)的梯度已经计算出来了，接下来把它们转换为对MINCO曲线参数P和T的梯度
+  obj.jerkOpt_.gdT.array() += obj.rhoT_;//rhoT_*T.sum()是总时间成本，直接把rhoT_添加入代价对T的梯度。
+  cost += obj.rhoT_ * T.sum();//总成本加上总时间成本
   addLayerTGrad(t, obj.jerkOpt_.gdT, gradt);
-  addLayerPGrad(p, obj.cfgVs_, obj.jerkOpt_.gdP, gradp);
+  addLayerPGrad(p, obj.cfgVs_, obj.jerkOpt_.gdP, gradp);//将代价对MINCO曲线参数(P,T)的梯度转换为代价对优化变量p,t的梯度
 
   return cost;
 }
@@ -193,7 +193,7 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
                             const Eigen::MatrixXd& finState,
                             const std::vector<Eigen::MatrixXd>& hPolys,
                             Trajectory& traj) {
-  cfgHs_ = hPolys;
+  cfgHs_ = hPolys;//cfgHs_存储飞行走廊（每个元素表示每段走廊的多边形数据），cfgVs_存储飞行走廊的顶点
   if (cfgHs_.size() == 1) {
     cfgHs_.push_back(cfgHs_[0]);
   }
@@ -201,14 +201,14 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
     ROS_ERROR("extractVs fail!");
     return false;
   }
-  N_ = 2 * cfgHs_.size();
+  N_ = 2 * cfgHs_.size();// 一个走廊设置两个轨迹段
 
   // NOTE: one corridor two pieces
   dim_t_ = N_;
   dim_p_ = 0;
   for (const auto& cfgV : cfgVs_) {
     dim_p_ += cfgV.cols() - 1;
-  }
+  }//MINCO轨迹中T的维度为轨迹段数N，P的维度为所有轨迹段的控制点数之和（每段轨迹的控制点数为该段走廊顶点数减1）
   // std::cout << "dim_p_: " << dim_p_ << std::endl;
   p_.resize(dim_p_);
   t_.resize(dim_t_);
@@ -226,15 +226,15 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
   tempNorm = initS.col(2).norm();
   initS.col(2) *= tempNorm > amax_ ? (amax_ / tempNorm) : 1.0;
   tempNorm = finalS.col(2).norm();
-  finalS.col(2) *= tempNorm > amax_ ? (amax_ / tempNorm) : 1.0;
+  finalS.col(2) *= tempNorm > amax_ ? (amax_ / tempNorm) : 1.0;// 对初始状态和最终状态的速度和加速度进行限制，确保它们不超过最大速度vmax_和最大加速度amax_
 
   T.setConstant((finState.col(0) - iniState.col(0)).norm() / vmax_ / N_);
-  backwardT(T, t_);
+  backwardT(T, t_);//把正实数域的T微分同胚映射为实数域的t_
   for (int i = 0; i < N_ - 1; ++i) {
     int k = cfgVs_[i].cols() - 1;
     P.col(i) = cfgVs_[i].rightCols(k).rowwise().sum() / (1.0 + k) + cfgVs_[i].col(0);
-  }
-  backwardP(P, cfgVs_, p_);
+  }// 将每段走廊的顶点进行平均，得到每段轨迹的初始控制点位置P
+  backwardP(P, cfgVs_, p_);//把有避障约束的控制点位置P微分同胚映射为实数域的p_
   jerkOpt_.reset(initS, finalS, N_);
 
   // NOTE optimization
@@ -248,7 +248,7 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
   Eigen::Map<Eigen::VectorXd> t(x_, dim_t_);
   Eigen::Map<Eigen::VectorXd> p(x_ + dim_t_, dim_p_);
   t = t_;
-  p = p_;
+  p = p_;//将优化变量t和p的初始值赋给x_，准备进行优化
   double minObjective;
   auto opt_ret = lbfgs::lbfgs_optimize(dim_t_ + dim_p_, x_, &minObjective,
                                        &objectiveFunc, nullptr,
@@ -261,9 +261,9 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
     return false;
   }
   forwardT(t_, T);
-  forwardP(p_, cfgVs_, P);
+  forwardP(p_, cfgVs_, P);//优化完的t_和p_微分同胚映射得到优化后的T和P
   jerkOpt_.generate(P, T);
-  traj = jerkOpt_.getTraj();
+  traj = jerkOpt_.getTraj();//用T和P生成最终的轨迹traj
   delete[] x_;
   return true;
 }
