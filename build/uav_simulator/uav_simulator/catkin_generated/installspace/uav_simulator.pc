@@ -1,8 +1,0 @@
-prefix=/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/install
-
-Name: uav_simulator
-Description: Description of uav_simulator
-Version: 0.0.0
-Cflags: 
-Libs: -L${prefix}/lib 
-Requires: 

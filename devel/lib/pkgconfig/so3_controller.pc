@@ -1,8 +1,0 @@
-prefix=/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/devel
-
-Name: so3_controller
-Description: Description of so3_controller
-Version: 0.0.0
-Cflags: -I/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/src/uav_simulator/so3_controller/include -I/usr/include/eigen3
-Libs: -L${prefix}/lib 
-Requires: quadrotor_msgs roscpp nodelet

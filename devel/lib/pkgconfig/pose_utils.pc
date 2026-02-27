@@ -1,8 +1,0 @@
-prefix=/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/devel
-
-Name: pose_utils
-Description: Description of pose_utils
-Version: 0.0.0
-Cflags: -I/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/src/uav_simulator/odom_vis/pose_utils/include
-Libs: -L${prefix}/lib -lpose_utils
-Requires: 

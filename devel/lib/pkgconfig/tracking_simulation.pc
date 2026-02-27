@@ -1,8 +1,0 @@
-prefix=/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/devel
-
-Name: tracking_simulation
-Description: Description of tracking_simulation
-Version: 0.0.0
-Cflags: 
-Libs: -L${prefix}/lib 
-Requires: 

@@ -1,8 +1,0 @@
-prefix=/home/xia_s1r/Documents/FormaitionVSTracker/Formation-Tracker/install
-
-Name: simulation
-Description: Description of simulation
-Version: 0.0.0
-Cflags: 
-Libs: -L${prefix}/lib 
-Requires: 
