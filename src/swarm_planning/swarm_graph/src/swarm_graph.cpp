@@ -139,9 +139,9 @@ bool SwarmGraph::calcFGrad( Eigen::Vector3d &gradp, int idx ){
 
         //Ignore the machine epsilon
         if((dfde.transpose() * dedp).norm() > 1e-7){
-            gradp = (dfde.transpose() * dedp).normalized();
+            gradp = (dfde.transpose() * dedp).transpose();
         }else{
-            gradp = Eigen::VectorXd::Zero(3);
+            gradp = Eigen::Vector3d::Zero();
         }
         return true;
     }else{

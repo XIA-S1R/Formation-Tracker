@@ -3,10 +3,9 @@
   <arg name="rhosVisibility_"/>
   <arg name="rhoTracking_"/>
   <arg name="target_name_"/>
-
-  <!-- <node pkg="nodelet" type="nodelet" name="plan_manage" args="manager" output="screen">
-    <param name="num_worker_threads" value="16"/>
-  </node> -->
+  <!-- Formation args: drone_id (int), formation_type_ ("none"|"hexagon") -->
+  <arg name="drone_id"        default="0"/>
+  <arg name="formation_type_" default="none"/>
 
   <node pkg="nodelet" type="nodelet" name="planning" args="load planning/Nodelet manager" output="screen">
     <remap from="~odom" to="odom"/>
@@ -15,36 +14,48 @@
     <remap from="~trajectory" to="trajectory"/>
     <remap from="~replanState" to="replanState"/>
     <remap from="~target" to="$(arg target_name_)"/>
-    <remap from="~triger" to="/triger"/>
+    <remap from="~triger" to="/triger"/> <!-- 在追踪者的规划上，triger只作为启动开关，不决定目标位置 -->
     <remap from="~land_triger" to="/land_triger"/>
 
-    <param name="plan_hz" value="20"/>
+    <param name="plan_hz"        value="20"/>
+    <param name="K"              value="8"/>
+    <param name="vmax"           value="3.0"/>
+    <param name="amax"           value="6.0"/>
+    <param name="rhoT"           value="100.0"/>
+    <param name="rhoP"           value="10000.0"/>
+    <param name="rhoV"           value="1000.0"/>
+    <param name="rhoA"           value="1000.0"/>
+    <param name="rhoTracking"    value="$(arg rhoTracking_)"/><!-- 追踪成本的权重 -->
+    <param name="rhosVisibility" value="$(arg rhosVisibility_)"/><!-- 可视性成本的权重 -->
+    <param name="theta_clearance" value="0.8"/><!-- 距离可视区域边界的安全间隙 -->
+    <param name="clearance_d"    value="0.2"/>
+    <param name="tolerance_d"    value="0.3"/>
+    <param name="tracking_dist"  value="2.5"/><!-- 希望维持的跟踪距离 -->
+    <param name="tracking_dur"   value="3.0"/><!-- 跟踪规划规划未来3s的轨迹 -->
+    <param name="tracking_dt"    value="0.2"/><!-- 采样间隔，用于计算代价 -->
+    <param name="debug"          value="false"/>
 
-    <param name="K" value="8"/>
-    <param name="vmax" value="3.0"/>
-    <param name="amax" value="6.0"/>
-    <param name="rhoT" value="100.0"/>
-    <param name="rhoP" value="10000.0"/>
-    <param name="rhoV" value="1000.0"/>
-    <param name="rhoA" value="1000.0"/>
-    <param name="rhoTracking" value="$(arg rhoTracking_)"/>
-    <param name="rhosVisibility" value="$(arg rhosVisibility_)"/>
-    <param name="theta_clearance" value="0.8"/>
-    <param name="clearance_d" value="0.2"/>
-    <param name="tolerance_d" value="0.3"/>
-    <param name="tracking_dist" value="2.5"/>
-    <param name="tracking_dur" value="3.0"/>
-    <param name="tracking_dt" value="0.2"/>
-    <param name="debug" value="false"/>
+    <param name="prediction/rho_a" value="1.0"/><!-- A*搜索中对加速度的惩罚 -->
+    <param name="prediction/vmax"  value="4.0"/>
 
-    <param name="prediction/rho_a" value="1.0"/>
-    <param name="prediction/vmax" value="4.0"/>
+    <!-- Swarm / formation parameters -->
+    <param name="rhoSwarm"                       value="1000.0"/>
+    <param name="optimization/drone_id"          value="$(arg drone_id)" type="int"/>
+    <!-- formation_type: 0 = none, 1 = regular hexagon (7 drones) -->
+    <param name="optimization/formation_type"
+           value="$(eval 1 if arg('formation_type_') == 'hexagon' else 0)" type="int"/>
+    <param name="optimization/use_formation"
+           value="$(eval arg('formation_type_') != 'none')" type="bool"/>
+    <param name="optimization/weight_formation"  value="10000.0"/>
+    <!-- formation_size is set by setDesiredFormation(); this param is a fallback -->
+    <param name="optimization/formation_size"    value="7"       type="int"/>
 
   </node>
-  <node pkg="planning" name="traj_server" type="traj_server" output="screen">
+
+  <node pkg="planning" name="traj_server" type="traj_server" output="screen"><!-- 轨迹发布节点，将规划的轨迹转化为位置控制指令发送给target/position_cmd话题 -->
     <remap from="~position_cmd" to="position_cmd"/>
-    <remap from="~trajectory" to="trajectory"/>
-    <remap from="~heartbeat" to="heartbeat"/>
-    <param name="time_forward" value="1.0" type="double"/>
+    <remap from="~trajectory"   to="trajectory"/>
+    <remap from="~heartbeat"    to="heartbeat"/>
+    <param name="time_forward"  value="1.0" type="double"/>
   </node>
 </launch>

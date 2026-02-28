@@ -22,6 +22,8 @@ namespace planning {
 
 Eigen::IOFormat CommaInitFmt(Eigen::StreamPrecision, Eigen::DontAlignCols, ", ", ", ", "", "", " << ", ";");
 
+// SwarmTrajData is defined in traj_opt/traj_opt.h — no local redefinition needed.
+
 class Nodelet : public nodelet::Nodelet {
  private:
   std::thread initThread_;
@@ -29,6 +31,7 @@ class Nodelet : public nodelet::Nodelet {
   ros::Timer plan_timer_;
 
   ros::Publisher traj_pub_, heartbeat_pub_, replanState_pub_;
+  ros::Publisher broadcast_traj_pub_;
 
   std::shared_ptr<mapping::OccGridMap> gridmapPtr_;
   std::shared_ptr<env::Env> envPtr_;
@@ -67,6 +70,9 @@ class Nodelet : public nodelet::Nodelet {
   std::atomic_bool target_received_ = ATOMIC_VAR_INIT(false);
   std::atomic_bool land_triger_received_ = ATOMIC_VAR_INIT(false);
 
+  std::vector<SwarmTrajData> swarm_trajs_;
+  ros::Subscriber broadcast_traj_sub_;
+
   void pub_hover_p(const Eigen::Vector3d& hover_p, const ros::Time& stamp) {
     quadrotor_msgs::PolyTraj traj_msg;
     traj_msg.hover = true;
@@ -102,7 +108,70 @@ class Nodelet : public nodelet::Nodelet {
     traj_msg.traj_id = traj_id_++;
     // NOTE yaw
     traj_msg.yaw = yaw;
+    traj_msg.drone_id = trajOptPtr_->drone_id_;
     traj_pub_.publish(traj_msg);
+    broadcast_traj_pub_.publish(traj_msg);
+  }
+
+  void RecvBroadcastPolyTrajCallback(const quadrotor_msgs::PolyTrajConstPtr& msg) {
+    if (msg->drone_id < 0) {
+      ROS_ERROR("drone_id < 0 is not allowed in a swarm system!");
+      return;
+    }
+    if (msg->order != 5) {
+      ROS_ERROR("Only support trajectory order equals 5 now!");
+      return;
+    }
+    if (msg->duration.size() * (msg->order + 1) != msg->coef_x.size()) {
+      ROS_ERROR("WRONG trajectory parameters.");
+      return;
+    }
+    if (abs((ros::Time::now() - msg->start_time).toSec()) > 0.25) {
+      ROS_WARN("Time stamp diff: Local - Remote Agent %d = %fs",
+               msg->drone_id, (ros::Time::now() - msg->start_time).toSec());
+      return;
+    }
+
+    const size_t recv_id = (size_t)msg->drone_id;
+    if ((int)recv_id == trajOptPtr_->drone_id_) return;  // Assume TrajOpt has drone_id_
+
+    /* Fill up the buffer */
+    if (swarm_trajs_.size() <= recv_id) {
+      for (size_t i = swarm_trajs_.size(); i <= recv_id; i++) {
+        SwarmTrajData blank;
+        blank.drone_id = -1;
+        swarm_trajs_.push_back(blank);
+      }
+    }
+
+    /* Store data */
+    swarm_trajs_[recv_id].drone_id = recv_id;
+    swarm_trajs_[recv_id].traj_id = msg->traj_id;
+    swarm_trajs_[recv_id].start_time = msg->start_time.toSec();
+
+    int piece_nums = msg->duration.size();
+    std::vector<double> dura(piece_nums);
+    std::vector<CoefficientMat> cMats(piece_nums);
+    for (int i = 0; i < piece_nums; ++i) {
+      int i6 = i * 6;
+      cMats[i].row(0) << msg->coef_x[i6 + 0], msg->coef_x[i6 + 1], msg->coef_x[i6 + 2],
+          msg->coef_x[i6 + 3], msg->coef_x[i6 + 4], msg->coef_x[i6 + 5];
+      cMats[i].row(1) << msg->coef_y[i6 + 0], msg->coef_y[i6 + 1], msg->coef_y[i6 + 2],
+          msg->coef_y[i6 + 3], msg->coef_y[i6 + 4], msg->coef_y[i6 + 5];
+      cMats[i].row(2) << msg->coef_z[i6 + 0], msg->coef_z[i6 + 1], msg->coef_z[i6 + 2],
+          msg->coef_z[i6 + 3], msg->coef_z[i6 + 4], msg->coef_z[i6 + 5];
+
+      dura[i] = msg->duration[i];
+    }
+
+    Trajectory trajectory(dura, cMats);
+    swarm_trajs_[recv_id].traj = trajectory;
+
+    swarm_trajs_[recv_id].duration = trajectory.getTotalDuration();
+    swarm_trajs_[recv_id].start_pos = trajectory.getPos(0.0);
+
+    /* Check Collision */
+    // Add collision check if needed
   }
 
   void triger_callback(const geometry_msgs::PoseStampedConstPtr& msgPtr) {
@@ -156,7 +225,7 @@ class Nodelet : public nodelet::Nodelet {
     while (odom_lock_.test_and_set())
       ;
     auto odom_msg = odom_msg_;
-    odom_lock_.clear();
+    odom_lock_.clear();//odom_lock_用于保证读取odom_msg_时的线程安全
     Eigen::Vector3d odom_p(odom_msg.pose.pose.position.x,
                            odom_msg.pose.pose.position.y,
                            odom_msg.pose.pose.position.z);
@@ -167,14 +236,14 @@ class Nodelet : public nodelet::Nodelet {
                               odom_msg.pose.pose.orientation.x,
                               odom_msg.pose.pose.orientation.y,
                               odom_msg.pose.pose.orientation.z);
-    if (!triger_received_) {
+    if (!triger_received_) {//追踪者接收到sh文件发布的triger话题，启动规划，但triger话题中的位置不决定目标位置，目标位置由target话题中的里程计消息决定
       return;
     }
     if (!target_received_) {
       return;
     }
     // NOTE obtain state of target
-    while (target_lock_.test_and_set())
+    while (target_lock_.test_and_set())//追踪者节点需要订阅对目标状态的推断！然后填入target信息用于规划
       ;
     replanStateMsg_.target = target_msg_;
     target_lock_.clear();
@@ -196,7 +265,7 @@ class Nodelet : public nodelet::Nodelet {
     }
 
     // NOTE just for landing on the car!
-    if (land_triger_received_) {
+    if (land_triger_received_) {//车上着陆逻辑
       if (std::fabs((target_p - odom_p).norm() < 0.1 && odom_v.norm() < 0.1 && target_v.norm() < 0.2)) {
         if (!wait_hover_) {
           pub_hover_p(odom_p, ros::Time::now());
@@ -208,17 +277,17 @@ class Nodelet : public nodelet::Nodelet {
       // TODO get the orientation fo target and calculate the pose of landing point
       target_p = target_p + target_q * land_p_;
       wait_hover_ = false;
-    } else {
-      target_p.z() += 1.0;
+    } else {//追踪逻辑
+      target_p.z() += 1.0;// 追踪目标定在目标上方1m处
       // NOTE determin whether to replan
       Eigen::Vector3d dp = target_p - odom_p;
       // std::cout << "dist : " << dp.norm() << std::endl;
-      double desired_yaw = std::atan2(dp.y(), dp.x());
+      double desired_yaw = std::atan2(dp.y(), dp.x());// 期望偏航角设置为朝向目标的方向
       Eigen::Vector3d project_yaw = odom_q.toRotationMatrix().col(0);  // NOTE ZYX
       double now_yaw = std::atan2(project_yaw.y(), project_yaw.x());
       if (std::fabs((target_p - odom_p).norm() - tracking_dist_) < tolerance_d_ &&
           odom_v.norm() < 0.1 && target_v.norm() < 0.2 &&
-          std::fabs(desired_yaw - now_yaw) < 0.5) {
+          std::fabs(desired_yaw - now_yaw) < 0.5) {// 如果接近目标、速度够小、朝向正确，就保持悬停
         if (!wait_hover_) {
           pub_hover_p(odom_p, ros::Time::now());
           wait_hover_ = true;
@@ -240,17 +309,20 @@ class Nodelet : public nodelet::Nodelet {
     gridmap_lock_.clear();
     prePtr_->setMap(*gridmapPtr_);
 
+    // Set swarm trajectories for collision avoidance
+    trajOptPtr_->setSwarmTrajs(swarm_trajs_);
+
     // visualize the ray from drone to target
     if (envPtr_->checkRayValid(odom_p, target_p)) {
-      visPtr_->visualize_arrow(odom_p, target_p, "ray", visualization::yellow);
+      visPtr_->visualize_arrow(odom_p, target_p, "ray", visualization::yellow);// 无遮挡标记黄色
     } else {
-      visPtr_->visualize_arrow(odom_p, target_p, "ray", visualization::red);
+      visPtr_->visualize_arrow(odom_p, target_p, "ray", visualization::red);// 有遮挡标记红色
     }
 
-    // NOTE prediction
+    // NOTE prediction 追踪者需要对目标未来状态进行预测
     std::vector<Eigen::Vector3d> target_predcit;
     // ros::Time t_start = ros::Time::now();
-    bool generate_new_traj_success = prePtr_->predict(target_p, target_v, target_predcit);
+    bool generate_new_traj_success = prePtr_->predict(target_p, target_v, target_predcit);// 预测采用简单的匀速模型A*拓展（可以考虑在其中添加丢失观测只靠预测时的不确定度）
     // ros::Time t_stop = ros::Time::now();
     // std::cout << "predict costs: " << (t_stop - t_start).toSec() * 1e3 << "ms" << std::endl;
     if (generate_new_traj_success) {
@@ -260,19 +332,19 @@ class Nodelet : public nodelet::Nodelet {
       for (double theta = 0; theta <= 2 * M_PI; theta += 0.01) {
         observable_margin.emplace_back(observable_p + tracking_dist_ * Eigen::Vector3d(cos(theta), sin(theta), 0));
       }
-      visPtr_->visualize_path(observable_margin, "observable_margin");
+      visPtr_->visualize_path(observable_margin, "observable_margin");//observable_margin是以预测轨迹的最后一个点为圆心，追踪距离为半径的圆，用于可视化追踪者的期望位置范围
     }
 
-    // NOTE replan state
+    // NOTE replan state 追踪者没有决定是否需要重规划的步骤，默认定时器回调函数每次都重规划，确保跟踪稳定性
     Eigen::MatrixXd iniState;
     iniState.setZero(3, 3);
     ros::Time replan_stamp = ros::Time::now() + ros::Duration(0.03);
-    double replan_t = (replan_stamp - replan_stamp_).toSec();
-    if (force_hover_ || replan_t > traj_poly_.getTotalDuration()) {
+    double replan_t = (replan_stamp - replan_stamp_).toSec();//上次规划到现在的时间
+    if (force_hover_ || replan_t > traj_poly_.getTotalDuration()) {//上次规划的轨迹已经执行完了，就从当前状态重新规划
       // should replan from the hover state
       iniState.col(0) = odom_p;
       iniState.col(1) = odom_v;
-    } else {
+    } else {//上次规划的轨迹还没执行完就重规划，就从上次规划的轨迹状态重新规划，保证新轨迹和上次规划的轨迹衔接平滑
       // should replan from the last trajectory
       iniState.col(0) = traj_poly_.getPos(replan_t);
       iniState.col(1) = traj_poly_.getVel(replan_t);
@@ -301,7 +373,7 @@ class Nodelet : public nodelet::Nodelet {
       if (land_triger_received_) {
         generate_new_traj_success = envPtr_->short_astar(p_start, target_p, path);
       } else {
-        generate_new_traj_success = envPtr_->findVisiblePath(p_start, target_predcit, way_pts, path);
+        generate_new_traj_success = envPtr_->findVisiblePath(p_start, target_predcit, way_pts, path);//env类中定义的A*搜索，包含视线能清晰观察到目标的路径搜索逻辑。输出与预测时间点同步的路径点和路径
       }
       // ros::Time t_end0 = ros::Time::now();
       // t_path += (t_end0 - t_front0).toSec() * 1e3;
@@ -322,11 +394,11 @@ class Nodelet : public nodelet::Nodelet {
         way_pts.pop_back();
         // ros::Time t_front1 = ros::Time::now();
         envPtr_->generate_visible_regions(target_predcit, way_pts,
-                                          visible_ps, thetas);
+                                          visible_ps, thetas);//使用预测的目标未来轨迹和A*搜索得到的路径点，生成可观测区域（扇形）的圆心点列visible_ps和对应的角度thetas，可参见论文定义
         // ros::Time t_end1 = ros::Time::now();
         // t_path += (t_end1 - t_front1).toSec() * 1e3;
         visPtr_->visualize_pointcloud(visible_ps, "visible_ps");
-        visPtr_->visualize_fan_shape_meshes(target_predcit, visible_ps, thetas, "visible_region");
+        visPtr_->visualize_fan_shape_meshes(target_predcit, visible_ps, thetas, "visible_region");// 通过对目标未来轨迹的预测和之前A*搜索得到的路径点，生成可观测区域并可视化
 
         // TODO change the final state
         std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> rays;
@@ -336,7 +408,7 @@ class Nodelet : public nodelet::Nodelet {
         visPtr_->visualize_pointcloud(way_pts, "way_pts");
         way_pts.insert(way_pts.begin(), p_start);
         // ros::Time t_front2 = ros::Time::now();
-        envPtr_->pts2path(way_pts, path);
+        envPtr_->pts2path(way_pts, path);// 目前的路径点已经保障了可观测到目标，现在平滑连接得到最终路径
         // ros::Time t_end2 = ros::Time::now();
         // t_path += (t_end2 - t_front2).toSec() * 1e3;
       }
@@ -350,7 +422,7 @@ class Nodelet : public nodelet::Nodelet {
       // double t_corridor = (t_end3 - t_front3).toSec() * 1e3;
 
       envPtr_->visCorridor(hPolys);
-      visPtr_->visualize_pairline(keyPts, "keyPts");
+      visPtr_->visualize_pairline(keyPts, "keyPts");//生成了安全走廊hPolys（每个元素表示每段走廊的多边形数据），每段走廊的代表线段keyPts
 
       // NOTE trajectory optimization
       Eigen::MatrixXd finState;
@@ -405,7 +477,7 @@ class Nodelet : public nodelet::Nodelet {
       if (land_triger_received_) {
         yaw = 2 * std::atan2(target_q.z(), target_q.w());
       }
-      pub_traj(traj, yaw, replan_stamp);
+      pub_traj(traj, yaw, replan_stamp);// 偏航角设置为朝向目标的方向（后续可更改逻辑）
       traj_poly_ = traj;
       replan_stamp_ = replan_stamp;
     } else if (force_hover_) {
@@ -547,7 +619,7 @@ class Nodelet : public nodelet::Nodelet {
     }
     // NOTE path searching
     std::vector<Eigen::Vector3d> path;
-    bool generate_new_traj_success = envPtr_->astar_search(p_start, local_goal, path);//env类中定义的A*搜索，已经集成了论文中所提的通向无遮挡区域的逻辑
+    bool generate_new_traj_success = envPtr_->astar_search(p_start, local_goal, path);//env类中定义的A*搜索，已经考虑了避障
     Trajectory traj;
     if (generate_new_traj_success) {
       visPtr_->visualize_path(path, "astar");
@@ -761,6 +833,7 @@ class Nodelet : public nodelet::Nodelet {
     heartbeat_pub_ = nh.advertise<std_msgs::Empty>("heartbeat", 10);
     traj_pub_ = nh.advertise<quadrotor_msgs::PolyTraj>("trajectory", 1);
     replanState_pub_ = nh.advertise<quadrotor_msgs::ReplanState>("replanState", 1);
+    broadcast_traj_pub_ = nh.advertise<quadrotor_msgs::PolyTraj>("/planning/broadcast_traj_send", 10);
 
     if (debug_) {
       plan_timer_ = nh.createTimer(ros::Duration(1.0 / plan_hz), &Nodelet::debug_timer_callback, this);
@@ -780,6 +853,10 @@ class Nodelet : public nodelet::Nodelet {
     target_sub_ = nh.subscribe<nav_msgs::Odometry>("target", 10, &Nodelet::target_callback, this, ros::TransportHints().tcpNoDelay());
     triger_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("triger", 10, &Nodelet::triger_callback, this, ros::TransportHints().tcpNoDelay());
     land_triger_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("land_triger", 10, &Nodelet::land_triger_callback, this, ros::TransportHints().tcpNoDelay());
+    broadcast_traj_sub_ = nh.subscribe<quadrotor_msgs::PolyTraj>("/planning/broadcast_traj_recv", 100,
+                                                                 &Nodelet::RecvBroadcastPolyTrajCallback,
+                                                                 this,
+                                                                 ros::TransportHints().tcpNoDelay());
     ROS_WARN("Planning node initialized!");
   }
 

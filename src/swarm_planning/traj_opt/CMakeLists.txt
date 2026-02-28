@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 2.8.3)
-project(traj_opt)
+project(swarm_traj_opt)
 
 set(CMAKE_BUILD_TYPE "Release")
 ADD_COMPILE_OPTIONS(-std=c++11 )
@@ -23,7 +23,7 @@ find_package(catkin REQUIRED COMPONENTS
 
 catkin_package(
  INCLUDE_DIRS include
- LIBRARIES traj_opt
+ LIBRARIES swarm_traj_opt
  CATKIN_DEPENDS plan_env swarm_graph
 #  DEPENDS system_lib
 )
@@ -42,11 +42,11 @@ include_directories(
 #    Assignment.msg
 #}
 
-add_library( traj_opt 
+add_library( swarm_traj_opt 
     src/poly_traj_optimizer.cpp 
     )
 
-target_link_libraries( traj_opt
+target_link_libraries( swarm_traj_opt
     ${catkin_LIBRARIES} 
-    ) 
+    )
 

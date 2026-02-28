@@ -181,19 +181,19 @@ static inline double objectiveFunc(void* ptrObj,
   // T_sigma = T_s + deltaT^2
   double sumT = obj.sum_T_ + deltaT * deltaT;
   forwardT(t, sumT, T);
-  forwardP(p, obj.cfgVs_, P);
+  forwardP(p, obj.cfgVs_, P);//从x中提取出优化变量t和p，并映射出原先的优化变量T和P
 
-  obj.jerkOpt_.generate(P, T);
-  double cost = obj.jerkOpt_.getTrajJerkCost();
-  obj.jerkOpt_.calGrads_CT();
-  obj.addTimeIntPenalty(cost);
-  obj.addTimeCost(cost);
-  obj.jerkOpt_.calGrads_PT();
+  obj.jerkOpt_.generate(P, T);//用当前P和T生成MINCO轨迹
+  double cost = obj.jerkOpt_.getTrajJerkCost();//计算MINCO轨迹的jerk成本
+  obj.jerkOpt_.calGrads_CT();//计算jerk代价对C和T的成本
+  obj.addTimeIntPenalty(cost); // corridor + v/a + swarm collision + formation (all in one loop)计算位置走廊约束、速度约束、加速度约束转化成的成本，并将它们加到总成本中；同时计算这些约束的梯度，并加到总梯度中
+  obj.addTimeCost(cost);       // tracking + visibility计算追踪代价、可见性代价，并将它们加到总成本中；同时计算这些代价的梯度，并加到总梯度中
+  obj.jerkOpt_.calGrads_PT();//现在综合所有代价，它们对多项式曲线参数(C(P,T),T)的梯度已经计算出来了，接下来把它们转换为对MINCO曲线参数P和T的梯度
   grad[obj.dim_t_ + obj.dim_p_] = obj.jerkOpt_.gdT.dot(T) / sumT + obj.rhoT_;
-  cost += obj.rhoT_ * deltaT * deltaT;
-  grad[obj.dim_t_ + obj.dim_p_] *= 2 * deltaT;
+  cost += obj.rhoT_ * deltaT * deltaT;//为代价加上时间代价的剩余部分
+  grad[obj.dim_t_ + obj.dim_p_] *= 2 * deltaT;//单独给出x最后一项，即N-1维度的t_向量缺失的最后一段的梯度
   addLayerTGrad(t, sumT, obj.jerkOpt_.gdT, gradt);
-  addLayerPGrad(p, obj.cfgVs_, obj.jerkOpt_.gdP, gradp);
+  addLayerPGrad(p, obj.cfgVs_, obj.jerkOpt_.gdP, gradp);//将代价对MINCO曲线参数(P,T)的梯度转换为代价对优化变量p,t的梯度
 
   return cost;
 }
@@ -270,6 +270,23 @@ TrajOpt::TrajOpt(ros::NodeHandle& nh) : nh_(nh) {
   nh.getParam("tracking_dt", tracking_dt_);
   nh.getParam("clearance_d", clearance_d_);
   nh.getParam("tolerance_d", tolerance_d_);
+
+  // Formation-related parameters
+  nh.getParam("optimization/weight_formation", wei_formation_);
+  nh.getParam("optimization/formation_size", formation_size_);
+  nh.getParam("optimization/drone_id", drone_id_);
+  nh.getParam("optimization/use_formation", use_formation_);
+  nh.getParam("optimization/formation_type", formation_type_);
+
+  if (!nh.getParam("rhoSwarm", rhoSwarm_)) {
+    rhoSwarm_ = 1000.0;
+  }
+
+  // Initialize SwarmGraph
+  swarm_graph_.reset(new SwarmGraph());
+  setDesiredFormation(formation_type_);
+
+  swarm_trajs_.clear(); // To be set externally
 }
 
 void TrajOpt::setBoundConds(const Eigen::MatrixXd& iniState,
@@ -283,22 +300,26 @@ void TrajOpt::setBoundConds(const Eigen::MatrixXd& iniState,
   tempNorm = initS.col(2).norm();
   initS.col(2) *= tempNorm > amax_ ? (amax_ / tempNorm) : 1.0;
   tempNorm = finalS.col(2).norm();
-  finalS.col(2) *= tempNorm > amax_ ? (amax_ / tempNorm) : 1.0;
+  finalS.col(2) *= tempNorm > amax_ ? (amax_ / tempNorm) : 1.0;// 对初始状态和最终状态的速度和加速度进行限制，确保它们不超过最大速度vmax_和最大加速度amax_
 
   Eigen::VectorXd T(N_);
   T.setConstant(sum_T_ / N_);
-  backwardT(T, t_);
+  backwardT(T, t_);//把正实数域的T微分同胚映射为实数域的t_
   Eigen::MatrixXd P(3, N_ - 1);
   for (int i = 0; i < N_ - 1; ++i) {
     int k = cfgVs_[i].cols() - 1;
     P.col(i) = cfgVs_[i].rightCols(k).rowwise().sum() / (1.0 + k) + cfgVs_[i].col(0);
-  }
-  backwardP(P, cfgVs_, p_);
+  }// 将每段走廊的顶点进行平均，得到每段轨迹的初始控制点位置P
+  backwardP(P, cfgVs_, p_);//把有避障约束的控制点位置P微分同胚映射为实数域的p_
   jerkOpt_.reset(initS, finalS, N_);
   return;
 }
 
 int TrajOpt::optimize(const double& delta) {
+  // Fix the absolute time reference once per optimization call so that
+  // all L-BFGS iterations use a consistent time base.
+  t_now_ = ros::Time::now().toSec();
+
   // Setup for L-BFGS solver
   lbfgs::lbfgs_parameter_t lbfgs_params;
   lbfgs::lbfgs_load_default_parameters(&lbfgs_params);
@@ -310,7 +331,7 @@ int TrajOpt::optimize(const double& delta) {
   Eigen::Map<Eigen::VectorXd> t(x_, dim_t_);
   Eigen::Map<Eigen::VectorXd> p(x_ + dim_t_, dim_p_);
   t = t_;
-  p = p_;
+  p = p_;//将优化变量t和p的初始值赋给x_，准备进行优化
   double minObjective;
   auto ret = lbfgs::lbfgs_optimize(dim_t_ + dim_p_ + 1, x_, &minObjective,
                                    &objectiveFunc, nullptr,
@@ -330,7 +351,7 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
                             const std::vector<Eigen::MatrixXd>& hPolys,
                             Trajectory& traj) {
   landing_ = false;
-  cfgHs_ = hPolys;
+  cfgHs_ = hPolys;//cfgHs_存储飞行走廊（每个元素表示每段走廊的多边形数据），cfgVs_存储飞行走廊的顶点
   if (cfgHs_.size() == 1) {
     cfgHs_.push_back(cfgHs_[0]);
   }
@@ -338,40 +359,40 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
     ROS_ERROR("extractVs fail!");
     return false;
   }
-  N_ = 2 * cfgHs_.size();
+  N_ = 2 * cfgHs_.size();// 一个走廊设置两个轨迹段
   // NOTE wonderful trick
   sum_T_ = tracking_dur_;
 
   // NOTE: one corridor two pieces
-  dim_t_ = N_ - 1;
+  dim_t_ = N_ - 1;// 相较定义上的t变量，代码中的dim_t_少了一个维度，因为最后一个时间变量是通过前面N-1个时间变量和总时间计算得到的
   dim_p_ = 0;
   for (const auto& cfgV : cfgVs_) {
-    dim_p_ += cfgV.cols() - 1;
+    dim_p_ += cfgV.cols() - 1;//p的维度为每段轨迹的控制点数为该段走廊顶点数减1
   }
   // std::cout << "dim_p_: " << dim_p_ << std::endl;
   p_.resize(dim_p_);
   t_.resize(dim_t_);
-  x_ = new double[dim_p_ + dim_t_ + 1];
+  x_ = new double[dim_p_ + dim_t_ + 1];//统一的优化变量仍然是p和t的拼接
   Eigen::VectorXd T(N_);
-  Eigen::MatrixXd P(3, N_ - 1);
+  Eigen::MatrixXd P(3, N_ - 1);//而T的维度为轨迹段数N，P的维度为N-1即所有中间点
 
-  tracking_ps_ = target_predcit;
+  tracking_ps_ = target_predcit;//预测的目标未来所处点列
   tracking_visible_ps_ = visible_ps;
-  tracking_thetas_ = thetas;
+  tracking_thetas_ = thetas;//可见区域扇形点列及相应角度
 
-  setBoundConds(iniState, finState);
-  x_[dim_p_ + dim_t_] = 0.1;
-  int opt_ret = optimize();
+  setBoundConds(iniState, finState);//经此函数限制了初始状态和最终状态的速度与加速度，同时将P和T初始化并映射至p_和t_
+  x_[dim_p_ + dim_t_] = 0.1;//实数域的t最后一位初始化为0.1
+  int opt_ret = optimize();//执行优化！
   if (opt_ret < 0) {
     return false;
   }
-  double sumT = sum_T_ + x_[dim_p_ + dim_t_] * x_[dim_p_ + dim_t_];
+  double sumT = sum_T_ + x_[dim_p_ + dim_t_] * x_[dim_p_ + dim_t_];//真正的轨迹用时是原定的tracking_dur_加上t变量最后一段的平方
   forwardT(t_, sumT, T);
-  forwardP(p_, cfgVs_, P);
+  forwardP(p_, cfgVs_, P);//优化完的t_和p_微分同胚映射得到优化后的T和P
   jerkOpt_.generate(P, T);
   // std::cout << "P: \n" << P << std::endl;
   // std::cout << "T: " << T.transpose() << std::endl;
-  traj = jerkOpt_.getTraj();
+  traj = jerkOpt_.getTraj();//用T和P生成最终的轨迹traj
   delete[] x_;
   return true;
 }
@@ -383,7 +404,7 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
                             const std::vector<Eigen::MatrixXd>& hPolys,
                             Trajectory& traj) {
   landing_ = true;
-  cfgHs_ = hPolys;
+  cfgHs_ = hPolys;//cfgHs_存储飞行走廊（每个元素表示每段走廊的多边形数据），cfgVs_存储飞行走廊的顶点
   if (cfgHs_.size() == 1) {
     cfgHs_.push_back(cfgHs_[0]);
   }
@@ -391,38 +412,38 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
     ROS_ERROR("extractVs fail!");
     return false;
   }
-  N_ = 2 * cfgHs_.size();
+  N_ = 2 * cfgHs_.size();// 一个走廊设置两个轨迹段
   // NOTE wonderful trick
   sum_T_ = tracking_dur_;
 
   // NOTE: one corridor two pieces
-  dim_t_ = N_ - 1;
+  dim_t_ = N_ - 1;// 相较定义上的t变量，代码中的dim_t_少了一个维度，因为最后一个时间变量是通过前面N-1个时间变量和总时间计算得到的
   dim_p_ = 0;
   for (const auto& cfgV : cfgVs_) {
-    dim_p_ += cfgV.cols() - 1;
+    dim_p_ += cfgV.cols() - 1;//p的维度为每段轨迹的控制点数为该段走廊顶点数减1
   }
   // std::cout << "dim_p_: " << dim_p_ << std::endl;
   p_.resize(dim_p_);
   t_.resize(dim_t_);
-  x_ = new double[dim_p_ + dim_t_ + 1];
+  x_ = new double[dim_p_ + dim_t_ + 1];//统一的优化变量仍然是p和t的拼接
   Eigen::VectorXd T(N_);
-  Eigen::MatrixXd P(3, N_ - 1);
+  Eigen::MatrixXd P(3, N_ - 1);//而T的维度为轨迹段数N，P的维度为N-1即所有中间点
 
   tracking_ps_ = target_predcit;
 
-  setBoundConds(iniState, finState);
-  x_[dim_p_ + dim_t_] = 0.1;
-  int opt_ret = optimize();
+  setBoundConds(iniState, finState);//经此函数限制了初始状态和最终状态的速度与加速度，同时将P和T初始化并映射至p_和t_
+  x_[dim_p_ + dim_t_] = 0.1;//实数域的t最后一位初始化为0.1
+  int opt_ret = optimize();//执行优化！
   if (opt_ret < 0) {
     return false;
   }
-  double sumT = sum_T_ + x_[dim_p_ + dim_t_] * x_[dim_p_ + dim_t_];
+  double sumT = sum_T_ + x_[dim_p_ + dim_t_] * x_[dim_p_ + dim_t_];//真正的轨迹用时是原定的tracking_dur_加上t变量最后一段的平方
   forwardT(t_, sumT, T);
-  forwardP(p_, cfgVs_, P);
+  forwardP(p_, cfgVs_, P);//优化完的t_和p_微分同胚映射得到优化后的T和P
   jerkOpt_.generate(P, T);
   // std::cout << "P: \n" << P << std::endl;
   // std::cout << "T: " << T.transpose() << std::endl;
-  traj = jerkOpt_.getTraj();
+  traj = jerkOpt_.getTraj();//用T和P生成最终的轨迹traj
   delete[] x_;
   return true;
 }
@@ -437,6 +458,9 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度约�
   Eigen::Matrix<double, 6, 3> gradViolaPc, gradViolaVc, gradViolaAc;
   double gradViolaPt, gradViolaVt, gradViolaAt;
   double omg;
+
+  // t_acc: accumulated absolute trajectory time at the start of piece i
+  double t_acc = 0.0;
 
   int innerLoop;
   for (int i = 0; i < N_; ++i) {//i为每段轨迹的索引
@@ -463,6 +487,9 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度约�
 
       omg = (j == 0 || j == innerLoop - 1) ? 0.5 : 1.0;
 
+      // Accumulated trajectory time at this sample point
+      double t_sample = t_acc + s1;
+
       if (grad_cost_p_corridor(pos, hPoly, grad_tmp, cost_tmp)) {
         gradViolaPc = beta0 * grad_tmp.transpose();
         gradViolaPt = alpha * grad_tmp.transpose() * vel;
@@ -485,9 +512,196 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度约�
         cost += omg * step * cost_tmp;
       }
 
+      // ---- Swarm collision avoidance ----
+      {
+        double gradt_swarm = 0, grad_prev_t_swarm = 0, costp_swarm = 0;
+        if (grad_cost_swarm_collision(i, t_sample, pos, vel,
+                                      grad_tmp, gradt_swarm, grad_prev_t_swarm, costp_swarm)) {
+          gradViolaPc = beta0 * grad_tmp.transpose();
+          gradViolaPt = alpha * gradt_swarm;
+          jerkOpt_.gdC.block<6, 3>(i * 6, 0) += omg * step * gradViolaPc;
+          jerkOpt_.gdT(i) += omg * (costp_swarm / K_ + step * gradViolaPt);
+          if (i > 0) {
+            jerkOpt_.gdT.head(i).array() += omg * step * grad_prev_t_swarm;
+          }
+          cost += omg * step * costp_swarm;
+        }
+      }
+
+      // ---- Formation cost ----
+      if (use_formation_) {
+        double gradt_form = 0, grad_prev_t_form = 0, costp_form = 0;
+        if (grad_cost_swarm_formation(i, t_sample, pos, vel,
+                                       grad_tmp, gradt_form, grad_prev_t_form, costp_form)) {
+          gradViolaPc = beta0 * grad_tmp.transpose();
+          gradViolaPt = alpha * gradt_form;
+          jerkOpt_.gdC.block<6, 3>(i * 6, 0) += omg * step * gradViolaPc;
+          jerkOpt_.gdT(i) += omg * (costp_form / K_ + step * gradViolaPt);
+          if (i > 0) {
+            jerkOpt_.gdT.head(i).array() += omg * step * grad_prev_t_form;
+          }
+          cost += omg * step * costp_form;
+        }
+      }
+
       s1 += step;
     }
+    t_acc += jerkOpt_.T1(i);
   }
+}
+
+bool TrajOpt::grad_cost_swarm_collision(const int piece,
+                                        const double t,
+                                        const Eigen::Vector3d& p,
+                                        const Eigen::Vector3d& v,
+                                        Eigen::Vector3d& gradp,
+                                        double& gradt,
+                                        double& grad_prev_t,
+                                        double& costp) {
+  if (swarm_trajs_.empty()) return false;
+
+  bool ret = false;
+  gradp.setZero();
+  gradt = 0;
+  grad_prev_t = 0;
+  costp = 0;
+
+  // Ellipsoid semi-axes: horizontal clearance a, vertical clearance b
+  constexpr double a = 2.0, b = 1.0;
+  constexpr double inv_a2 = 1.0 / (a * a), inv_b2 = 1.0 / (b * b);
+  const double CLEARANCE2 = (rhoSwarm_ > 0) ? 1.0 : 1.0; // normalized: penalty starts when ellip_dist2 < 1
+  // NOTE: rhoSwarm_ is the weight; the clearance ellipsoid has semi-axes a,b (unit ellipsoid = 1).
+
+  double pt_time = t_now_ + t;  // absolute time of this sample point
+
+  for (size_t id = 0; id < swarm_trajs_.size(); ++id) {
+    if (swarm_trajs_[id].drone_id < 0 || swarm_trajs_[id].drone_id == drone_id_) continue;
+
+    double traj_start = swarm_trajs_[id].start_time;
+    Eigen::Vector3d swarm_p, swarm_v;
+
+    double t_other = pt_time - traj_start;
+    if (t_other >= 0 && t_other < swarm_trajs_[id].duration) {
+      swarm_p = swarm_trajs_[id].traj.getPos(t_other);
+      swarm_v = swarm_trajs_[id].traj.getVel(t_other);
+    } else if (t_other >= swarm_trajs_[id].duration) {
+      // Extrapolate with constant velocity after trajectory ends
+      double exceed = t_other - swarm_trajs_[id].duration;
+      swarm_v = swarm_trajs_[id].traj.getVel(swarm_trajs_[id].duration);
+      swarm_p = swarm_trajs_[id].traj.getPos(swarm_trajs_[id].duration) + exceed * swarm_v;
+    } else {
+      continue;  // t_other < 0: other drone's traj hasn't started yet
+    }
+
+    Eigen::Vector3d dp = p - swarm_p;
+    double ellip_dist2 = dp(0) * dp(0) * inv_b2 + dp(1) * dp(1) * inv_b2 + dp(2) * dp(2) * inv_a2;
+    double dist2_err = CLEARANCE2 - ellip_dist2;
+    double dist2_err2 = dist2_err * dist2_err;
+    double dist2_err3 = dist2_err2 * dist2_err;
+
+    if (dist2_err3 > 0) {
+      ret = true;
+      costp += rhoSwarm_ * dist2_err3;
+
+      // dJ/dp  (chain rule: dJ/d(ellip_dist2) * d(ellip_dist2)/dp)
+      Eigen::Vector3d dJ_dp = rhoSwarm_ * 3.0 * dist2_err2 * (-2.0) *
+                               Eigen::Vector3d(inv_b2 * dp(0), inv_b2 * dp(1), inv_a2 * dp(2));
+      gradp += dJ_dp;
+
+      // dJ/dT_i  = dJ/dp · (dp/dt)  = dJ/dp · (v - swarm_v)
+      gradt += dJ_dp.dot(v - swarm_v);
+
+      // dJ/dT_{0..i-1}  = dJ/dp · (-swarm_v)  (other drone's pos depends on prev T segments)
+      grad_prev_t += dJ_dp.dot(-swarm_v);
+    }
+  }
+  return ret;
+}
+
+bool TrajOpt::grad_cost_swarm_formation(const int piece,
+                                        const double t,
+                                        const Eigen::Vector3d& p,
+                                        const Eigen::Vector3d& v,
+                                        Eigen::Vector3d& gradp,
+                                        double& gradt,
+                                        double& grad_prev_t,
+                                        double& costp) {
+  if (!use_formation_ || swarm_graph_ == nullptr) return false;
+
+  // Need all other drones to have published a trajectory
+  int ready_count = 0;
+  for (size_t id = 0; id < swarm_trajs_.size(); ++id) {
+    if ((int)id != drone_id_ && swarm_trajs_[id].drone_id >= 0) ready_count++;
+  }
+  if (ready_count < formation_size_ - 1) return false;
+
+  bool ret = false;
+  gradp.setZero();
+  gradt = 0;
+  grad_prev_t = 0;
+  costp = 0;
+
+  double pt_time = t_now_ + t;  // absolute time of this sample point
+
+  // Build position/velocity vectors for the whole swarm at pt_time
+  std::vector<Eigen::Vector3d> swarm_pos(formation_size_, Eigen::Vector3d::Zero());
+  std::vector<Eigen::Vector3d> swarm_vel(formation_size_, Eigen::Vector3d::Zero());
+
+  swarm_pos[drone_id_] = p;
+  swarm_vel[drone_id_] = v;
+
+  for (size_t id = 0; id < swarm_trajs_.size(); ++id) {
+    if ((int)id == drone_id_ || swarm_trajs_[id].drone_id < 0) continue;
+    if ((int)id >= formation_size_) continue;
+
+    double traj_start = swarm_trajs_[id].start_time;
+    double t_other = pt_time - traj_start;
+    if (t_other >= 0 && t_other < swarm_trajs_[id].duration) {
+      swarm_pos[id] = swarm_trajs_[id].traj.getPos(t_other);
+      swarm_vel[id] = swarm_trajs_[id].traj.getVel(t_other);
+    } else if (t_other >= swarm_trajs_[id].duration) {
+      swarm_vel[id] = swarm_trajs_[id].traj.getVel(swarm_trajs_[id].duration);
+      swarm_pos[id] = swarm_trajs_[id].traj.getPos(swarm_trajs_[id].duration) +
+                      (t_other - swarm_trajs_[id].duration) * swarm_vel[id];
+    } else {
+      return false;  // Some drone's traj not yet started
+    }
+  }
+
+  // Update the SwarmGraph with the current swarm positions
+  swarm_graph_->updateGraph(swarm_pos);
+
+  // Get the scalar formation error (squared F-norm of SNL difference)
+  double similarity_error;
+  if (!swarm_graph_->calcFNorm2(similarity_error)) return false;
+
+  if (similarity_error > 0) {
+    ret = true;
+    costp = wei_formation_ * similarity_error;
+
+    // Get per-agent position gradients from SwarmGraph
+    std::vector<Eigen::Vector3d> swarm_grad;
+    swarm_graph_->getGrad(swarm_grad);
+
+    // Gradient w.r.t. self position
+    gradp = wei_formation_ * swarm_grad[drone_id_];
+
+    // Gradient w.r.t. T_i (current piece duration):
+    //   dJ/dT_i = sum_k [ dJ/dp_k · v_k ]
+    for (int id = 0; id < formation_size_; ++id) {
+      gradt += wei_formation_ * swarm_grad[id].dot(swarm_vel[id]);
+    }
+
+    // Gradient w.r.t. T_{0..i-1} (all previous piece durations):
+    //   Only the other drones' positions depend on previous T segments.
+    for (int id = 0; id < formation_size_; ++id) {
+      if (id != drone_id_) {
+        grad_prev_t += wei_formation_ * swarm_grad[id].dot(swarm_vel[id]);
+      }
+    }
+  }
+
+  return ret;
 }
 
 void TrajOpt::addTimeCost(double& cost) {
@@ -746,6 +960,40 @@ bool TrajOpt::grad_cost_a(const Eigen::Vector3d& a,
     return true;
   }
   return false;
+}
+
+void TrajOpt::setDesiredFormation(int type) {
+  std::vector<Eigen::Vector3d> swarm_des;
+  Eigen::Vector3d v0, v1, v2, v3, v4, v5, v6;
+  switch (type) {
+    case 0: // NONE_FORMATION
+      use_formation_ = false;
+      formation_size_ = 0;
+      break;
+    case 1: // REGULAR_HEXAGON
+      // Set the desired formation
+      v0 << 0, 0, 0;
+      v1 << 1.7321, -1, 0;
+      v2 << 0, -2, 0;
+      v3 << -1.7321, -1, 0;
+      v4 << -1.7321, 1, 0;
+      v5 << 0, 2, 0;
+      v6 << 1.7321, 1, 0;
+
+      swarm_des.push_back(v0);
+      swarm_des.push_back(v1);
+      swarm_des.push_back(v2);
+      swarm_des.push_back(v3);
+      swarm_des.push_back(v4);
+      swarm_des.push_back(v5);
+      swarm_des.push_back(v6);
+
+      formation_size_ = swarm_des.size();
+      swarm_graph_->setDesiredForm(swarm_des);
+      break;
+    default:
+      break;
+  }
 }
 
 }  // namespace traj_opt

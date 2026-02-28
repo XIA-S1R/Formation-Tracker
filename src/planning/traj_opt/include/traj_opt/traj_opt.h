@@ -2,6 +2,16 @@
 #include <ros/ros.h>
 
 #include "minco.hpp"
+#include <swarm_graph/swarm_graph.hpp>
+
+struct SwarmTrajData {
+  int drone_id = -1;
+  int traj_id = -1;
+  double start_time = 0.0;
+  Trajectory traj;
+  double duration = 0.0;
+  Eigen::Vector3d start_pos;
+};
 
 namespace traj_opt {
 
@@ -17,6 +27,7 @@ class TrajOpt {
   double rhoP_, rhoV_, rhoA_;
   double rhoTracking_, rhosVisibility_;
   double clearance_d_, tolerance_d_, theta_clearance_;
+  double rhoSwarm_;
   // corridor
   std::vector<Eigen::MatrixXd> cfgVs_;
   std::vector<Eigen::MatrixXd> cfgHs_;
@@ -35,6 +46,17 @@ class TrajOpt {
   double tracking_dur_;
   double tracking_dist_;
   double tracking_dt_;
+
+  // Formation-related parameters
+  SwarmGraph::Ptr swarm_graph_;
+  double wei_formation_;
+  int formation_size_, drone_id_;
+  std::vector<SwarmTrajData> swarm_trajs_;
+  bool use_formation_;
+  int formation_type_;
+
+  // Absolute time at the start of each optimization call (fixed during one L-BFGS run)
+  double t_now_;
 
   // polyH utils
   bool extractVs(const std::vector<Eigen::MatrixXd>& hPs,
@@ -65,6 +87,31 @@ class TrajOpt {
 
   void addTimeIntPenalty(double& cost);
   void addTimeCost(double& cost);
+  void setDesiredFormation(int type);
+  void setSwarmTrajs(const std::vector<SwarmTrajData>& swarm_trajs) { swarm_trajs_ = swarm_trajs; }
+
+  // Formation cost: returns true if penalty was applied.
+  // t: accumulated trajectory time at the current sample point (= sum of durations of previous pieces + s1)
+  // piece: index of the current trajectory piece (needed for grad_prev_t propagation)
+  bool grad_cost_swarm_formation(const int piece,
+                                 const double t,
+                                 const Eigen::Vector3d& p,
+                                 const Eigen::Vector3d& v,
+                                 Eigen::Vector3d& gradp,
+                                 double& gradt,
+                                 double& grad_prev_t,
+                                 double& costp);
+
+  // Swarm collision avoidance cost (ellipsoidal)
+  bool grad_cost_swarm_collision(const int piece,
+                                 const double t,
+                                 const Eigen::Vector3d& p,
+                                 const Eigen::Vector3d& v,
+                                 Eigen::Vector3d& gradp,
+                                 double& gradt,
+                                 double& grad_prev_t,
+                                 double& costp);
+
   bool grad_cost_p_corridor(const Eigen::Vector3d& p,
                             const Eigen::MatrixXd& hPoly,
                             Eigen::Vector3d& gradp,

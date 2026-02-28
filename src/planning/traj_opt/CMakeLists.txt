@@ -8,12 +8,13 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall")
 find_package(Eigen3 REQUIRED)
 find_package(catkin REQUIRED COMPONENTS
   roscpp
+  swarm_graph
 )
 
 catkin_package(
   INCLUDE_DIRS include ${EIGEN3_INCLUDE_DIR}
   LIBRARIES ${PROJECT_NAME}
-  CATKIN_DEPENDS roscpp
+  CATKIN_DEPENDS roscpp swarm_graph
   DEPENDS EIGEN3
 )
 

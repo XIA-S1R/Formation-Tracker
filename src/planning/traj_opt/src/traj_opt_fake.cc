@@ -208,13 +208,13 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
   dim_p_ = 0;
   for (const auto& cfgV : cfgVs_) {
     dim_p_ += cfgV.cols() - 1;
-  }//MINCO轨迹中T的维度为轨迹段数N，P的维度为所有轨迹段的控制点数之和（每段轨迹的控制点数为该段走廊顶点数减1）
+  }//MINCO轨迹中t的维度为轨迹段数N，p的维度为每段轨迹的控制点数为该段走廊顶点数减1
   // std::cout << "dim_p_: " << dim_p_ << std::endl;
   p_.resize(dim_p_);
   t_.resize(dim_t_);
   x_ = new double[dim_p_ + dim_t_];
   Eigen::VectorXd T(N_);
-  Eigen::MatrixXd P(3, N_ - 1);
+  Eigen::MatrixXd P(3, N_ - 1);//而T的维度为轨迹段数N，P的维度为N-1即所有中间点
 
   // NOTE set boundary conditions
   Eigen::MatrixXd initS = iniState;
