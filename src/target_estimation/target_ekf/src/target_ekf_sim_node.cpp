@@ -6,7 +6,12 @@
 #include <message_filters/time_synchronizer.h>
 #include <nav_msgs/Odometry.h>
 #include <ros/ros.h>
-#include <quadrotor_msgs/OccMap3d.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <unordered_set>
+#include <cmath>
 
 #include <target_ekf/target_ekf.hpp>
 
@@ -23,48 +28,57 @@ double pitch_thr_ = 30;
 bool check_fov_ = false;
 
 std::shared_ptr<Ekf> ekfPtr_;
-quadrotor_msgs::OccMap3d gridmap_;
 
-bool isLineOfSightClear(const quadrotor_msgs::OccMap3d& map, const Eigen::Vector3d& start, const Eigen::Vector3d& end) {
-  // 用于检查目标点与无人机之间的视线是否被障碍阻挡
-  // Check if map is valid
-  if (map.data.empty() || map.size_x == 0 || map.size_y == 0 || map.size_z == 0) {
-    ROS_WARN("[ekf] Map not available, assuming line of sight clear.");
-    return true;
+// 直接用全局点云构建简易占据栅格
+struct SimpleOccMap {
+  double resolution = 0.3;
+  std::unordered_set<int64_t> occ_cells;
+  bool received = false;
+
+  int64_t toKey(int x, int y, int z) const {
+    return ((int64_t)(x + 32768) << 32) | ((int64_t)(y + 32768) << 16) | (int64_t)(z + 32768);
   }
-  // Add distance check to avoid long raycasting
-  if ((end - start).norm() > 10.0) {
-    return false;  // Assume blocked if too far
+
+  void fromPointCloud(const pcl::PointCloud<pcl::PointXYZ>& cloud, double res) {
+    resolution = res;
+    occ_cells.clear();
+    for (const auto& pt : cloud) {
+      int x = (int)std::floor(pt.x / resolution);
+      int y = (int)std::floor(pt.y / resolution);
+      int z = (int)std::floor(pt.z / resolution);
+      occ_cells.insert(toKey(x, y, z));
+    }
+    received = true;
   }
-  // 3D map
-  double res = map.resolution;
-  int sx = map.size_x;
-  int sy = map.size_y;
-  int sz = map.size_z;
-  int ox = map.offset_x;
-  int oy = map.offset_y;
-  int oz = map.offset_z;
+
+  bool isOccupied(const Eigen::Vector3d& p) const {
+    int x = (int)std::floor(p.x() / resolution);
+    int y = (int)std::floor(p.y() / resolution);
+    int z = (int)std::floor(p.z() / resolution);
+    return occ_cells.count(toKey(x, y, z)) > 0;
+  }
+} occMap_;
+
+bool isLineOfSightClear(const Eigen::Vector3d& start, const Eigen::Vector3d& end) {
+  if (!occMap_.received) return false;
 
   double dist = (end - start).norm();
-  int steps = std::max(1, (int)(dist / res));
-  for (int i = 0; i <= steps; ++i) {
+  if (dist > 15.0) return false;
+
+  int steps = std::max(1, (int)(dist / (occMap_.resolution * 0.5)));
+  for (int i = 1; i < steps; ++i) {  // i从1开始，跳过起点（无人机自身位置）
     double t = (double)i / steps;
     Eigen::Vector3d pt = start + t * (end - start);
-    int x = std::round(pt.x() / res) - ox;
-    int y = std::round(pt.y() / res) - oy;
-    int z = std::round(pt.z() / res) - oz;
-    if (x >= 0 && x < sx && y >= 0 && y < sy && z >= 0 && z < sz) {
-      int index = (z * sy + y) * sx + x;
-      if (map.data[index] == 1) {  // Occupied
-        return false;
-      }
-    }
+    if (occMap_.isOccupied(pt)) return false;
   }
   return true;
 }
 
-void gridmap_callback(const quadrotor_msgs::OccMap3dConstPtr& msg) {
-  gridmap_ = *msg;
+void global_map_callback(const sensor_msgs::PointCloud2ConstPtr& msg) {
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  pcl::fromROSMsg(*msg, cloud);
+  occMap_.fromPointCloud(cloud, 0.3);  // 与mockamap的resolution一致
+  ROS_INFO_ONCE("[ekf] Global map received, %zu obstacle points.", cloud.size());
 }
 
 void predict_state_callback(const ros::TimerEvent& event) {
@@ -137,7 +151,12 @@ void update_state_callback(const nav_msgs::OdometryConstPtr& target_msg, const n
   }
 
   // Check line of sight 新增的障碍物遮挡检查，障碍物遮挡的情况下无法观测目标
-  if (!isLineOfSightClear(gridmap_, cam_p, p)) {
+  // 地图未收到或视线被遮挡，均不进行EKF更新
+  if (!occMap_.received) {
+    ROS_WARN_THROTTLE(1.0, "[ekf] Global map not yet received, skipping update.");
+    return;
+  }
+  if (!isLineOfSightClear(cam_p, p)) {
     return;
   }
 
@@ -187,7 +206,7 @@ int main(int argc, char** argv) {
   ros::Subscriber single_odom_sub = nh.subscribe("odom", 100, &odom_callback, ros::TransportHints().tcpNoDelay());
   target_odom_pub_ = nh.advertise<nav_msgs::Odometry>("target_odom", 1);
   yolo_odom_pub_ = nh.advertise<nav_msgs::Odometry>("yolo_odom", 1);
-  ros::Subscriber gridmap_sub = nh.subscribe("gridmap_inflate", 1, &gridmap_callback);
+  ros::Subscriber global_map_sub = nh.subscribe("global_map", 1, &global_map_callback);
 
   int ekf_rate = 20;
   nh.getParam("ekf_rate", ekf_rate);

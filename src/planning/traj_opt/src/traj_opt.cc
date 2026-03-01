@@ -534,9 +534,10 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度约�
         if (grad_cost_swarm_formation(i, t_sample, pos, vel,
                                        grad_tmp, gradt_form, grad_prev_t_form, costp_form)) {
           gradViolaPc = beta0 * grad_tmp.transpose();
-          gradViolaPt = alpha * gradt_form;
+          // gradt_form is already the full dJ/dT_i (not a "slope" w.r.t. s1),
+          // so do NOT multiply by alpha here. Accumulate directly into gdT.
           jerkOpt_.gdC.block<6, 3>(i * 6, 0) += omg * step * gradViolaPc;
-          jerkOpt_.gdT(i) += omg * (costp_form / K_ + step * gradViolaPt);
+          jerkOpt_.gdT(i) += omg * step * gradt_form;
           if (i > 0) {
             jerkOpt_.gdT.head(i).array() += omg * step * grad_prev_t_form;
           }
@@ -695,9 +696,7 @@ bool TrajOpt::grad_cost_swarm_formation(const int piece,
     // Gradient w.r.t. T_{0..i-1} (all previous piece durations):
     //   Only the other drones' positions depend on previous T segments.
     for (int id = 0; id < formation_size_; ++id) {
-      if (id != drone_id_) {
-        grad_prev_t += wei_formation_ * swarm_grad[id].dot(swarm_vel[id]);
-      }
+      grad_prev_t += wei_formation_ * swarm_grad[id].dot(swarm_vel[id]);
     }
   }
 
