@@ -83,7 +83,8 @@ struct Ekf {
     x.setZero();
     x.head(3) = z;
     x.tail(3) = z_rpy;
-    Sigma.setZero();
+    Sigma.setIdentity(9, 9);
+    Sigma *= 10.0;  // 设为较大初始不确定度，确保reset后第一次update能有效收敛
   }
   inline bool update(const Eigen::Vector3d& z, const Eigen::Vector3d& z_rqp) {
     K = Sigma * C.transpose() * (C * Sigma * C.transpose() + Rt).inverse();
@@ -91,8 +92,8 @@ struct Ekf {
     zz.head(3) = z;
     zz.tail(3) = z_rqp;
     Eigen::VectorXd x_tmp = x + K * (zz - C * x);
-    // NOTE check valid
-    static double vmax = 4;
+    // NOTE check valid：放宽速度阈值，避免收敛初期误判
+    static double vmax = 8.0;
     if (x_tmp.middleRows(3, 3).norm() > vmax) {
       return false;
     }

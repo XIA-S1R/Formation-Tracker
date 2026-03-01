@@ -82,6 +82,12 @@ void global_map_callback(const sensor_msgs::PointCloud2ConstPtr& msg) {
 }
 
 void predict_state_callback(const ros::TimerEvent& event) {
+  // 地图未收到前持续刷新last_update_stamp_，避免误报too long time no update
+  if (!occMap_.received) {
+    last_update_stamp_ = ros::Time::now();
+    return;
+  }
+
   double update_dt = (ros::Time::now() - last_update_stamp_).toSec();
   if (update_dt < 2.0) {
     ekfPtr_->predict();
@@ -150,10 +156,10 @@ void update_state_callback(const nav_msgs::OdometryConstPtr& target_msg, const n
     }
   }
 
-  // Check line of sight 新增的障碍物遮挡检查，障碍物遮挡的情况下无法观测目标
-  // 地图未收到或视线被遮挡，均不进行EKF更新
+  // Check line of sight
   if (!occMap_.received) {
-    ROS_WARN_THROTTLE(1.0, "[ekf] Global map not yet received, skipping update.");
+    // 地图未收到，静默跳过，同时刷新时间戳避免后续误触发reset
+    last_update_stamp_ = ros::Time::now();
     return;
   }
   if (!isLineOfSightClear(cam_p, p)) {
