@@ -20,7 +20,7 @@
     <param name="plan_hz"        value="20"/>
     <param name="K"              value="8"/>
     <param name="vmax"           value="3.0"/>
-    <param name="amax"           value="6.0"/>
+    <param name="amax"           value="10.0"/>
     <param name="rhoT"           value="100.0"/>
     <param name="rhoP"           value="10000.0"/>
     <param name="rhoV"           value="1000.0"/>
@@ -41,14 +41,14 @@
     <!-- Swarm / formation parameters -->
     <param name="rhoSwarm"                       value="1000.0"/>
     <param name="optimization/drone_id"          value="$(arg drone_id)" type="int"/>
-    <!-- formation_type: 0 = none, 1 = regular hexagon (7 drones) -->
+    <!-- formation_type: 0 = none, 1 = regular hexagon (7 drones), 2 = equilateral triangle (3 drones) -->
     <param name="optimization/formation_type"
-           value="$(eval 1 if arg('formation_type_') == 'hexagon' else 0)" type="int"/>
+           value="$(eval 1 if arg('formation_type_') == 'hexagon' else (2 if arg('formation_type_') == 'triangle' else 0))" type="int"/>
     <param name="optimization/use_formation"
            value="$(eval arg('formation_type_') != 'none')" type="bool"/>
     <param name="optimization/weight_formation"  value="10000.0"/>
-    <!-- formation_size is set by setDesiredFormation(); this param is a fallback -->
-    <param name="optimization/formation_size"    value="7"       type="int"/>
+    <param name="optimization/formation_size"
+           value="$(eval 7 if arg('formation_type_') == 'hexagon' else (3 if arg('formation_type_') == 'triangle' else 0))" type="int"/>
 
   </node>
 

@@ -60,6 +60,8 @@ class Nodelet : public nodelet::Nodelet {
   bool force_hover_ = true;
 
   nav_msgs::Odometry odom_msg_, target_msg_;
+  Eigen::Vector3d last_target_p_ = Eigen::Vector3d::Zero();
+  bool last_target_p_valid_ = false;
   quadrotor_msgs::OccMap3d map_msg_;
   std::atomic_flag odom_lock_ = ATOMIC_FLAG_INIT;
   std::atomic_flag target_lock_ = ATOMIC_FLAG_INIT;
@@ -126,9 +128,11 @@ class Nodelet : public nodelet::Nodelet {
       ROS_ERROR("WRONG trajectory parameters.");
       return;
     }
-    if (abs((ros::Time::now() - msg->start_time).toSec()) > 0.25) {
-      ROS_WARN("Time stamp diff: Local - Remote Agent %d = %fs",
-               msg->drone_id, (ros::Time::now() - msg->start_time).toSec());
+    // 仿真中规划耗时 + 消息延迟可达数百ms，放宽到 2.0s
+    double stamp_diff = (ros::Time::now() - msg->start_time).toSec();
+    if (stamp_diff > 2.0 || stamp_diff < -2.0) {
+      ROS_WARN("Time stamp diff: Local - Remote Agent %d = %fs (dropped)",
+               msg->drone_id, stamp_diff);
       return;
     }
 
@@ -242,6 +246,20 @@ class Nodelet : public nodelet::Nodelet {
     if (!target_received_) {
       return;
     }
+
+    // NOTE sequential start：drone_id=0 直接规划；drone_id>=1 等收到前一架无人机的广播轨迹后才开始规划
+    // 与 Swarm-Formation 的 SEQUENTIAL_START 状态逻辑一致，保证第一次规划时 swarm_trajs_ 非空
+    if (trajOptPtr_->use_formation_ && trajOptPtr_->drone_id_ >= 1) {
+      int prev_id = trajOptPtr_->drone_id_ - 1;
+      bool have_prev = ((int)swarm_trajs_.size() > prev_id &&
+                        swarm_trajs_[prev_id].drone_id == prev_id);
+      if (!have_prev) {
+        ROS_INFO_THROTTLE(1.0, "[drone %d] waiting for drone %d trajectory...",
+                          trajOptPtr_->drone_id_, prev_id);
+        return;
+      }
+    }
+
     // NOTE obtain state of target
     while (target_lock_.test_and_set())//追踪者节点需要订阅对目标状态的推断！然后填入target信息用于规划
       ;
@@ -259,6 +277,17 @@ class Nodelet : public nodelet::Nodelet {
     target_q.y() = replanStateMsg_.target.pose.pose.orientation.y;
     target_q.z() = replanStateMsg_.target.pose.pose.orientation.z;
 
+    // NOTE detect ekf reset
+    if (last_target_p_valid_) {
+      if ((target_p - last_target_p_).norm() > 2.0) {
+        ROS_WARN("EKF reset detected, skipping this planning cycle.");
+        last_target_p_ = target_p;
+        return;
+      }
+    }
+    last_target_p_ = target_p;
+    last_target_p_valid_ = true;
+
     // NOTE force-hover: waiting for the speed of drone small enough
     if (force_hover_ && odom_v.norm() > 0.1) {
       return;
@@ -271,7 +300,7 @@ class Nodelet : public nodelet::Nodelet {
           pub_hover_p(odom_p, ros::Time::now());
           wait_hover_ = true;
         }
-        ROS_WARN("[planner] HOVERING...");
+        ROS_WARN("[drone %d] HOVERING...", trajOptPtr_->drone_id_);
         return;
       }
       // TODO get the orientation fo target and calculate the pose of landing point
@@ -279,6 +308,13 @@ class Nodelet : public nodelet::Nodelet {
       wait_hover_ = false;
     } else {//追踪逻辑
       target_p.z() += 1.0;// 追踪目标定在目标上方1m处
+
+      // 仿照 Swarm-Formation：每架无人机终点 = 目标位置 + 本机编队偏移
+      // 路径搜索、走廊、finState 全部自然对齐到本机专属位置
+      if (trajOptPtr_->use_formation_) {
+        target_p += trajOptPtr_->formation_offset_;
+      }
+
       // NOTE determin whether to replan
       Eigen::Vector3d dp = target_p - odom_p;
       // std::cout << "dist : " << dp.norm() << std::endl;
@@ -292,7 +328,7 @@ class Nodelet : public nodelet::Nodelet {
           pub_hover_p(odom_p, ros::Time::now());
           wait_hover_ = true;
         }
-        ROS_WARN("[planner] HOVERING...");
+        ROS_WARN("[drone %d] HOVERING...", trajOptPtr_->drone_id_);
         replanStateMsg_.state = -1;
         replanState_pub_.publish(replanStateMsg_);
         return;
@@ -429,7 +465,6 @@ class Nodelet : public nodelet::Nodelet {
       finState.setZero(3, 3);
       finState.col(0) = path.back();
       finState.col(1) = target_v;
-      // ros::Time t_front4 = ros::Time::now();
       if (land_triger_received_) {
         finState.col(0) = target_predcit.back();
         generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, traj);
@@ -438,18 +473,6 @@ class Nodelet : public nodelet::Nodelet {
                                                                target_predcit, visible_ps, thetas,
                                                                hPolys, traj);
       }
-      // ros::Time t_end4 = ros::Time::now();
-      // double t_optimization = (t_end4 - t_front4).toSec() * 1e3;
-
-      // NOTE average calculating time of path searching, corridor generation and optimization
-
-      // t_path_ = (t_path_ * times_path_ + t_path) / (++times_path_);
-      // t_corridor_ = (t_corridor_ * times_corridor_ + t_corridor) / (++times_corridor_);
-      // t_optimization_ = (t_optimization_ * times_optimization_ + t_optimization) / (++times_optimization_);
-
-      // std::cout << "t_path_: " << t_path_ << " ms" << std::endl;
-      // std::cout << "t_corridor_: " << t_corridor_ << " ms" << std::endl;
-      // std::cout << "t_optimization_: " << t_optimization_ << " ms" << std::endl;
 
       visPtr_->visualize_traj(traj, "traj");
     }
@@ -464,7 +487,7 @@ class Nodelet : public nodelet::Nodelet {
     }
     if (valid) {
       force_hover_ = false;
-      ROS_WARN("[planner] REPLAN SUCCESS");
+      ROS_WARN("[drone %d planner] REPLAN SUCCESS", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 0;
       replanState_pub_.publish(replanStateMsg_);
       Eigen::Vector3d dp = target_p + target_v * 0.03 - iniState.col(0);
@@ -480,23 +503,18 @@ class Nodelet : public nodelet::Nodelet {
       pub_traj(traj, yaw, replan_stamp);// 偏航角设置为朝向目标的方向（后续可更改逻辑）
       traj_poly_ = traj;
       replan_stamp_ = replan_stamp;
-    } else if (force_hover_) {
-      ROS_ERROR("[planner] REPLAN FAILED, HOVERING...");
-      replanStateMsg_.state = 1;
-      replanState_pub_.publish(replanStateMsg_);
-      return;
     } else if (validcheck(traj_poly_, replan_stamp_)) {
+      ROS_ERROR("[drone %d planner] REPLAN FAILED, EXECUTE LAST TRAJ...", trajOptPtr_->drone_id_);
+      replanStateMsg_.state = 3;
+      replanState_pub_.publish(replanStateMsg_);
+      return;  // current generated traj invalid but last is valid
+    } else {
       force_hover_ = true;
-      ROS_FATAL("[planner] EMERGENCY STOP!!!");
+      ROS_FATAL("[drone %d planner] EMERGENCY STOP!!!", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 2;
       replanState_pub_.publish(replanStateMsg_);
       pub_hover_p(iniState.col(0), replan_stamp);
       return;
-    } else {
-      ROS_ERROR("[planner] REPLAN FAILED, EXECUTE LAST TRAJ...");
-      replanStateMsg_.state = 3;
-      replanState_pub_.publish(replanStateMsg_);
-      return;  // current generated traj invalid but last is valid
     }
     visPtr_->visualize_traj(traj, "traj");
   }
@@ -857,6 +875,7 @@ class Nodelet : public nodelet::Nodelet {
                                                                  &Nodelet::RecvBroadcastPolyTrajCallback,
                                                                  this,
                                                                  ros::TransportHints().tcpNoDelay());
+
     ROS_WARN("Planning node initialized!");
   }
 

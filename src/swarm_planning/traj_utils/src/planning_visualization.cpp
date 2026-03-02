@@ -209,10 +209,21 @@ namespace ego_planner
       line_end_.resize(line_size_);
       line_begin_ = {0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6};
       line_end_   = {1, 2, 3, 4, 5, 6, 2, 3, 4, 5, 6, 1};
-      
       break;
     }
-    
+
+    case FORMATION_TYPE::EQUILATERAL_TRIANGLE:
+    {
+      // 3 drones, 3 edges: 0-1, 1-2, 2-0
+      formation_size_ = 3;
+      line_size_      = 3;
+      line_begin_.resize(line_size_);
+      line_end_.resize(line_size_);
+      line_begin_ = {0, 1, 2};
+      line_end_   = {1, 2, 0};
+      break;
+    }
+
     default:
       break;
     }

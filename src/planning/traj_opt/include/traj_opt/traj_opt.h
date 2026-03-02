@@ -54,9 +54,20 @@ class TrajOpt {
   std::vector<SwarmTrajData> swarm_trajs_;
   bool use_formation_;
   int formation_type_;
+  Eigen::Vector3d formation_offset_;  // 本机在期望编队中的偏移（相对编队质心），仅供外部参考，不用于锁定 finState
 
   // Absolute time at the start of each optimization call (fixed during one L-BFGS run)
   double t_now_;
+
+  // Debug: per-optimization-call cost breakdown (accumulated in addTimeIntPenalty / addTimeCost)
+  double debug_cost_corridor_  = 0;
+  double debug_cost_vel_       = 0;
+  double debug_cost_acc_       = 0;
+  double debug_cost_collision_ = 0;
+  double debug_cost_formation_ = 0;
+  double debug_cost_tracking_  = 0;
+  double debug_cost_vis_       = 0;
+  bool   debug_print_once_     = false;  // set true before each optimize() call, cleared after first print
 
   // polyH utils
   bool extractVs(const std::vector<Eigen::MatrixXd>& hPs,
@@ -90,9 +101,7 @@ class TrajOpt {
   void setDesiredFormation(int type);
   void setSwarmTrajs(const std::vector<SwarmTrajData>& swarm_trajs) { swarm_trajs_ = swarm_trajs; }
 
-  // Formation cost: returns true if penalty was applied.
-  // t: accumulated trajectory time at the current sample point (= sum of durations of previous pieces + s1)
-  // piece: index of the current trajectory piece (needed for grad_prev_t propagation)
+  // Formation cost
   bool grad_cost_swarm_formation(const int piece,
                                  const double t,
                                  const Eigen::Vector3d& p,

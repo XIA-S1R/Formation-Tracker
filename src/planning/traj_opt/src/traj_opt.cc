@@ -178,22 +178,42 @@ static inline double objectiveFunc(void* ptrObj,
 
   Eigen::VectorXd T(obj.N_);
   Eigen::MatrixXd P(3, obj.N_ - 1);
-  // T_sigma = T_s + deltaT^2
   double sumT = obj.sum_T_ + deltaT * deltaT;
   forwardT(t, sumT, T);
-  forwardP(p, obj.cfgVs_, P);//从x中提取出优化变量t和p，并映射出原先的优化变量T和P
+  forwardP(p, obj.cfgVs_, P);
 
-  obj.jerkOpt_.generate(P, T);//用当前P和T生成MINCO轨迹
-  double cost = obj.jerkOpt_.getTrajJerkCost();//计算MINCO轨迹的jerk成本
-  obj.jerkOpt_.calGrads_CT();//计算jerk代价对C和T的成本
-  obj.addTimeIntPenalty(cost); // corridor + v/a + swarm collision + formation (all in one loop)计算位置走廊约束、速度约束、加速度约束转化成的成本，并将它们加到总成本中；同时计算这些约束的梯度，并加到总梯度中
-  obj.addTimeCost(cost);       // tracking + visibility计算追踪代价、可见性代价，并将它们加到总成本中；同时计算这些代价的梯度，并加到总梯度中
-  obj.jerkOpt_.calGrads_PT();//现在综合所有代价，它们对多项式曲线参数(C(P,T),T)的梯度已经计算出来了，接下来把它们转换为对MINCO曲线参数P和T的梯度
+  obj.jerkOpt_.generate(P, T);
+  double cost = obj.jerkOpt_.getTrajJerkCost();
+  obj.jerkOpt_.calGrads_CT();
+
+  // --- per-call cost accumulators (reset before each penalty pass) ---
+  obj.debug_cost_corridor_  = 0;
+  obj.debug_cost_vel_       = 0;
+  obj.debug_cost_acc_       = 0;
+  obj.debug_cost_collision_ = 0;
+  obj.debug_cost_formation_ = 0;
+  obj.debug_cost_tracking_  = 0;
+  obj.debug_cost_vis_       = 0;
+
+  obj.addTimeIntPenalty(cost);
+  obj.addTimeCost(cost);
+  obj.jerkOpt_.calGrads_PT();
   grad[obj.dim_t_ + obj.dim_p_] = obj.jerkOpt_.gdT.dot(T) / sumT + obj.rhoT_;
-  cost += obj.rhoT_ * deltaT * deltaT;//为代价加上时间代价的剩余部分
-  grad[obj.dim_t_ + obj.dim_p_] *= 2 * deltaT;//单独给出x最后一项，即N-1维度的t_向量缺失的最后一段的梯度
+  cost += obj.rhoT_ * deltaT * deltaT;
+  grad[obj.dim_t_ + obj.dim_p_] *= 2 * deltaT;
   addLayerTGrad(t, sumT, obj.jerkOpt_.gdT, gradt);
-  addLayerPGrad(p, obj.cfgVs_, obj.jerkOpt_.gdP, gradp);//将代价对MINCO曲线参数(P,T)的梯度转换为代价对优化变量p,t的梯度
+  addLayerPGrad(p, obj.cfgVs_, obj.jerkOpt_.gdP, gradp);
+
+  // Print cost breakdown every first iteration of each optimization call
+  if (obj.debug_print_once_) {
+    obj.debug_print_once_ = false;
+    printf("\033[36m[drone %d cost] corridor=%.1f  vel=%.1f  acc=%.1f  "
+           "collision=%.1f  formation=%.1f  tracking=%.1f  vis=%.1f  total=%.1f\033[0m\n",
+           obj.drone_id_,
+           obj.debug_cost_corridor_, obj.debug_cost_vel_, obj.debug_cost_acc_,
+           obj.debug_cost_collision_, obj.debug_cost_formation_,
+           obj.debug_cost_tracking_, obj.debug_cost_vis_, cost);
+  }
 
   return cost;
 }
@@ -316,9 +336,8 @@ void TrajOpt::setBoundConds(const Eigen::MatrixXd& iniState,
 }
 
 int TrajOpt::optimize(const double& delta) {
-  // Fix the absolute time reference once per optimization call so that
-  // all L-BFGS iterations use a consistent time base.
   t_now_ = ros::Time::now().toSec();
+  debug_print_once_ = true;  // print cost breakdown on first L-BFGS iteration
 
   // Setup for L-BFGS solver
   lbfgs::lbfgs_parameter_t lbfgs_params;
@@ -448,7 +467,7 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
   return true;
 }
 
-void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度约束、加速度约束代价，并加到总成本中；同时计算这些约束的梯度，并加到总梯度中
+void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度走廊约束、加速度约束代价，并加到总成本中；同时计算这些约束的梯度，并加到总梯度中
   Eigen::Vector3d pos, vel, acc, jer;
   Eigen::Vector3d grad_tmp;
   double cost_tmp;
@@ -496,6 +515,7 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度约�
         jerkOpt_.gdC.block<6, 3>(i * 6, 0) += omg * step * gradViolaPc;
         jerkOpt_.gdT(i) += omg * (cost_tmp / K_ + step * gradViolaPt);
         cost += omg * step * cost_tmp;
+        debug_cost_corridor_ += omg * step * cost_tmp;
       }
       if (grad_cost_v(vel, grad_tmp, cost_tmp)) {
         gradViolaVc = beta1 * grad_tmp.transpose();
@@ -503,6 +523,7 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度约�
         jerkOpt_.gdC.block<6, 3>(i * 6, 0) += omg * step * gradViolaVc;
         jerkOpt_.gdT(i) += omg * (cost_tmp / K_ + step * gradViolaVt);
         cost += omg * step * cost_tmp;
+        debug_cost_vel_ += omg * step * cost_tmp;
       }
       if (grad_cost_a(acc, grad_tmp, cost_tmp)) {
         gradViolaAc = beta2 * grad_tmp.transpose();
@@ -510,6 +531,7 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度约�
         jerkOpt_.gdC.block<6, 3>(i * 6, 0) += omg * step * gradViolaAc;
         jerkOpt_.gdT(i) += omg * (cost_tmp / K_ + step * gradViolaAt);
         cost += omg * step * cost_tmp;
+        debug_cost_acc_ += omg * step * cost_tmp;
       }
 
       // ---- Swarm collision avoidance ----
@@ -525,6 +547,7 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度约�
             jerkOpt_.gdT.head(i).array() += omg * step * grad_prev_t_swarm;
           }
           cost += omg * step * costp_swarm;
+          debug_cost_collision_ += omg * step * costp_swarm;
         }
       }
 
@@ -534,14 +557,14 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度约�
         if (grad_cost_swarm_formation(i, t_sample, pos, vel,
                                        grad_tmp, gradt_form, grad_prev_t_form, costp_form)) {
           gradViolaPc = beta0 * grad_tmp.transpose();
-          // gradt_form is already the full dJ/dT_i (not a "slope" w.r.t. s1),
-          // so do NOT multiply by alpha here. Accumulate directly into gdT.
+          gradViolaPt = alpha * gradt_form;
           jerkOpt_.gdC.block<6, 3>(i * 6, 0) += omg * step * gradViolaPc;
-          jerkOpt_.gdT(i) += omg * step * gradt_form;
+          jerkOpt_.gdT(i) += omg * (costp_form / K_ + step * gradViolaPt);
           if (i > 0) {
             jerkOpt_.gdT.head(i).array() += omg * step * grad_prev_t_form;
           }
           cost += omg * step * costp_form;
+          debug_cost_formation_ += omg * step * costp_form;
         }
       }
 
@@ -567,8 +590,9 @@ bool TrajOpt::grad_cost_swarm_collision(const int piece,
   grad_prev_t = 0;
   costp = 0;
 
-  // Ellipsoid semi-axes: horizontal clearance a, vertical clearance b
-  constexpr double a = 2.0, b = 1.0;
+  // Ellipsoid semi-axes: keep small enough to not conflict with 2m triangle formation
+  // horizontal clearance 0.8m, vertical clearance 0.5m
+  constexpr double a = 0.8, b = 0.5;
   constexpr double inv_a2 = 1.0 / (a * a), inv_b2 = 1.0 / (b * b);
   const double CLEARANCE2 = (rhoSwarm_ > 0) ? 1.0 : 1.0; // normalized: penalty starts when ellip_dist2 < 1
   // NOTE: rhoSwarm_ is the weight; the clearance ellipsoid has semi-axes a,b (unit ellipsoid = 1).
@@ -629,12 +653,19 @@ bool TrajOpt::grad_cost_swarm_formation(const int piece,
                                         double& costp) {
   if (!use_formation_ || swarm_graph_ == nullptr) return false;
 
-  // Need all other drones to have published a trajectory
+  // 严格对齐 Swarm-Formation 的冷启动逻辑：
+  // 只有当所有其他无人机的轨迹都就绪时才计算编队代价；
+  // 唯一例外是最后一架无人机（drone_id_ == formation_size_ - 1），
+  // 它强制认为所有轨迹都就绪，保证编队代价从冷启动开始就至少有一架无人机在执行。
   int ready_count = 0;
-  for (size_t id = 0; id < swarm_trajs_.size(); ++id) {
-    if ((int)id != drone_id_ && swarm_trajs_[id].drone_id >= 0) ready_count++;
+  for (int id = 0; id < formation_size_; ++id) {
+    if (id == drone_id_) continue;
+    if ((int)swarm_trajs_.size() > id && swarm_trajs_[id].drone_id >= 0)
+      ready_count++;
   }
-  if (ready_count < formation_size_ - 1) return false;
+  bool is_last_drone = (drone_id_ == formation_size_ - 1);
+  if (!is_last_drone && ready_count < formation_size_ - 1)
+    return false;  // 轨迹未全部就绪，跳过（最后一架无人机除外）
 
   bool ret = false;
   gradp.setZero();
@@ -642,37 +673,42 @@ bool TrajOpt::grad_cost_swarm_formation(const int piece,
   grad_prev_t = 0;
   costp = 0;
 
-  double pt_time = t_now_ + t;  // absolute time of this sample point
+  double pt_time = t_now_ + t;
 
-  // Build position/velocity vectors for the whole swarm at pt_time
   std::vector<Eigen::Vector3d> swarm_pos(formation_size_, Eigen::Vector3d::Zero());
   std::vector<Eigen::Vector3d> swarm_vel(formation_size_, Eigen::Vector3d::Zero());
 
   swarm_pos[drone_id_] = p;
   swarm_vel[drone_id_] = v;
 
-  for (size_t id = 0; id < swarm_trajs_.size(); ++id) {
-    if ((int)id == drone_id_ || swarm_trajs_[id].drone_id < 0) continue;
-    if ((int)id >= formation_size_) continue;
+  for (int id = 0; id < formation_size_; ++id) {
+    if (id == drone_id_) continue;
 
-    double traj_start = swarm_trajs_[id].start_time;
-    double t_other = pt_time - traj_start;
-    if (t_other >= 0 && t_other < swarm_trajs_[id].duration) {
-      swarm_pos[id] = swarm_trajs_[id].traj.getPos(t_other);
-      swarm_vel[id] = swarm_trajs_[id].traj.getVel(t_other);
-    } else if (t_other >= swarm_trajs_[id].duration) {
-      swarm_vel[id] = swarm_trajs_[id].traj.getVel(swarm_trajs_[id].duration);
-      swarm_pos[id] = swarm_trajs_[id].traj.getPos(swarm_trajs_[id].duration) +
-                      (t_other - swarm_trajs_[id].duration) * swarm_vel[id];
+    bool traj_ready = ((int)swarm_trajs_.size() > id && swarm_trajs_[id].drone_id >= 0);
+
+    if (traj_ready) {
+      double traj_start = swarm_trajs_[id].start_time;
+      double t_other = pt_time - traj_start;
+      if (t_other >= 0 && t_other < swarm_trajs_[id].duration) {
+        swarm_pos[id] = swarm_trajs_[id].traj.getPos(t_other);
+        swarm_vel[id] = swarm_trajs_[id].traj.getVel(t_other);
+      } else if (t_other >= swarm_trajs_[id].duration) {
+        swarm_vel[id] = swarm_trajs_[id].traj.getVel(swarm_trajs_[id].duration);
+        swarm_pos[id] = swarm_trajs_[id].traj.getPos(swarm_trajs_[id].duration) +
+                        (t_other - swarm_trajs_[id].duration) * swarm_vel[id];
+      } else {
+        return false;  // t_other < 0，时间对不上，跳过
+      }
     } else {
-      return false;  // Some drone's traj not yet started
+      // 最后一架无人机且轨迹未就绪：用自身当前位置占位，速度设零
+      // 这样 SNL 至少能用本机 + 已就绪的无人机位置计算，不会退化
+      swarm_pos[id] = p;  // 占位，SNL 会产生排斥力让它们分散
+      swarm_vel[id].setZero();
     }
   }
 
-  // Update the SwarmGraph with the current swarm positions
   swarm_graph_->updateGraph(swarm_pos);
 
-  // Get the scalar formation error (squared F-norm of SNL difference)
   double similarity_error;
   if (!swarm_graph_->calcFNorm2(similarity_error)) return false;
 
@@ -680,23 +716,15 @@ bool TrajOpt::grad_cost_swarm_formation(const int piece,
     ret = true;
     costp = wei_formation_ * similarity_error;
 
-    // Get per-agent position gradients from SwarmGraph
     std::vector<Eigen::Vector3d> swarm_grad;
     swarm_graph_->getGrad(swarm_grad);
 
-    // Gradient w.r.t. self position
     gradp = wei_formation_ * swarm_grad[drone_id_];
 
-    // Gradient w.r.t. T_i (current piece duration):
-    //   dJ/dT_i = sum_k [ dJ/dp_k · v_k ]
     for (int id = 0; id < formation_size_; ++id) {
       gradt += wei_formation_ * swarm_grad[id].dot(swarm_vel[id]);
-    }
-
-    // Gradient w.r.t. T_{0..i-1} (all previous piece durations):
-    //   Only the other drones' positions depend on previous T segments.
-    for (int id = 0; id < formation_size_; ++id) {
-      grad_prev_t += wei_formation_ * swarm_grad[id].dot(swarm_vel[id]);
+      if (id != drone_id_)
+        grad_prev_t += wei_formation_ * swarm_grad[id].dot(swarm_vel[id]);
     }
   }
 
@@ -740,6 +768,7 @@ void TrajOpt::addTimeCost(double& cost) {
       if (grad_cost_p_landing(pos, target_p, grad_tmp, cost_tmp)) {
         gradViolaPc = beta0 * grad_tmp.transpose();
         cost += rho * step * cost_tmp;
+        debug_cost_tracking_ += rho * step * cost_tmp;
         jerkOpt_.gdC.block<6, 3>(piece * 6, 0) += rho * step * gradViolaPc;
         if (piece > 0) {
           jerkOpt_.gdT.head(piece).array() += -rho * step * grad_tmp.dot(vel);
@@ -749,6 +778,7 @@ void TrajOpt::addTimeCost(double& cost) {
       if (grad_cost_p_tracking(pos, target_p, grad_tmp, cost_tmp)) {
         gradViolaPc = beta0 * grad_tmp.transpose();
         cost += rho * step * cost_tmp;
+        debug_cost_tracking_ += rho * step * cost_tmp;
         jerkOpt_.gdC.block<6, 3>(piece * 6, 0) += rho * step * gradViolaPc;
         if (piece > 0) {
           jerkOpt_.gdT.head(piece).array() += -rho * step * grad_tmp.dot(vel);
@@ -759,6 +789,7 @@ void TrajOpt::addTimeCost(double& cost) {
                                grad_tmp, cost_tmp)) {
         gradViolaPc = beta0 * grad_tmp.transpose();
         cost += rho * step * cost_tmp;
+        debug_cost_vis_ += rho * step * cost_tmp;
         jerkOpt_.gdC.block<6, 3>(piece * 6, 0) += rho * step * gradViolaPc;
         if (piece > 0) {
           jerkOpt_.gdT.head(piece).array() += -rho * step * grad_tmp.dot(vel);
@@ -989,6 +1020,20 @@ void TrajOpt::setDesiredFormation(int type) {
 
       formation_size_ = swarm_des.size();
       swarm_graph_->setDesiredForm(swarm_des);
+      break;
+    case 2: // EQUILATERAL_TRIANGLE (3 drones, edge length = 2m)
+      v0 <<  0.0,    1.1547, 0;
+      v1 <<  1.0,   -0.5774, 0;
+      v2 << -1.0,   -0.5774, 0;
+      swarm_des.push_back(v0);
+      swarm_des.push_back(v1);
+      swarm_des.push_back(v2);
+      formation_size_ = swarm_des.size();
+      use_formation_ = true;
+      swarm_graph_->setDesiredForm(swarm_des);
+      // 保存本机的期望偏移
+      if (drone_id_ >= 0 && drone_id_ < (int)swarm_des.size())
+        formation_offset_ = swarm_des[drone_id_];
       break;
     default:
       break;

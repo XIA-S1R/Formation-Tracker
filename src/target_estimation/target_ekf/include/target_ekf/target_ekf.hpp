@@ -80,11 +80,13 @@ struct Ekf {
     return;
   }
   inline void reset(const Eigen::Vector3d& z, const Eigen::Vector3d& z_rpy) {
+    Eigen::Vector3d old_vel = x.middleRows(3, 3);  // 保留旧速度估计，比清零更合理
     x.setZero();
     x.head(3) = z;
+    x.middleRows(3, 3) = old_vel;  // 复用旧速度，避免速度突变传给规划器
     x.tail(3) = z_rpy;
     Sigma.setIdentity(9, 9);
-    Sigma *= 10.0;  // 设为较大初始不确定度，确保reset后第一次update能有效收敛
+    Sigma *= 10.0;
   }
   inline bool update(const Eigen::Vector3d& z, const Eigen::Vector3d& z_rqp) {
     K = Sigma * C.transpose() * (C * Sigma * C.transpose() + Rt).inverse();

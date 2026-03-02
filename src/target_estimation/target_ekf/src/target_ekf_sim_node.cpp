@@ -26,6 +26,8 @@ double fx_, fy_, cx_, cy_, width_, height_;
 ros::Time last_update_stamp_;
 double pitch_thr_ = 30;
 bool check_fov_ = false;
+bool ekf_initialized_ = false;      // ekf 是否已经有过至少一次有效 update
+int ekf_reset_suppress_count_ = 0;  // reset 后抑制发布的帧数
 
 std::shared_ptr<Ekf> ekfPtr_;
 
@@ -60,7 +62,8 @@ struct SimpleOccMap {
 } occMap_;
 
 bool isLineOfSightClear(const Eigen::Vector3d& start, const Eigen::Vector3d& end) {
-  if (!occMap_.received) return false;
+  // 地图未收到时不做遮挡检测，直接认为视线畅通，避免 ekf 无法初始化
+  if (!occMap_.received) return true;
 
   double dist = (end - start).norm();
   if (dist > 15.0) return false;
@@ -82,9 +85,14 @@ void global_map_callback(const sensor_msgs::PointCloud2ConstPtr& msg) {
 }
 
 void predict_state_callback(const ros::TimerEvent& event) {
-  // 地图未收到前持续刷新last_update_stamp_，避免误报too long time no update
-  if (!occMap_.received) {
-    last_update_stamp_ = ros::Time::now();
+  // reset 后静默几帧
+  if (ekf_reset_suppress_count_ > 0) {
+    ekf_reset_suppress_count_--;
+    return;
+  }
+
+  // ekf 未初始化则不发布
+  if (!ekf_initialized_) {
     return;
   }
 
@@ -95,7 +103,7 @@ void predict_state_callback(const ros::TimerEvent& event) {
     ROS_WARN("[ekf] too long time no update!");
     return;
   }
-  // publish target odom
+
   nav_msgs::Odometry target_odom;
   target_odom.header.stamp = ros::Time::now();
   target_odom.header.frame_id = "world";
@@ -115,8 +123,6 @@ void predict_state_callback(const ros::TimerEvent& event) {
 }
 
 void update_state_callback(const nav_msgs::OdometryConstPtr& target_msg, const nav_msgs::OdometryConstPtr& odom_msg) {
-  // std::cout << "yolo stamp: " << bboxes_msg->header.stamp << std::endl;
-  // std::cout << "odom stamp: " << odom_msg->header.stamp << std::endl;
   Eigen::Vector3d odom_p, p;
   Eigen::Quaterniond odom_q, q;
   odom_p(0) = odom_msg->pose.pose.position.x;
@@ -143,36 +149,34 @@ void update_state_callback(const nav_msgs::OdometryConstPtr& target_msg, const n
   // NOTE check whether it's in FOV
   if (check_fov_) {
     Eigen::Vector3d p_in_body = cam_q.inverse() * (p - cam_p);
-    if (p_in_body.z() < 0.1 || p_in_body.z() > 5.0) {
-      return;
-    }
+    if (p_in_body.z() < 0.1 || p_in_body.z() > 5.0) return;
     double x = p_in_body.x() * fx_ / p_in_body.z() + cx_;
-    if (x < 0 || x > height_) {
-      return;
-    }
+    if (x < 0 || x > height_) return;
     double y = p_in_body.y() * fy_ / p_in_body.z() + cy_;
-    if (y < 0 || y > width_) {
-      return;
-    }
+    if (y < 0 || y > width_) return;
   }
 
-  // Check line of sight
   if (!occMap_.received) {
-    // 地图未收到，静默跳过，同时刷新时间戳避免后续误触发reset
-    last_update_stamp_ = ros::Time::now();
-    return;
+    return;  // 地图未到，跳过但不刷新 last_update_stamp_
   }
-  if (!isLineOfSightClear(cam_p, p)) {
+
+  // 视线遮挡检测：只在 ekf 已初始化后才生效
+  // 首次初始化时无论视线是否遮挡都必须完成，否则视线被遮挡的无人机永远无法启动
+  if (ekf_initialized_ && !isLineOfSightClear(cam_p, p)) {
     return;
   }
 
-  // update target odom
   double update_dt = (ros::Time::now() - last_update_stamp_).toSec();
-  if (update_dt > 5.0) {
+  if (!ekf_initialized_ || update_dt > 1.0) {
+    // 首次初始化或长时间丢失后 reset：
+    // 静默 3 帧（约 150ms@20Hz），让 ekf 先用真实观测稳定再发布给规划器
     ekfPtr_->reset(p, rpy);
-    ROS_WARN("[ekf] reset!");
+    ekf_initialized_ = true;
+    ekf_reset_suppress_count_ = 3;
+    ROS_WARN("[ekf] reset! suppressing %d frames.", ekf_reset_suppress_count_);
   } else if (ekfPtr_->update(p, rpy)) {
-    // ROS_WARN("[ekf] update!");
+    // 正常更新，清空静默计数（如果还在静默期也立即解除）
+    ekf_reset_suppress_count_ = 0;
   } else {
     ROS_ERROR("[ekf] update invalid!");
     return;
@@ -212,7 +216,7 @@ int main(int argc, char** argv) {
   ros::Subscriber single_odom_sub = nh.subscribe("odom", 100, &odom_callback, ros::TransportHints().tcpNoDelay());
   target_odom_pub_ = nh.advertise<nav_msgs::Odometry>("target_odom", 1);
   yolo_odom_pub_ = nh.advertise<nav_msgs::Odometry>("yolo_odom", 1);
-  ros::Subscriber global_map_sub = nh.subscribe("global_map", 1, &global_map_callback);
+  ros::Subscriber global_map_sub = nh.subscribe("global_map", 10, &global_map_callback);
 
   int ekf_rate = 20;
   nh.getParam("ekf_rate", ekf_rate);
