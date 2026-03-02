@@ -5,6 +5,7 @@
 
 #include <Eigen/Core>
 #include <queue>
+#include <memory>
 
 namespace prediction {
 
@@ -25,13 +26,14 @@ class NodeComparator {
 struct Predict {
  private:
   static constexpr int MAX_MEMORY = 1 << 22;
-  // searching
 
   double dt;
   double pre_dur;
   double rho_a;
   double car_z, vmax;
   mapping::OccGridMap map;
+  // Single heap allocation — O(1) construction, no 4M individual new/delete.
+  std::unique_ptr<Node[]> data_pool_;
   NodePtr data[MAX_MEMORY];
   int stack_top;
 
@@ -45,8 +47,10 @@ struct Predict {
     nh.getParam("tracking_dt", dt);
     nh.getParam("prediction/rho_a", rho_a);
     nh.getParam("prediction/vmax", vmax);
+    // One allocation for the whole pool, then point each slot into it.
+    data_pool_.reset(new Node[MAX_MEMORY]);
     for (int i = 0; i < MAX_MEMORY; ++i) {
-      data[i] = new Node;
+      data[i] = &data_pool_[i];
     }
   }
   inline void setMap(const mapping::OccGridMap& _map) {

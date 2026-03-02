@@ -85,6 +85,14 @@ void DepthRender::set_para(float _fx, float _fy, float _cx, float _cy, int _widt
 
 void DepthRender::set_data(vector<float> &cloud_data)
 {
+	// Free previously allocated memory before reallocating
+	if (has_devptr) {
+		free(host_cloud_ptr);
+		cudaFree(dev_cloud_ptr);
+		cudaFree(parameter_devptr);
+		has_devptr = false;
+	}
+
 	cloud_size = cloud_data.size() / 3;
 	parameter.point_number = cloud_size;
 
@@ -92,72 +100,31 @@ void DepthRender::set_data(vector<float> &cloud_data)
 	for(int i = 0; i < cloud_size; i++)
 		host_cloud_ptr[i] = make_float3(cloud_data[3*i], cloud_data[3*i+1], cloud_data[3*i+2]);
 
-  cudaError err = cudaMalloc(&dev_cloud_ptr, cloud_size * sizeof(float3));
-  if(err != cudaSuccess)
-    throw CudaException("DeviceLinear: unable to allocate linear memory.", err);
- 	err = cudaMemcpy(
-          dev_cloud_ptr,
-          host_cloud_ptr,
-          cloud_size * sizeof(float3),
-          cudaMemcpyHostToDevice);
-  if(err != cudaSuccess)
-  	throw CudaException("DeviceLinear: unable to copy data from host to device.", err);
-
-  err = cudaMalloc(&parameter_devptr, sizeof(Parameter));
-  if(err != cudaSuccess)
-    throw CudaException("DeviceLinear: unable to allocate linear memory.", err);
- 	err = cudaMemcpy(
-          parameter_devptr,
-          &parameter,
-          sizeof(Parameter),
-          cudaMemcpyHostToDevice);
-  if(err != cudaSuccess)
-  	throw CudaException("DeviceLinear: unable to copy data from host to device.", err);
-
-  has_devptr = true;
-
-  //printf("load points done!\n");
-}
-
-/*void DepthRender::render_pose( Matrix3d &rotation, Vector3d &translation, int *host_ptr)
-{
-	for(int i = 0; i < 3; i++)
-	{
-		parameter.t[i] = translation(i);
-		for(int j = 0; j < 3; j++)
-		{
-			parameter.r[i][j] = rotation(i,j);
-		}
+	cudaError err = cudaMalloc(&dev_cloud_ptr, cloud_size * sizeof(float3));
+	if(err != cudaSuccess) {
+		fprintf(stderr, "[depth_render] cudaMalloc dev_cloud_ptr failed: %s\n", cudaGetErrorString(err));
+		throw CudaException("DeviceLinear: unable to allocate linear memory.", err);
 	}
- 	cudaError err = cudaMemcpy(
-          parameter_devptr,
-          &parameter,
-          sizeof(Parameter),
-          cudaMemcpyHostToDevice);
-  if(err != cudaSuccess)
-  	throw CudaException("DeviceLinear: unable to copy data from host to device.", err);
+	err = cudaMemcpy(dev_cloud_ptr, host_cloud_ptr, cloud_size * sizeof(float3), cudaMemcpyHostToDevice);
+	if(err != cudaSuccess) {
+		fprintf(stderr, "[depth_render] cudaMemcpy cloud failed: %s\n", cudaGetErrorString(err));
+		throw CudaException("DeviceLinear: unable to copy data from host to device.", err);
+	}
 
-	DeviceImage<int> depth_output(parameter.width, parameter.height);
-  depth_output.zero();
+	err = cudaMalloc(&parameter_devptr, sizeof(Parameter));
+	if(err != cudaSuccess) {
+		fprintf(stderr, "[depth_render] cudaMalloc parameter failed: %s\n", cudaGetErrorString(err));
+		throw CudaException("DeviceLinear: unable to allocate linear memory.", err);
+	}
+	err = cudaMemcpy(parameter_devptr, &parameter, sizeof(Parameter), cudaMemcpyHostToDevice);
+	if(err != cudaSuccess) {
+		fprintf(stderr, "[depth_render] cudaMemcpy parameter failed: %s\n", cudaGetErrorString(err));
+		throw CudaException("DeviceLinear: unable to copy data from host to device.", err);
+	}
 
-  dim3 depth_block;
-  dim3 depth_grid;
-  depth_block.x = 16;
-  depth_block.y = 16;
-  depth_grid.x = (parameter.width + depth_block.x - 1 ) / depth_block.x;
-  depth_grid.y = (parameter.height + depth_block.y - 1 ) / depth_block.y;
-  depth_initial<<<depth_grid, depth_block>>>(depth_output.dev_ptr);
-
-  dim3 render_block;
-  dim3 render_grid;
-  render_block.x = 64;
-  render_grid.x = (cloud_size + render_block.x - 1) / render_block.x;
-  render<<<render_grid, render_block>>>(dev_cloud_ptr, parameter_devptr, depth_output.dev_ptr);
-
-	depth_output.getDevData(host_ptr);
+	has_devptr = true;
 }
-*/
-//void DepthRender::render_pose( Matrix4d &transformation, int *host_ptr)
+
 void DepthRender::render_pose( double * transformation, int *host_ptr)
 {
 	for(int i = 0; i < 3; i++)

@@ -1,8 +1,7 @@
 PROJECT(local_sensing_node)
 CMAKE_MINIMUM_REQUIRED(VERSION 2.8.3)
-SET(CMAKE_BUILD_TYPE Release) # Release, RelWithDebInfo
+SET(CMAKE_BUILD_TYPE Release)
 SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14")
-# set(ENABLE_CUDA false)
 set(ENABLE_CUDA true)
 
 if(ENABLE_CUDA)
@@ -21,6 +20,8 @@ if(ENABLE_CUDA)
   ) 
 
   SET(CUDA_PROPAGATE_HOST_FLAGS OFF)
+  # Force dynamic cudart to avoid "unknown error" from static cudart + newer driver
+  set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
 
   find_package(OpenCV REQUIRED)
   find_package(Eigen3 REQUIRED)
@@ -51,12 +52,17 @@ if(ENABLE_CUDA)
       src/depth_render.cu
   )
 
+  target_link_libraries( depth_render_cuda
+    ${CUDA_LIBRARIES}
+  )
+
   add_executable(
     pcl_render_node
     src/pcl_render_node.cpp
   )
   target_link_libraries( pcl_render_node
     depth_render_cuda
+    ${CUDA_LIBRARIES}
     ${OpenCV_LIBS}
     ${Boost_LIBRARIES}
     ${catkin_LIBRARIES}

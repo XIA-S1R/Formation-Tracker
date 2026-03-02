@@ -57,6 +57,9 @@ class Env {
 
   std::unordered_map<Eigen::Vector3i, NodePtr> visited_nodes_;
   std::shared_ptr<mapping::OccGridMap> mapPtr_;
+  // Use a single contiguous pool instead of 262144 individual heap allocations.
+  // This makes the Env constructor O(1) instead of O(MAX_MEMORY).
+  Node data_pool_[MAX_MEMORY];
   NodePtr data_[MAX_MEMORY];
   double desired_dist_, theta_clearance_, tolerance_d_;
 
@@ -81,14 +84,13 @@ class Env {
     nh.getParam("tracking_dist", desired_dist_);
     nh.getParam("tolerance_d", tolerance_d_);
     nh.getParam("theta_clearance", theta_clearance_);
+    // Point each pointer to its slot in the contiguous pool — no heap allocation.
     for (int i = 0; i < MAX_MEMORY; ++i) {
-      data_[i] = new Node;
+      data_[i] = &data_pool_[i];
     }
   }
   ~Env() {
-    for (int i = 0; i < MAX_MEMORY; ++i) {
-      delete data_[i];
-    }
+    // Nothing to delete: data_pool_ is a member array, freed automatically.
   }
 
   bool inline checkRayValid(const Eigen::Vector3d& p0, const Eigen::Vector3d& p1, double max_dist) const {

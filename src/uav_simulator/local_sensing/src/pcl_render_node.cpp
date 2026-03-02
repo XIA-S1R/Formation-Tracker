@@ -143,10 +143,8 @@ void rcvGlobalPointCloudCallBack(const sensor_msgs::PointCloud2 &pointcloud_map)
     return;
 
   ROS_WARN("Global Pointcloud received..");
-  //load global map
   pcl::PointCloud<pcl::PointXYZ> cloudIn;
   pcl::PointXYZ pt_in;
-  //transform map to point cloud format
   pcl::fromROSMsg(pointcloud_map, cloudIn);
   for (int i = 0; i < int(cloudIn.points.size()); i++) {
     pt_in = cloudIn.points[i];
@@ -155,12 +153,14 @@ void rcvGlobalPointCloudCallBack(const sensor_msgs::PointCloud2 &pointcloud_map)
     cloud_data.push_back(pt_in.z);
   }
   printf("global map has points: %d.\n", (int)cloud_data.size() / 3);
-  //pass cloud_data to depth render
-  depthrender.set_data(cloud_data);
-  depth_hostptr = (int *)malloc(width * height * sizeof(int));
-
-  has_global_map = true;
-  // ROS_ERROR("GLOBAL!!!!");
+  try {
+    depthrender.set_data(cloud_data);
+    depth_hostptr = (int *)malloc(width * height * sizeof(int));
+    has_global_map = true;
+  } catch (const std::exception& e) {
+    ROS_ERROR("[pcl_render] CUDA set_data failed: %s — will retry on next message.", e.what());
+    cloud_data.clear();  // 重置，下次回调重试
+  }
 }
 
 void rcvLocalPointCloudCallBack(const sensor_msgs::PointCloud2 &pointcloud_map) {
