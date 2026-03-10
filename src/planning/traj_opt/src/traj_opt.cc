@@ -721,11 +721,17 @@ bool TrajOpt::grad_cost_swarm_formation(const int piece,
 
     gradp = wei_formation_ * swarm_grad[drone_id_];
 
+    // dJ/d(t_sample) = Σ_id  (dJ/dp_id) · (dp_id/dt_sample)
+    // t_sample 是绝对时间，所有无人机的位置都随之变化，因此需要累加所有无人机速度的贡献。
+    // gradt = grad_prev_t = dJ/d(t_sample)（两者推导完全相同）
+    double dJdt = wei_formation_ * swarm_grad[drone_id_].dot(v);  // 本机
     for (int id = 0; id < formation_size_; ++id) {
-      gradt += wei_formation_ * swarm_grad[id].dot(swarm_vel[id]);
-      if (id != drone_id_)
-        grad_prev_t += wei_formation_ * swarm_grad[id].dot(swarm_vel[id]);
+      if (id == drone_id_) continue;
+      // swarm_vel[id] 在轨迹未就绪时已置零，自动不贡献
+      dJdt += wei_formation_ * swarm_grad[id].dot(swarm_vel[id]);  // 其他机
     }
+    gradt       = dJdt;
+    grad_prev_t = dJdt;
   }
 
   return ret;
