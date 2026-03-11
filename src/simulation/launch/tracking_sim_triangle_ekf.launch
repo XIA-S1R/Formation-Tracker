@@ -126,16 +126,10 @@
       <param name="color_g" value="0.5"/>
       <param name="color_b" value="1.0"/>
     </node>
-    <node name="drone0_target_dpf" pkg="target_ekf"
-          type="target_dpf_sim_node" output="screen">
+    <node name="target_estimator" pkg="target_ekf"
+          type="target_ekf_sim_node" output="screen">
       <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
       <param name="pitch_thr" value="37"/>
-      <param name="drone_id" value="0"/>
-      <param name="num_drones" value="3"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="1000"/>
-      <param name="num_components" value="10"/>
-      <param name="num_em_iters" value="10"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
       <remap from="~target_odom" to="target_ekf_odom"/>
@@ -169,16 +163,10 @@
       <param name="color_g" value="0.8"/>
       <param name="color_b" value="0.2"/>
     </node>
-    <node name="drone1_target_dpf" pkg="target_ekf"
-          type="target_dpf_sim_node" output="screen">
+    <node name="target_estimator" pkg="target_ekf"
+          type="target_ekf_sim_node" output="screen">
       <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
       <param name="pitch_thr" value="37"/>
-      <param name="drone_id" value="1"/>
-      <param name="num_drones" value="3"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="1000"/>
-      <param name="num_components" value="10"/>
-      <param name="num_em_iters" value="10"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
       <remap from="~target_odom" to="target_ekf_odom"/>
@@ -212,16 +200,10 @@
       <param name="color_g" value="0.6"/>
       <param name="color_b" value="0.0"/>
     </node>
-    <node name="drone2_target_dpf" pkg="target_ekf"
-          type="target_dpf_sim_node" output="screen">
+    <node name="target_estimator" pkg="target_ekf"
+          type="target_ekf_sim_node" output="screen">
       <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
       <param name="pitch_thr" value="37"/>
-      <param name="drone_id" value="2"/>
-      <param name="num_drones" value="3"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="1000"/>
-      <param name="num_components" value="10"/>
-      <param name="num_em_iters" value="10"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
       <remap from="~target_odom" to="target_ekf_odom"/>

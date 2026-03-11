@@ -11,18 +11,30 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   nav_msgs
   geometry_msgs
+  std_msgs
   tracking_msgs
   object_detection_msgs
   quadrotor_msgs
   message_filters
+  message_generation
   pcl_conversions
   pcl_ros
   Eigen3 REQUIRED
 )
 
+add_message_files(
+  FILES
+  LocalStats.msg
+)
+
+generate_messages(
+  DEPENDENCIES
+  std_msgs
+)
+
 catkin_package(
   INCLUDE_DIRS ${EIGEN3_INCLUDE_DIR}
-  CATKIN_DEPENDS object_detection_msgs
+  CATKIN_DEPENDS object_detection_msgs message_runtime std_msgs
   DEPENDS EIGEN3
 )
 
@@ -56,4 +68,18 @@ target_link_libraries(target_ekf_sim_node
 
 add_dependencies(target_ekf_sim_node
   ${catkin_EXPORTED_TARGETS}
+)
+
+add_executable(target_dpf_sim_node
+ src/target_dpf_sim_node.cpp
+)
+
+target_link_libraries(target_dpf_sim_node
+   ${catkin_LIBRARIES}
+   ${PCL_LIBRARIES}
+)
+
+add_dependencies(target_dpf_sim_node
+  ${catkin_EXPORTED_TARGETS}
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
 )

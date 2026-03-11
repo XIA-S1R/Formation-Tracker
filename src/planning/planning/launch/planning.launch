@@ -22,7 +22,7 @@
     <param name="vmax"           value="1.5"/>
     <param name="amax"           value="3.0"/>
     <param name="rhoT"           value="100.0"/>
-    <param name="rhoP"           value="10000.0"/>
+    <param name="rhoP"           value="100000.0"/>
     <param name="rhoV"           value="1000.0"/>
     <param name="rhoA"           value="1000.0"/>
     <param name="rhoTracking"    value="$(arg rhoTracking_)"/><!-- 追踪成本的权重 -->
@@ -39,7 +39,7 @@
     <param name="prediction/vmax"  value="4.0"/>
 
     <!-- Swarm / formation parameters -->
-    <param name="rhoSwarm"                       value="10000.0"/><!-- 集群避撞权重 -->
+    <param name="rhoSwarm"                       value="100000.0"/><!-- 集群避撞权重 -->
     <param name="optimization/drone_id"          value="$(arg drone_id)" type="int"/>
     <!-- formation_type: 0 = none, 1 = regular hexagon (7 drones), 2 = equilateral triangle (3 drones) -->
     <param name="optimization/formation_type"
