@@ -1,18 +1,17 @@
-# Local summary quantities for Distributed Particle Filter (Gu 2007, Eq.21)
-# Each drone publishes this after computing local statistics from weighted particles.
+std_msgs/Header header
+int32 drone_id
+int32 num_components
+int32 state_dim    # 新增：GMM拟合的状态维度=9，对应论文的nx
+int32 obs_dim      # 保留：观测维度=6，仅用于观测更新
+bool has_observation
 
-Header    header
-int32     drone_id            # sender drone ID (m)
-int32     num_components      # C: number of GMM components
-int32     obs_dim             # n_z: dimension of predicted observations
+# 本地统计量u (论文公式21)，9维状态空间
+float64[] alpha_local
+float64[] a_local    # C*state_dim 维
+float64[] b_local    # C*state_dim*state_dim 维
 
-# Local summary quantities for each GMM component c (Eq.21):
-#   alpha_local[c] = k * alpha_{m,c}  (scalar per component)
-#   a_local[c]     = a_{m,c}          (obs_dim vector per component, flattened)
-#   b_local[c]     = b_{m,c}          (obs_dim x obs_dim matrix per component, flattened)
+# 共识状态ζ (论文公式26)，9维状态空间
+float64[] zeta_alpha
+float64[] zeta_a     # C*state_dim 维
+float64[] zeta_b     # C*state_dim*state_dim 维
 
-float64[] alpha_local         # [C]                        
-float64[] a_local             # [C * obs_dim]              
-float64[] b_local             # [C * obs_dim * obs_dim]    
-
-bool      has_observation     # whether this drone had a valid observation this step

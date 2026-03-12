@@ -133,8 +133,8 @@
       <param name="drone_id" value="0"/>
       <param name="num_drones" value="3"/>
       <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="1000"/>
-      <param name="num_components" value="10"/>
+      <param name="num_particles" value="200"/>
+      <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
@@ -176,8 +176,8 @@
       <param name="drone_id" value="1"/>
       <param name="num_drones" value="3"/>
       <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="1000"/>
-      <param name="num_components" value="10"/>
+      <param name="num_particles" value="200"/>
+      <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
@@ -219,8 +219,8 @@
       <param name="drone_id" value="2"/>
       <param name="num_drones" value="3"/>
       <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="1000"/>
-      <param name="num_components" value="10"/>
+      <param name="num_particles" value="200"/>
+      <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
