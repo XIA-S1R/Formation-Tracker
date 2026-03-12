@@ -28,7 +28,7 @@
     <param name="rhoTracking"    value="$(arg rhoTracking_)"/><!-- 追踪成本的权重 -->
     <param name="rhosVisibility" value="$(arg rhosVisibility_)"/><!-- 可视性成本的权重 -->
     <param name="theta_clearance" value="0.8"/><!-- 距离可视区域边界的安全间隙 -->
-    <param name="clearance_d"    value="0.2"/>
+    <param name="clearance_d"    value="0.5"/><!-- 距离障碍物的安全间隙 -->
     <param name="tolerance_d"    value="0.3"/>
     <param name="tracking_dist"  value="2.5"/><!-- 希望维持的跟踪距离 -->
     <param name="tracking_dur"   value="3.0"/><!-- 跟踪规划规划未来3s的轨迹 -->

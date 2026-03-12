@@ -791,6 +791,7 @@ void TrajOpt::addTimeCost(double& cost) {
         }
       }
       // TODO occlusion
+      /* Commented out visibility constraint
       if (grad_cost_visibility(pos, target_p, tracking_visible_ps_[i], tracking_thetas_[i],
                                grad_tmp, cost_tmp)) {
         gradViolaPc = beta0 * grad_tmp.transpose();
@@ -800,7 +801,7 @@ void TrajOpt::addTimeCost(double& cost) {
         if (piece > 0) {
           jerkOpt_.gdT.head(piece).array() += -rho * step * grad_tmp.dot(vel);
         }
-      }
+      }*/
     }
 
     t += step;

@@ -26,7 +26,7 @@
     <node pkg="nodelet" type="nodelet" name="so3_quadrotor"
           args="load so3_quadrotor/Nodelet manager" output="screen">
       <rosparam file="$(find uav_simulator)/config/so3_quadrotor.yaml"/>
-      <param name="init_x" value="-30"/>
+      <param name="init_x" value="-16"/>
       <param name="init_y" value="0"/>
       <param name="init_z" value="2"/>
       <remap from="~odom"   to="odom"/>
@@ -110,7 +110,7 @@
   <!-- drone0：前顶点 -->
   <group ns="drone0">
     <include file="$(find mapping)/launch/mapping.launch">
-      <arg name="init_x_" value="-38.00"/>
+      <arg name="init_x_" value="-18.00"/>
       <arg name="init_y_" value=" 1.1547"/>
       <arg name="init_z_" value=" 1.50"/>
     </include>
@@ -153,7 +153,7 @@
   <!-- drone1：右后顶点 -->
   <group ns="drone1">
     <include file="$(find mapping)/launch/mapping.launch">
-      <arg name="init_x_" value="-37.00"/>
+      <arg name="init_x_" value="-17.00"/>
       <arg name="init_y_" value="-0.5774"/>
       <arg name="init_z_" value=" 1.50"/>
     </include>
@@ -196,7 +196,7 @@
   <!-- drone2：左后顶点 -->
   <group ns="drone2">
     <include file="$(find mapping)/launch/mapping.launch">
-      <arg name="init_x_" value="-39.00"/>
+      <arg name="init_x_" value="-19.00"/>
       <arg name="init_y_" value="-0.5774"/>
       <arg name="init_z_" value=" 1.50"/>
     </include>

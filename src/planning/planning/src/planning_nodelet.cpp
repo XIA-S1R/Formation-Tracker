@@ -470,8 +470,7 @@ class Nodelet : public nodelet::Nodelet {
         generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, traj);
       } else {
         generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState,
-                                                               target_predcit, visible_ps, thetas,
-                                                               hPolys, traj);
+                                                               target_predcit, hPolys, traj);
       }
 
       visPtr_->visualize_traj(traj, "traj");
@@ -789,8 +788,7 @@ class Nodelet : public nodelet::Nodelet {
       finState.col(1) = target_v;
 
       generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState,
-                                                             target_predcit, visible_ps, thetas,
-                                                             hPolys, traj);
+                                                             target_predcit, hPolys, traj);
       visPtr_->visualize_traj(traj, "traj");
     }
     if (!generate_new_traj_success) {

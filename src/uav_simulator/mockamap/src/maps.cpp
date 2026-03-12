@@ -73,16 +73,26 @@ Maps::randomMapGenerate()
   double _y_l = -info.sizeY / (2 * info.scale);
   double _y_h = info.sizeY / (2 * info.scale);
   
-  // 计算y方向范围：下1/6到2/3篇幅
-  double total_y = info.sizeY / info.scale;
-  double y_min = total_y / 6.0; // 最下方1/6留白
-  double y_max = total_y * 2.0 / 3.0; // 最上方1/3留白
-  double y_range = y_max - y_min;
+  // 计算地图的实际尺寸（以米为单位）
+  double map_width_x = info.sizeX / info.scale; // x轴总长度
+  double map_width_y = info.sizeY / info.scale; // y轴总长度
+  double map_width_z = info.sizeZ / info.scale; // z轴总长度
+  
+  // 计算x方向的区域划分（考虑地图中心在原点）
+  double left_third = map_width_x / 6.0; // 左侧1/6区域长度
+  double middle_third = map_width_x * 2.0 / 3.0; // 中间2/3区域长度
+  double right_third = map_width_x / 3.0; // 右侧1/3区域长度
+  
+  // 计算各区域的边界
+  double left_bound = -map_width_x / 2.0 + left_third; // 左侧1/6结束的位置
+  double right_bound = map_width_x / 2.0 - right_third; // 右侧1/3开始的位置
+  double right_start = right_bound; // 右侧1/3区域的起始位置
+  double right_end = map_width_x / 2.0; // 右侧1/3区域的结束位置
   
   ROS_INFO("Map dimensions: x=%.2f, y=%.2f, z=%.2f", 
-           info.sizeX / info.scale, total_y, info.sizeZ / info.scale);
-  ROS_INFO("Y ranges: y_min=%.2f, y_max=%.2f, y_range=%.2f", 
-           y_min, y_max, y_range);
+           map_width_x, map_width_y, map_width_z);
+  ROS_INFO("X ranges: left_bound=%.2f, right_bound=%.2f", left_bound, right_bound);
+  ROS_INFO("Right third: start=%.2f, end=%.2f", right_start, right_end);
 
   // 从参数服务器获取配置
   double _w_l, _w_h, _h_l, _h_h;
@@ -104,11 +114,11 @@ Maps::randomMapGenerate()
 
   // 确保参数合理
   _h_l = _h_l >= 0 ? _h_l : 0;
-  _h_h = _h_h <= info.sizeZ / info.scale ? _h_h : info.sizeZ / info.scale;
+  _h_h = _h_h <= map_width_z ? _h_h : map_width_z;
 
-  // 初始化随机分布
-  std::uniform_real_distribution<double> rand_x(_x_l, _x_h);
-  std::uniform_real_distribution<double> rand_y(-y_max, y_max); // 确保障碍物位于y方向的有效范围内
+  // 初始化随机分布，确保障碍物只生成在中间的2/3区域
+  std::uniform_real_distribution<double> rand_x(left_bound, right_bound); // 确保障碍物位于x方向的有效范围内
+  std::uniform_real_distribution<double> rand_y(_y_l, _y_h);
   std::uniform_real_distribution<double> rand_w(_w_l, _w_h);
   std::uniform_real_distribution<double> rand_h(_h_l, _h_h);
   std::uniform_real_distribution<double> rand_inf(0.5, 1.5);
@@ -226,6 +236,80 @@ Maps::randomMapGenerate()
     }
   }
 
+  // 计算地图的实际边界（考虑地图中心在原点）
+  double map_min_x = -map_width_x / 2.0;
+  double map_max_x = map_width_x / 2.0;
+  double map_min_y = -map_width_y / 2.0;
+  double map_max_y = map_width_y / 2.0;
+  
+  ROS_INFO("Map actual bounds: x=[%.2f, %.2f], y=[%.2f, %.2f]", 
+           map_min_x, map_max_x, map_min_y, map_max_y);
+  
+  // 计算x轴后1/3区域的长度
+  double right_third_length = right_end - right_start;
+  
+  // 在x方向的后1/3区域添加大障碍物
+  double big_obstacle_width = right_third_length * 0.4; // 缩短宽度，占后1/3区域的40%
+  double big_obstacle_length = 10.0;
+  double big_obstacle_height = 8.0;
+  
+  // 计算大障碍物的位置，确保整个障碍在后1/3区域内
+  double big_obstacle_x_min = right_start;
+  double big_obstacle_x_max = right_start + right_third_length * 0.45; // 为矩形障碍留出空间
+  double big_obstacle_y_min = map_min_y + big_obstacle_length / 2.0;
+  double big_obstacle_y_max = map_max_y - big_obstacle_length / 2.0;
+  
+  // 确保大障碍物的尺寸合理
+  double actual_big_width = std::min(big_obstacle_width, big_obstacle_x_max - big_obstacle_x_min);
+  double actual_big_length = std::min(big_obstacle_length, big_obstacle_y_max - big_obstacle_y_min);
+  
+  // 计算大障碍物的中心位置
+  double big_obstacle_x = (big_obstacle_x_min + big_obstacle_x_max) / 2.0;
+  double big_obstacle_y = 0.0;
+  double big_obstacle_z = 0.0;
+  
+  generateBox(big_obstacle_x, big_obstacle_y, big_obstacle_z, 
+              actual_big_width, actual_big_length, big_obstacle_height, 
+              _resolution, pt_random);
+  
+  // 计算大障碍物的实际右边界
+  double big_obstacle_right = big_obstacle_x + actual_big_width / 2.0;
+  
+  // 在大障碍物之后添加几列沿x轴方向的长矩形障碍
+  int num_columns = 5; // 增加数量
+  double column_width = right_third_length * 0.5; // 缩短宽度，占后1/3区域的50%
+  double column_length = 1.0;
+  double column_height = 6.0;
+  double column_spacing = 3.0; // 减小间距
+  double column_gap = 3.0; // 与大障碍物的间距，适当减小
+  
+  // 计算矩形障碍的起始x位置（在大障碍物之后，确保在后1/3区域内）
+  double column_x_min = big_obstacle_right + column_gap;
+  double column_x_max = right_end;
+  double column_start_x = column_x_min + column_width / 2.0;
+  
+  // 确保矩形障碍的位置在后1/3区域内
+  if (column_start_x + column_width / 2.0 > column_x_max) {
+    column_start_x = column_x_max - column_width / 2.0;
+  }
+  
+  for (int i = 0; i < num_columns; i++) {
+    // 计算矩形障碍的x位置（确保在大障碍物之后）
+    double column_x = column_start_x;
+    
+    double column_y = -column_spacing * (num_columns - 1) / 2.0 + i * column_spacing;
+    // 确保整个矩形障碍在y轴边界内
+    double column_y_min = map_min_y + column_length / 2.0;
+    double column_y_max = map_max_y - column_length / 2.0;
+    column_y = std::max(column_y, column_y_min);
+    column_y = std::min(column_y, column_y_max);
+    
+    double column_z = 0.0;
+    generateBox(column_x, column_y, column_z, 
+                column_width, column_length, column_height, 
+                _resolution, pt_random);
+  }
+  
   addGround();
   info.cloud->width    = info.cloud->points.size();
   info.cloud->height   = 1;
