@@ -27,81 +27,205 @@ void Maps::addGround() {
   }
 }
 
+// 生成矩形障碍物
+void Maps::generateBox(double x, double y, double z, double width, double length, double height, double resolution, pcl::PointXYZ& pt)
+{
+  int widNum = ceil(width / resolution);
+  int lenNum = ceil(length / resolution);
+  int heiNum = ceil(height / resolution);
+
+  int rl, rh, sl, sh;
+  rl = -widNum / 2;
+  rh = widNum / 2;
+  sl = -lenNum / 2;
+  sh = lenNum / 2;
+
+  // 确保z方向位置合理，使矩形底部接触地面
+  double base_z = 0.0; // 地面高度
+
+  for (int r = rl; r < rh; r++)
+    for (int s = sl; s < sh; s++)
+    {
+      for (int t = 0; t < heiNum; t++)
+      {
+        if ((r - rl) * (r - rh + 1) * (s - sl) * (s - sh + 1) * t *
+              (t - heiNum + 1) ==
+            0)
+        {
+          pt.x = x + r * resolution;
+          pt.y = y + s * resolution;
+          pt.z = base_z + t * resolution;
+          info.cloud->points.push_back(pt);
+        }
+      }
+    }
+}
+
+// 基于swarm_formation的map_generator包中的random_forest_sensing.cpp实现
 void
 Maps::randomMapGenerate()
 {
-
   std::default_random_engine eng(info.seed);
-
   double _resolution = 1 / info.scale;
 
   double _x_l = -info.sizeX / (2 * info.scale);
   double _x_h = info.sizeX / (2 * info.scale);
   double _y_l = -info.sizeY / (2 * info.scale);
   double _y_h = info.sizeY / (2 * info.scale);
-  // double _h_l = 0;
-  // double _h_h = info.sizeZ / info.scale;
+  
+  // 计算y方向范围：下1/6到2/3篇幅
+  double total_y = info.sizeY / info.scale;
+  double y_min = total_y / 6.0; // 最下方1/6留白
+  double y_max = total_y * 2.0 / 3.0; // 最上方1/3留白
+  double y_range = y_max - y_min;
+  
+  ROS_INFO("Map dimensions: x=%.2f, y=%.2f, z=%.2f", 
+           info.sizeX / info.scale, total_y, info.sizeZ / info.scale);
+  ROS_INFO("Y ranges: y_min=%.2f, y_max=%.2f, y_range=%.2f", 
+           y_min, y_max, y_range);
 
+  // 从参数服务器获取配置
   double _w_l, _w_h, _h_l, _h_h;
-  int    _ObsNum;
+  int    _obs_num, circle_num_;
+  double radius_l_, radius_h_, z_l_, z_h_, theta_, _min_dist;
 
-  info.nh_private->param("width_min", _w_l, 0.6);
+  info.nh_private->param("width_min", _w_l, 0.2);
   info.nh_private->param("width_max", _w_h, 1.5);
-  info.nh_private->param("height_min", _h_l, 1.5);
-  info.nh_private->param("height_max", _h_h, 1.5);
-  info.nh_private->param("obstacle_number", _ObsNum, 10);
+  info.nh_private->param("height_min", _h_l, 2.0);
+  info.nh_private->param("height_max", _h_h, 10.0);
+  info.nh_private->param("obstacle_number", _obs_num, 30);
+  info.nh_private->param("circle_number", circle_num_, 30);
+  info.nh_private->param("radius_min", radius_l_, 0.5);
+  info.nh_private->param("radius_max", radius_h_, 2.0);
+  info.nh_private->param("z_min", z_l_, 0.7);
+  info.nh_private->param("z_max", z_h_, 3.0);
+  info.nh_private->param("theta", theta_, 0.5);
+  info.nh_private->param("min_distance", _min_dist, 0.8);
 
+  // 确保参数合理
   _h_l = _h_l >= 0 ? _h_l : 0;
   _h_h = _h_h <= info.sizeZ / info.scale ? _h_h : info.sizeZ / info.scale;
 
-  std::uniform_real_distribution<double> rand_x;
-  std::uniform_real_distribution<double> rand_y;
-  std::uniform_real_distribution<double> rand_w;
-  std::uniform_real_distribution<double> rand_h;
+  // 初始化随机分布
+  std::uniform_real_distribution<double> rand_x(_x_l, _x_h);
+  std::uniform_real_distribution<double> rand_y(-y_max, y_max); // 确保障碍物位于y方向的有效范围内
+  std::uniform_real_distribution<double> rand_w(_w_l, _w_h);
+  std::uniform_real_distribution<double> rand_h(_h_l, _h_h);
+  std::uniform_real_distribution<double> rand_inf(0.5, 1.5);
+  std::uniform_real_distribution<double> rand_radius_(radius_l_, radius_h_);
+  std::uniform_real_distribution<double> rand_radius2_(radius_l_, 1.2);
+  std::uniform_real_distribution<double> rand_theta_(-theta_, theta_);
+  std::uniform_real_distribution<double> rand_z_(z_l_, z_h_);
 
   pcl::PointXYZ pt_random;
+  std::vector<Eigen::Vector2d> obs_position;
 
-  rand_x = std::uniform_real_distribution<double>(_x_l, _x_h);
-  rand_y = std::uniform_real_distribution<double>(_y_l, _y_h);
-  rand_w = std::uniform_real_distribution<double>(_w_l, _w_h);
-  rand_h = std::uniform_real_distribution<double>(_h_l, _h_h);
-
-  for (int i = 0; i < _ObsNum; i++)
+  // 生成圆柱形障碍物
+  for (int i = 0; i < _obs_num && ros::ok(); i++)
   {
-    double x, y;
+    double x, y, w, h, inf;
     x = rand_x(eng);
     y = rand_y(eng);
-
-    double w, h;
     w = rand_w(eng);
-    h = rand_h(eng);
+    inf = rand_inf(eng);
 
-    int widNum = ceil(w / _resolution);
-    int heiNum = ceil(h / _resolution);
-
-    int rl, rh, sl, sh;
-    rl = -widNum / 2;
-    rh = widNum / 2;
-    sl = -widNum / 2;
-    sh = widNum / 2;
-
-    for (int r = rl; r < rh; r++)
-      for (int s = sl; s < sh; s++)
+    // 检查障碍物间距
+    bool flag_continue = false;
+    for (auto p : obs_position)
+      if ((Eigen::Vector2d(x, y) - p).norm() < _min_dist)
       {
-        for (int t = 0; t < heiNum; t++)
+        i--;
+        flag_continue = true;
+        break;
+      }
+    if (flag_continue)
+      continue;
+
+    obs_position.push_back(Eigen::Vector2d(x, y));
+
+    // 调整坐标到网格点
+    x = floor(x / _resolution) * _resolution + _resolution / 2.0;
+    y = floor(y / _resolution) * _resolution + _resolution / 2.0;
+
+    int widNum = ceil((w * inf) / _resolution);
+    double radius = (w * inf) / 2;
+
+    for (int r = -widNum / 2.0; r < widNum / 2.0; r++)
+      for (int s = -widNum / 2.0; s < widNum / 2.0; s++)
+      {
+        h = rand_h(eng);
+        int heiNum = ceil(h / _resolution);
+        for (int t = 0; t < heiNum; t++) // 从地面开始生成
         {
-          if ((r - rl) * (r - rh + 1) * (s - sl) * (s - sh + 1) * t *
-                (t - heiNum + 1) ==
-              0)
+          double temp_x = x + (r + 0.5) * _resolution + 1e-2;
+          double temp_y = y + (s + 0.5) * _resolution + 1e-2;
+          double temp_z = t * _resolution + 1e-2; // 从地面开始
+          
+          // 只生成圆柱表面的点
+          if ((Eigen::Vector2d(temp_x, temp_y) - Eigen::Vector2d(x, y)).norm() <= radius)
           {
-            pt_random.x = x + r * _resolution;
-            pt_random.y = y + s * _resolution;
-            pt_random.z = t * _resolution;
+            pt_random.x = temp_x;
+            pt_random.y = temp_y;
+            pt_random.z = temp_z;
             info.cloud->points.push_back(pt_random);
           }
         }
       }
   }
+
+  // 生成环形障碍物
+  for (int i = 0; i < circle_num_; ++i)
+  {
+    double x, y, z;
+    x = rand_x(eng);
+    y = rand_y(eng);
+    z = rand_z_(eng);
+
+    // 调整坐标到网格点
+    x = floor(x / _resolution) * _resolution + _resolution / 2.0;
+    y = floor(y / _resolution) * _resolution + _resolution / 2.0;
+    z = floor(z / _resolution) * _resolution + _resolution / 2.0;
+
+    // 确保环的底部接触地面
+    double base_z = 0.0;
+    z = base_z; // 固定z坐标为地面高度
+
+    double theta = rand_theta_(eng);
+    Eigen::Matrix3d rotate;
+    rotate << cos(theta), -sin(theta), 0.0, sin(theta), cos(theta), 0.0, 0, 0, 1;
+
+    double radius1 = rand_radius_(eng);
+    double radius2 = radius1; // 确保环是正圆，不是椭圆
+    // 确保环有足够的高度，避免变成扁平的椭圆
+    double min_height = 0.5; // 最小高度
+    if (radius2 < min_height) {
+      radius2 = min_height;
+    }
+
+    // 生成完整的环形
+    Eigen::Vector3d cpt;
+    for (double angle = 0.0; angle < 6.282; angle += _resolution / 2)
+    {
+      cpt(0) = 0.0;
+      cpt(1) = radius1 * cos(angle);
+      cpt(2) = radius2 * sin(angle);
+
+      // 生成点
+      Eigen::Vector3d cpt_if;
+      for (int ifx = -0; ifx <= 0; ++ifx)
+        for (int ify = -0; ify <= 0; ++ify)
+          for (int ifz = -0; ifz <= 0; ++ifz)
+          {
+            cpt_if = cpt + Eigen::Vector3d(ifx * _resolution, ify * _resolution, ifz * _resolution);
+            cpt_if = rotate * cpt_if + Eigen::Vector3d(x, y, z);
+            pt_random.x = cpt_if(0);
+            pt_random.y = cpt_if(1);
+            pt_random.z = cpt_if(2);
+            info.cloud->points.push_back(pt_random);
+          }
+    }
+  }
+
   addGround();
   info.cloud->width    = info.cloud->points.size();
   info.cloud->height   = 1;

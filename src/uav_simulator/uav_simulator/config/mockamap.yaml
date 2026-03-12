@@ -5,7 +5,7 @@ resolution: 0.1
 # map size unit meter
 x_length: 42
 y_length: 40
-z_length: 5
+z_length: 20
 # whether to generate ground and ceil
 ground: 0
 ceil: 0

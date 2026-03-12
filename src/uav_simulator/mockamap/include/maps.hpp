@@ -45,6 +45,9 @@ private:
   void recursizeDivisionMaze(Eigen::MatrixXi &maze);
   void optimizeMap();
   void addGround();
+  void generateCylinder(double x, double y, double z, double radius, double height, double resolution, pcl::PointXYZ& pt);
+  void generateRing(double x, double y, double z, double inner_radius, double outer_radius, double height, double resolution, pcl::PointXYZ& pt);
+  void generateBox(double x, double y, double z, double width, double length, double height, double resolution, pcl::PointXYZ& pt);
 };
 
 class MazePoint {
