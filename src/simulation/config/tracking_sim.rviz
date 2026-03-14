@@ -10,8 +10,7 @@ Panels:
         - /drone01/mapping1
         - /drone01/planning1
         - /drone11
-        - /target_ekf_odom2
-        - /target_ekf_odom3
+        - /drone11/local_inflate_map1
       Splitter Ratio: 0.46234309673309326
     Tree Height: 338
   - Class: rviz/Selection
@@ -215,8 +214,8 @@ Visualization Manager:
             - Alpha: 1
               Autocompute Intensity Bounds: true
               Autocompute Value Bounds:
-                Max Value: 3.825000047683716
-                Min Value: -0.22500000894069672
+                Max Value: 8.175000190734863
+                Min Value: 3.825000047683716
                 Value: true
               Axis: Z
               Channel Name: intensity
@@ -838,6 +837,42 @@ Visualization Manager:
       Topic: /drone2/target_ekf_odom
       Unreliable: false
       Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: ""
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: pointforPredict
+      Position Transformer: ""
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.009999999776482582
+      Style: Flat Squares
+      Topic: /drone0/drone0_target_dpf/search_particles_vis
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /drone0/drone0_target_dpf/search_gmm_vis
+      Name: GMMforPredict
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 255; 255; 255
@@ -866,7 +901,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/XYOrbit
-      Distance: 28.523427963256836
+      Distance: 21.6982421875
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -874,17 +909,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -4
-        Y: 0
-        Z: 1.5
+        X: 12.523968696594238
+        Y: 5.068416118621826
+        Z: 1.4999980926513672
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.419796109199524
+      Pitch: 1.0347959995269775
       Target Frame: world
-      Yaw: 3.090003490447998
+      Yaw: 2.1850063800811768
     Saved: ~
 Window Geometry:
   Displays:

@@ -187,7 +187,7 @@ class Nodelet : public nodelet::Nodelet {
 
   void triger_callback(const geometry_msgs::PoseStampedConstPtr& msgPtr) {
   // 将triger话题中的x,y位置作为goal位置
-    goal_ << msgPtr->pose.position.x, msgPtr->pose.position.y, 5;
+    goal_ << msgPtr->pose.position.x, msgPtr->pose.position.y, 3 ;
     triger_received_ = true;
   }
 

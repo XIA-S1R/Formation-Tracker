@@ -6,6 +6,7 @@
 #include <nav_msgs/Odometry.h>
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <visualization_msgs/MarkerArray.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -15,6 +16,7 @@
 #include <target_ekf/target_ekf.hpp>
 #include <target_ekf/target_dpf.hpp>
 #include <target_ekf/LocalStats.h>
+#include <target_ekf/LabeledConsensusState.h>
 #include <std_msgs/Bool.h>
 #include <unordered_set>
 #include <algorithm>
@@ -25,6 +27,10 @@
 // 发布器
 ros::Publisher target_odom_pub_;
 ros::Publisher local_stats_pub_;
+ros::Publisher labeled_consensus_pub_;
+ros::Publisher search_state_pub_;
+ros::Publisher search_particles_vis_pub_;
+ros::Publisher search_gmm_vis_pub_; // 搜索GMM分布可视化发布器
 std::vector<ros::Subscriber> stats_subs_;
 
 // 相机外参
@@ -60,7 +66,6 @@ int dpf_reset_suppress_count_ = 0;
 int miss_detection_num_ = 10; // 连续多少帧都没有观测后进入搜索模式
 int consecutive_no_obs_count_ = 0; // 连续无观测计数
 bool search_mode_active_ = false; // 是否处于搜索模式
-ros::Publisher search_state_pub_; // 搜索状态发布器
 ros::Time last_global_obs_time_;
 
 // 搜索粒子管理器
@@ -69,7 +74,9 @@ std::unique_ptr<SearchParticlesManager> search_particles_manager_;
 // 邻居数据存储
 std::map<int, LocalStat> received_stats_;
 std::map<int, NeighborConsensus> received_consensus_;
+std::map<int, std::vector<LabeledNeighborConsensus>> received_labeled_consensus_;
 std::mutex stats_mutex_;
+std::mutex labeled_stats_mutex_;
 
 // === 占据栅格 ===
 struct SimpleOccMap {
@@ -77,11 +84,9 @@ struct SimpleOccMap {
   std::unordered_set<int64_t> occ_cells;
   bool received = false;
   mutable std::mutex map_mutex_;
-
   int64_t toKey(int x, int y, int z) const {
     return ((int64_t)(x + 32768) << 32) | ((int64_t)(y + 32768) << 16) | (int64_t)(z + 32768);
   }
-
   void fromPointCloud(const pcl::PointCloud<pcl::PointXYZ>& cloud, double res) {
     std::lock_guard<std::mutex> lock(map_mutex_);
     resolution = res;
@@ -94,7 +99,6 @@ struct SimpleOccMap {
     }
     received = true;
   }
-
   bool isOccupied(const Eigen::Vector3d& p) const {
     std::lock_guard<std::mutex> lock(map_mutex_);
     int x = (int)std::floor(p.x() / resolution);
@@ -126,6 +130,193 @@ void global_map_callback(const sensor_msgs::PointCloud2ConstPtr& msg) {
   ROS_INFO_ONCE("[dpf%d] Global map received, %zu obstacle points.", drone_id_, cloud.size());
 }
 
+// === 发布搜索粒子可视化 ===
+void publishSearchParticlesVisualization() {
+  if (!search_particles_manager_ || !search_particles_manager_->isInitialized()) return;
+  
+  const auto& search_particles = search_particles_manager_->getSearchParticles();
+  if (search_particles.empty()) return;
+  
+  // 创建点云
+  pcl::PointCloud<pcl::PointXYZRGB> cloud;
+  cloud.header.frame_id = "world";
+  cloud.header.stamp = ros::Time::now().toNSec() / 1e3;
+  
+  for (const auto& particle : search_particles) {
+    pcl::PointXYZRGB point;
+    point.x = particle.state(0);
+    point.y = particle.state(1);
+    point.z = particle.state(2);
+    
+    // 根据粒子的意图标签设置颜色
+    switch (particle.intent) {
+      case STRAIGHT:
+        // 蓝色 - 直行
+        point.r = 0;
+        point.g = 0;
+        point.b = 255;
+        break;
+      case LEFT_TURN:
+        // 红色 - 左转
+        point.r = 255;
+        point.g = 0;
+        point.b = 0;
+        break;
+      case RIGHT_TURN:
+        // 绿色 - 右转
+        point.r = 0;
+        point.g = 255;
+        point.b = 0;
+        break;
+      default:
+        // 白色 - 默认
+        point.r = 255;
+        point.g = 255;
+        point.b = 255;
+        break;
+    }
+    
+    // 根据粒子权重调整亮度
+    double weight = std::min(1.0, particle.weight * search_particles.size());
+    point.r = static_cast<uint8_t>(point.r * weight);
+    point.g = static_cast<uint8_t>(point.g * weight);
+    point.b = static_cast<uint8_t>(point.b * weight);
+    
+    cloud.push_back(point);
+  }
+  
+  // 转换为ROS消息并发布
+  sensor_msgs::PointCloud2 cloud_msg;
+  pcl::toROSMsg(cloud, cloud_msg);
+  search_particles_vis_pub_.publish(cloud_msg);
+}
+
+// === 发布GMM分布可视化 ===
+void publishGMMVisualization() {
+  if (!search_particles_manager_ || !search_particles_manager_->isInitialized()) return;
+  
+  // 获取GMM参数
+  auto gmm_means = search_particles_manager_->getLabeledGMMMeans();
+  auto gmm_covs = search_particles_manager_->getLabeledGMMCovs();
+  auto gmm_pis = search_particles_manager_->getLabeledGMMPis();
+  
+  visualization_msgs::MarkerArray marker_array;
+  int marker_id = 0;
+  
+  // 为每个标签创建GMM可视化
+  for (const auto& label_means : gmm_means) {
+    SearchIntent label = label_means.first;
+    const auto& means = label_means.second;
+    
+    // 获取该标签的协方差和混合权重
+    auto covs_it = gmm_covs.find(label);
+    auto pis_it = gmm_pis.find(label);
+    if (covs_it == gmm_covs.end() || pis_it == gmm_pis.end()) continue;
+    
+    const auto& covs = covs_it->second;
+    const auto& pis = pis_it->second;
+    
+    // 根据标签设置颜色
+    std_msgs::ColorRGBA color;
+    switch (label) {
+      case STRAIGHT:
+        // 蓝色 - 直行
+        color.r = 0.0;
+        color.g = 0.0;
+        color.b = 1.0;
+        break;
+      case LEFT_TURN:
+        // 红色 - 左转
+        color.r = 1.0;
+        color.g = 0.0;
+        color.b = 0.0;
+        break;
+      case RIGHT_TURN:
+        // 绿色 - 右转
+        color.r = 0.0;
+        color.g = 1.0;
+        color.b = 0.0;
+        break;
+      default:
+        // 白色 - 默认
+        color.r = 1.0;
+        color.g = 1.0;
+        color.b = 1.0;
+        break;
+    }
+    color.a = 0.5; // 设置透明度
+    
+    // 为每个GMM分量创建标记
+    for (size_t i = 0; i < means.size() && i < covs.size(); ++i) {
+      const auto& mean = means[i];
+      const auto& cov = covs[i];
+      double weight = (i < pis.size()) ? pis(i) : 1.0 / means.size();
+      
+      // 创建球体标记表示GMM均值
+      visualization_msgs::Marker mean_marker;
+      mean_marker.header.frame_id = "world";
+      mean_marker.header.stamp = ros::Time::now();
+      mean_marker.id = marker_id++;
+      mean_marker.type = visualization_msgs::Marker::SPHERE;
+      mean_marker.action = visualization_msgs::Marker::ADD;
+      mean_marker.pose.position.x = mean(0);
+      mean_marker.pose.position.y = mean(1);
+      mean_marker.pose.position.z = mean(2);
+      mean_marker.pose.orientation.w = 1.0;
+      
+      // 根据权重设置大小
+      double scale = 0.3 * weight;
+      mean_marker.scale.x = scale;
+      mean_marker.scale.y = scale;
+      mean_marker.scale.z = scale;
+      
+      mean_marker.color = color;
+      marker_array.markers.push_back(mean_marker);
+      
+      // 创建箭头标记表示GMM分量的方向（基于速度）
+      if (mean.size() >= 6) {
+        visualization_msgs::Marker arrow_marker;
+        arrow_marker.header.frame_id = "world";
+        arrow_marker.header.stamp = ros::Time::now();
+        arrow_marker.id = marker_id++;
+        arrow_marker.type = visualization_msgs::Marker::ARROW;
+        arrow_marker.action = visualization_msgs::Marker::ADD;
+        arrow_marker.pose.position.x = mean(0);
+        arrow_marker.pose.position.y = mean(1);
+        arrow_marker.pose.position.z = mean(2);
+        
+        // 计算速度方向
+        Eigen::Vector3d velocity(mean(3), mean(4), mean(5));
+        double speed = velocity.norm();
+        if (speed > 0.1) {
+          velocity.normalize();
+          
+          // 计算箭头方向的四元数
+          Eigen::Vector3d z_axis(0, 0, 1);
+          Eigen::Vector3d direction = velocity;
+          Eigen::Quaterniond q;
+          q.setFromTwoVectors(z_axis, direction);
+          arrow_marker.pose.orientation.x = q.x();
+          arrow_marker.pose.orientation.y = q.y();
+          arrow_marker.pose.orientation.z = q.z();
+          arrow_marker.pose.orientation.w = q.w();
+          
+          // 设置箭头大小
+          arrow_marker.scale.x = 0.1 * speed;
+          arrow_marker.scale.y = 0.05;
+          arrow_marker.scale.z = 0.05;
+          
+          arrow_marker.color = color;
+          marker_array.markers.push_back(arrow_marker);
+        }
+      }
+    }
+  }
+  
+  // 发布GMM可视化
+  search_gmm_vis_pub_.publish(marker_array);
+}
+
 // === LocalStats 消息 <-> 结构体转换 ===
 LocalStat fromMsg(const target_ekf::LocalStats::ConstPtr& msg) {
   LocalStat ls;
@@ -153,7 +344,6 @@ target_ekf::LocalStats toMsg(const LocalStat& ls, const DistributedPF& dpf) {
   msg.state_dim = ls.nx; // 9维状态空间
   msg.obs_dim = dpf.nz_;
   msg.has_observation = ls.has_obs;
-
   // 打包本地统计量u
   msg.alpha_local.resize(ls.C);
   msg.a_local.resize(ls.C * ls.nx);
@@ -169,7 +359,6 @@ target_ekf::LocalStats toMsg(const LocalStat& ls, const DistributedPF& dpf) {
       }
     }
   }
-
   // 打包共识状态ζ
   msg.zeta_alpha.resize(dpf.C_);
   msg.zeta_a.resize(dpf.C_ * dpf.nx_);
@@ -203,6 +392,46 @@ void stats_callback(const target_ekf::LocalStats::ConstPtr& msg) {
         msg->zeta_b.data() + c * msg->state_dim * msg->state_dim, msg->state_dim, msg->state_dim);
   }
   received_consensus_[msg->drone_id] = nc;
+}
+
+// === 收到其他无人机标签化共识状态的回调 ===
+void labeled_consensus_callback(const target_ekf::LabeledConsensusState::ConstPtr& msg) {
+  std::lock_guard<std::mutex> lock(labeled_stats_mutex_);
+  
+  LabeledNeighborConsensus nc; 
+  nc.label = static_cast<SearchIntent>(msg->label);
+  nc.zeta_alpha.resize(msg->alpha.size());
+  for (size_t i = 0; i < msg->alpha.size(); ++i) {
+    nc.zeta_alpha(i) = msg->alpha[i];
+  }
+  
+  nc.zeta_a.resize(msg->num_components);
+  nc.zeta_b.resize(msg->num_components);
+  
+  for (int c = 0; c < msg->num_components; ++c) {
+    nc.zeta_a[c].resize(msg->state_dim);
+    nc.zeta_b[c].resize(msg->state_dim, msg->state_dim);
+    
+    // 从数组填充a向量
+    int a_start = c * msg->state_dim;
+    for (int i = 0; i < msg->state_dim; ++i) {
+      nc.zeta_a[c](i) = msg->a[a_start + i];
+    }
+    
+    // 从数组填充b矩阵
+    int b_start = c * msg->state_dim * msg->state_dim;
+    for (int i = 0; i < msg->state_dim; ++i) {
+      for (int j = 0; j < msg->state_dim; ++j) {
+        nc.zeta_b[c](i, j) = msg->b[b_start + i * msg->state_dim + j];
+      }
+    }
+  }
+  
+  nc.has_obs = msg->has_obs;
+  nc.timestamp = msg->header.stamp;
+  
+  // 存储该标签的共识状态（追加而非覆盖）
+  received_labeled_consensus_[msg->drone_id].push_back(nc);
 }
 
 // === 【关键修复】无人机odom回调：仅保存最新位姿，不执行核心逻辑 ===
@@ -242,7 +471,6 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     ROS_DEBUG_THROTTLE(1.0, "[dpf%d] Waiting for odom and map...", drone_id_);
     return;
   }
-
   // 读取无人机最新位姿
   Eigen::Vector3d odom_p;
   Eigen::Quaterniond odom_q;
@@ -253,7 +481,6 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
   }
   Eigen::Vector3d cam_p = odom_q.toRotationMatrix() * cam2body_p_ + odom_p;
   Eigen::Quaterniond cam_q = odom_q * Eigen::Quaterniond(cam2body_R_);
-
   // 检查是否有有效观测
   bool has_obs = false;
   Eigen::Vector3d obs_pos, obs_rpy;
@@ -290,7 +517,6 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     // 用完重置观测标志，避免重复使用
     has_latest_obs_ = false;
   }
-
   // 初始化/重置逻辑
   double update_dt = (ros::Time::now() - last_update_stamp_).toSec();
   bool need_reset = (!dpfPtr_->initialized_ || update_dt > 1.0);
@@ -308,38 +534,152 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       if (!dpfPtr_->initialized_) return;
     }
   }
-
   // ==============================================
   // 【模式判断 - 在回调开始时判断当前应执行的模式】
   // ==============================================
   ROS_DEBUG("[dpf%d] has_obs=%d, initialized=%d", drone_id_, has_obs, dpfPtr_->initialized_);
-
   if (search_mode_active_) {
     // =========================
     // 【搜索模式处理流程】
     // =========================
-    // 1. 更新搜索粒子状态
-    search_particles_manager_->updateAllSearchParticles();
-    
-    // 2. 使用负观测权重更新机制来处理搜索模式下的无观测情况
-    // 当前无人机没有观测到目标，但需要基于视场信息更新搜索粒子权重
-    if (!has_obs) {
-      // 使用负观测权重更新来降低在当前无人机视场内但未被观测到的搜索粒子权重
-      search_particles_manager_->updateSearchParticlesWithNegativeObservation(cam_p, cam_q, 0.05);
-    }
-    
-    // 3. 检查是否重新观测到目标，如果是则退出搜索模式
+
+    // --- 优先退出检查1：本无人机发现目标 → 直接从观测重置，不走共识 ---
     if (has_obs) {
+      dpfPtr_->reset(obs_pos, obs_rpy);
+      dpf_reset_suppress_count_ = 3;
       search_mode_active_ = false;
       consecutive_no_obs_count_ = 0;
-      ROS_WARN("[dpf%d] EXITING SEARCH MODE: Target reacquired!", drone_id_);
+      ROS_WARN("[dpf%d] EXITING SEARCH MODE: Target reacquired, resetting from direct observation!", drone_id_);
+
+      // 发布 local_stats（has_obs=true），通知邻居此机已重新观测到目标
+      LocalStat local_stat = dpfPtr_->computeLocalStatsOnly(drone_id_, true);
+      local_stats_pub_.publish(toMsg(local_stat, *dpfPtr_));
+
+      {
+        std::lock_guard<std::mutex> lock(labeled_stats_mutex_);
+        received_labeled_consensus_.clear();
+      }
+      std_msgs::Bool search_state_msg;
+      search_state_msg.data = false;
+      search_state_pub_.publish(search_state_msg);
+      last_update_stamp_ = ros::Time::now();
+      return;
+    }
+
+    // --- 优先退出检查2：邻居无人机已重新观测到目标 → 退出搜索模式，由普通DPF共识同步状态 ---
+    {
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      ros::Time current_time = ros::Time::now();
+      for (auto& kv : received_consensus_) {
+        double time_diff = (current_time - kv.second.timestamp).toSec();
+        if (time_diff < 0.5 && kv.second.has_obs) {
+          search_mode_active_ = false;
+          consecutive_no_obs_count_ = 0;
+          ROS_WARN("[dpf%d] EXITING SEARCH MODE: Neighbor drone %d reacquired target!", drone_id_, kv.first);
+          break;
+        }
+      }
+    }
+    if (!search_mode_active_) {
+      {
+        std::lock_guard<std::mutex> lock(labeled_stats_mutex_);
+        received_labeled_consensus_.clear();
+      }
+      std_msgs::Bool search_state_msg;
+      search_state_msg.data = false;
+      search_state_pub_.publish(search_state_msg);
+      return;
+    }
+
+    // --- 步骤1：状态预测（搜索粒子状态更新）---
+    search_particles_manager_->updateAllSearchParticles();
+
+    // --- 步骤2：负观测权重更新（此处 has_obs 已确认为 false）---
+    search_particles_manager_->updateSearchParticlesWithNegativeObservation(cam_p, cam_q, 0.05);
+
+    // --- 步骤3：标签化的E步，计算每个标签的本地统计量（所有节点执行）---
+    std::vector<LabeledLocalStat> local_labeled_stats = search_particles_manager_->computeLabeledLocalStats();
+
+    // --- 步骤4：收集邻居标签化共识状态---
+    std::vector<LabeledNeighborConsensus> neighbor_labeled_consensus;
+    {
+      std::lock_guard<std::mutex> lock(labeled_stats_mutex_);
+      ros::Time current_time = ros::Time::now();
+      double time_threshold = 0.3;
+      for (auto& kv : received_labeled_consensus_) {
+        if (kv.first != drone_id_) { // 不包括自己
+          for (const auto& labeled_nc : kv.second) {
+            double time_diff = (current_time - labeled_nc.timestamp).toSec();
+            if (time_diff < time_threshold) {
+              neighbor_labeled_consensus.push_back(labeled_nc);
+            }
+          }
+        }
+      }
+      // 清理过期数据
+      received_labeled_consensus_.clear();
+    }
+
+    // --- 步骤5：标签化的共识滤波（每个标签独立运行共识）---
+    search_particles_manager_->labeledConsensusFilter(neighbor_labeled_consensus, local_labeled_stats);
+
+    // --- 步骤5.1：发布搜索粒子可视化---
+    publishSearchParticlesVisualization();
+
+    // --- 步骤5.2：发布GMM分布可视化---
+    publishGMMVisualization();
+
+    // --- 步骤6：发布标签化共识状态（用于邻居间通信）---
+  auto zeta_alphas = search_particles_manager_->getLabeledZetaAlpha();
+  auto zeta_as = search_particles_manager_->getLabeledZetaA();
+  auto zeta_bs = search_particles_manager_->getLabeledZetaB();
+
+  for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
+    SearchIntent label = static_cast<SearchIntent>(label_int);
+    
+    target_ekf::LabeledConsensusState labeled_consensus_msg;
+    labeled_consensus_msg.header.stamp = ros::Time::now();
+    labeled_consensus_msg.header.frame_id = "world";
+    labeled_consensus_msg.drone_id = drone_id_;
+    labeled_consensus_msg.label = static_cast<int>(label);
+    labeled_consensus_msg.num_components = num_components;
+    labeled_consensus_msg.state_dim = 9;
+    labeled_consensus_msg.has_obs = false;  // 搜索模式中总是false
+
+    // 填充ζ而不是u
+    auto& zeta_alpha = zeta_alphas[label];
+    auto& zeta_a = zeta_as[label];
+    auto& zeta_b = zeta_bs[label];
+    
+    labeled_consensus_msg.alpha.resize(zeta_alpha.size());
+    for (int i = 0; i < zeta_alpha.size(); ++i) {
+      labeled_consensus_msg.alpha[i] = zeta_alpha(i);  // ✅ 发布ζ
     }
     
-    // 4. 发布搜索状态
+    labeled_consensus_msg.a.resize(zeta_a.size() * 9);
+    for (int c = 0; c < zeta_a.size(); ++c) {
+      for (int i = 0; i < 9; ++i) {
+        labeled_consensus_msg.a[c * 9 + i] = zeta_a[c](i);
+      }
+    }
+    
+    labeled_consensus_msg.b.resize(zeta_b.size() * 9 * 9);
+    for (int c = 0; c < zeta_b.size(); ++c) {
+      for (int i = 0; i < 9; ++i) {
+        for (int j = 0; j < 9; ++j) {
+          labeled_consensus_msg.b[c * 9 * 9 + i * 9 + j] = zeta_b[c](i, j);
+        }
+      }
+    }
+    
+    labeled_consensus_pub_.publish(labeled_consensus_msg);
+  }
+
+    // --- 步骤7：发布搜索状态---
     std_msgs::Bool search_state_msg;
     search_state_msg.data = search_mode_active_;
     search_state_pub_.publish(search_state_msg);
-    
+
     return;  // 提前结束，不执行普通DPF流程
   }
   else {
@@ -379,6 +719,8 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
         neighbor_consensus.push_back(received_consensus_.begin()->second);
         neighbor_ids.push_back(received_consensus_.begin()->first);
       }
+      // 清理过期数据
+      received_consensus_.clear();
     }
     
     // 检查是否所有无人机都失去了观测（包括当前无人机和邻居）
@@ -427,9 +769,9 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     ROS_DEBUG("[dpf%d][EM] completed 1 step, fused %zu neighbors", drone_id_, neighbor_consensus.size());
     
     // --- 论文步骤7：系统重采样（仅有观测节点执行）---
-    if (has_obs) {
-      dpfPtr_->systematicResample();
-    }
+    //if (has_obs) {
+      //dpfPtr_->systematicResample();
+    //}
     
     // --- 发布最新的共识状态ζ（给邻居下一帧使用）---
     local_stats_pub_.publish(toMsg(local_stat, *dpfPtr_));
@@ -447,7 +789,6 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     search_state_msg.data = search_mode_active_;
     search_state_pub_.publish(search_state_msg);
   }
-
   // --- 发布目标odom ---
   Eigen::Vector3d est_pos = dpfPtr_->pos();
   Eigen::Vector3d est_vel = dpfPtr_->vel();
@@ -462,7 +803,6 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     est_vel.x(), est_vel.y(), est_vel.z(),
     gmm_mu0(0), gmm_mu0(1), gmm_mu0(2),
     pos_err, has_obs);
-
   nav_msgs::Odometry target_odom;
   target_odom.header.stamp = ros::Time::now();
   target_odom.header.frame_id = "world";
@@ -478,18 +818,14 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
   target_odom.pose.pose.orientation.y = q_out.y();
   target_odom.pose.pose.orientation.z = q_out.z();
   target_odom_pub_.publish(target_odom);
-
   dpf_reset_suppress_count_ = 0;
   last_update_stamp_ = ros::Time::now();
 }
-
-
 
 int main(int argc, char** argv) {
   ros::init(argc, argv, "target_dpf");
   ros::NodeHandle nh("~");
   last_update_stamp_ = ros::Time::now() - ros::Duration(10.0);
-
   // 读取参数
   nh.param<int>("drone_id", drone_id_, 0);
   nh.param<int>("num_drones", num_drones_, 3);
@@ -508,10 +844,8 @@ int main(int argc, char** argv) {
   nh.getParam("cam_height", height_);
   nh.getParam("pitch_thr", pitch_thr_);
   nh.getParam("check_fov", check_fov_);
-
   // 搜索模式参数
   nh.getParam("miss_detection_num", miss_detection_num_);
-
   // DPF参数
   int num_particles = 300;
   int num_components = 4;
@@ -520,16 +854,25 @@ int main(int argc, char** argv) {
   nh.getParam("num_particles", num_particles);
   nh.getParam("num_components", num_components);
   nh.getParam("num_em_iters", num_em_iters);
-
   dpfPtr_ = std::make_shared<DistributedPF>(1.0 / dpf_rate_, num_particles, num_components, num_em_iters);
   
   // 创建搜索粒子管理器
-  search_particles_manager_ = std::make_unique<SearchParticlesManager>(drone_id_);
-
+  search_particles_manager_ = std::make_unique<SearchParticlesManager>(drone_id_, num_components, &nh);
+  // ✅ 设置视线检查函数
+  search_particles_manager_->setLineOfSightCheckFn(
+  [](const Eigen::Vector3d& start, const Eigen::Vector3d& end) {
+    return isLineOfSightClear(start, end);
+  }
+);
+  
   // 订阅/发布
   target_odom_pub_ = nh.advertise<nav_msgs::Odometry>("target_odom", 1);
   local_stats_pub_ = nh.advertise<target_ekf::LocalStats>("local_stats", 1);
+  labeled_consensus_pub_ = nh.advertise<target_ekf::LabeledConsensusState>("labeled_consensus", 1);
   search_state_pub_ = nh.advertise<std_msgs::Bool>("search_state", 1);
+  search_gmm_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>("search_gmm_vis", 1);
+  search_gmm_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>("search_gmm_vis", 1);
+  search_particles_vis_pub_ = nh.advertise<sensor_msgs::PointCloud2>("search_particles_vis", 1);
   
   // 地图订阅
   ros::Subscriber global_map_sub = nh.subscribe("global_map", 10, &global_map_callback);
@@ -537,18 +880,17 @@ int main(int argc, char** argv) {
   ros::Subscriber odom_sub = nh.subscribe("odom", 100, &odom_callback, ros::TransportHints().tcpNoDelay());
   // YOLO目标订阅（单独订阅，不再同步）
   ros::Subscriber yolo_sub = nh.subscribe("yolo", 1, &yolo_callback, ros::TransportHints().tcpNoDelay());
-
   // 订阅其他无人机的局部统计量
   for (int i = 0; i < num_drones_; ++i) {
     if (i == drone_id_) continue;
     std::string topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/local_stats";
     stats_subs_.push_back(nh.subscribe(topic, 10, &stats_callback));
-    ROS_INFO("[dpf%d] Subscribing to %s", drone_id_, topic.c_str());
+    std::string labeled_topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/labeled_consensus";
+    stats_subs_.push_back(nh.subscribe(labeled_topic, 10, &labeled_consensus_callback));
+    ROS_INFO("[dpf%d] Subscribing to %s and %s", drone_id_, topic.c_str(), labeled_topic.c_str());
   }
-
   // 【核心】固定频率Timer执行DPF核心逻辑
   ros::Timer dpf_core_timer = nh.createTimer(ros::Duration(1.0 / dpf_rate_), &dpf_core_timer_callback);
-
   ros::MultiThreadedSpinner spinner(4); // 多线程Spinner，避免回调阻塞
   spinner.spin();
   return 0;
