@@ -578,4 +578,8 @@ struct DistributedPF {
     rpy_filtered_.z() = wrapAngle(filter_alpha_ * rpy_out.z() + (1.0 - filter_alpha_) * rpy_filtered_.z());
     return rpy_filtered_;
   }
+  // === 获取粒子集合和权重 ===
+  inline std::pair<Eigen::MatrixXd, Eigen::VectorXd> getParticlesAndWeights() const {
+  return std::make_pair(particles_, weights_);
+  }
 };

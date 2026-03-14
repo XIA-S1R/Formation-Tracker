@@ -8,6 +8,7 @@
 #include <ros/package.h>
 #include <ros/ros.h>
 #include <std_msgs/Empty.h>
+#include <std_msgs/Bool.h>
 #include <traj_opt/traj_opt.h>
 
 #include <Eigen/Core>
@@ -32,12 +33,18 @@ class Nodelet : public nodelet::Nodelet {
 
   ros::Publisher traj_pub_, heartbeat_pub_, replanState_pub_;
   ros::Publisher broadcast_traj_pub_;
+  ros::Subscriber search_state_sub_;
 
   std::shared_ptr<mapping::OccGridMap> gridmapPtr_;
   std::shared_ptr<env::Env> envPtr_;
   std::shared_ptr<visualization::Visualization> visPtr_;
   std::shared_ptr<traj_opt::TrajOpt> trajOptPtr_;
   std::shared_ptr<prediction::Predict> prePtr_;
+
+  // 搜索模式相关
+  bool search_mode_active_ = false;
+  std::atomic_flag search_state_lock_ = ATOMIC_FLAG_INIT;
+  std_msgs::Bool latest_search_state_;
 
   // NOTE planning or fake target
   bool fake_ = false;
@@ -180,7 +187,7 @@ class Nodelet : public nodelet::Nodelet {
 
   void triger_callback(const geometry_msgs::PoseStampedConstPtr& msgPtr) {
   // 将triger话题中的x,y位置作为goal位置
-    goal_ << msgPtr->pose.position.x, msgPtr->pose.position.y, 0.9;
+    goal_ << msgPtr->pose.position.x, msgPtr->pose.position.y, 5;
     triger_received_ = true;
   }
 
@@ -217,6 +224,14 @@ class Nodelet : public nodelet::Nodelet {
     map_msg_ = *msgPtr;
     map_received_ = true;
     gridmap_lock_.clear();
+  }
+
+  void search_state_callback(const std_msgs::Bool::ConstPtr& msgPtr) {
+    while (search_state_lock_.test_and_set())
+      ;
+    latest_search_state_ = *msgPtr;
+    search_mode_active_ = msgPtr->data;
+    search_state_lock_.clear();
   }
 
   // NOTE main callback
@@ -307,12 +322,26 @@ class Nodelet : public nodelet::Nodelet {
       target_p = target_p + target_q * land_p_;
       wait_hover_ = false;
     } else {//追踪逻辑
-      target_p.z() += 1.0;// 追踪目标定在目标上方1m处
+      if (search_mode_active_) {
+        // 搜索模式：执行预设的搜索轨迹或分散搜索
+        // 这里可以实现具体的搜索算法，比如螺旋搜索、网格搜索等
+        // 临时使用一个固定的搜索点，实际应用中应该实现动态搜索算法
+        ROS_WARN_THROTTLE(1.0, "[planner] IN SEARCH MODE: Executing search pattern");
+        
+        // 示例：简单的分散搜索 - 每架无人机前往预设的搜索区域
+        // 这里可以根据无人机ID分配不同的搜索区域
+        double search_offset_x = (trajOptPtr_->drone_id_ % 3 - 1) * 3.0; // -3, 0, 3
+        double search_offset_y = ((trajOptPtr_->drone_id_ / 3) % 3 - 1) * 3.0; // -3, 0, 3
+        target_p = odom_p + Eigen::Vector3d(search_offset_x, search_offset_y, 0.0);
+        target_p.z() = std::max(2.0, odom_p.z()); // 保持安全高度
+      } else {
+        target_p.z() += 1.0;// 追踪目标定在目标上方1m处
 
-      // 仿照 Swarm-Formation：每架无人机终点 = 目标位置 + 本机编队偏移
-      // 路径搜索、走廊、finState 全部自然对齐到本机专属位置
-      if (trajOptPtr_->use_formation_) {
-        target_p += trajOptPtr_->formation_offset_;
+        // 仿照 Swarm-Formation：每架无人机终点 = 目标位置 + 本机编队偏移
+        // 路径搜索、走廊、finState 全部自然对齐到本机专属位置
+        if (trajOptPtr_->use_formation_) {
+          target_p += trajOptPtr_->formation_offset_;
+        }
       }
 
       // NOTE determin whether to replan
@@ -867,6 +896,7 @@ class Nodelet : public nodelet::Nodelet {
     gridmap_sub_ = nh.subscribe<quadrotor_msgs::OccMap3d>("gridmap_inflate", 1, &Nodelet::gridmap_callback, this, ros::TransportHints().tcpNoDelay());
     odom_sub_ = nh.subscribe<nav_msgs::Odometry>("odom", 10, &Nodelet::odom_callback, this, ros::TransportHints().tcpNoDelay());
     target_sub_ = nh.subscribe<nav_msgs::Odometry>("target", 10, &Nodelet::target_callback, this, ros::TransportHints().tcpNoDelay());
+    search_state_sub_ = nh.subscribe<std_msgs::Bool>("search_state", 10, &Nodelet::search_state_callback, this, ros::TransportHints().tcpNoDelay());
     triger_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("triger", 10, &Nodelet::triger_callback, this, ros::TransportHints().tcpNoDelay());
     land_triger_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("land_triger", 10, &Nodelet::land_triger_callback, this, ros::TransportHints().tcpNoDelay());
     broadcast_traj_sub_ = nh.subscribe<quadrotor_msgs::PolyTraj>("/planning/broadcast_traj_recv", 100,

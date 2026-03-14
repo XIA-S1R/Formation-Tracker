@@ -15,6 +15,11 @@
 #include <target_ekf/target_ekf.hpp>
 #include <target_ekf/target_dpf.hpp>
 #include <target_ekf/LocalStats.h>
+#include <std_msgs/Bool.h>
+#include <unordered_set>
+#include <algorithm>
+#include <numeric>
+#include "target_ekf/search_particles_manager.hpp"
 
 // === 全局变量 ===
 // 发布器
@@ -50,6 +55,16 @@ int dpf_rate_ = 20;
 std::shared_ptr<DistributedPF> dpfPtr_;
 ros::Time last_update_stamp_;
 int dpf_reset_suppress_count_ = 0;
+
+// 搜索模式相关
+int miss_detection_num_ = 10; // 连续多少帧都没有观测后进入搜索模式
+int consecutive_no_obs_count_ = 0; // 连续无观测计数
+bool search_mode_active_ = false; // 是否处于搜索模式
+ros::Publisher search_state_pub_; // 搜索状态发布器
+ros::Time last_global_obs_time_;
+
+// 搜索粒子管理器
+std::unique_ptr<SearchParticlesManager> search_particles_manager_;
 
 // 邻居数据存储
 std::map<int, LocalStat> received_stats_;
@@ -295,60 +310,142 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
   }
 
   // ==============================================
-  // 【100%对齐论文Algorithm 1 核心流程】
+  // 【模式判断 - 在回调开始时判断当前应执行的模式】
   // ==============================================
   ROS_DEBUG("[dpf%d] has_obs=%d, initialized=%d", drone_id_, has_obs, dpfPtr_->initialized_);
 
-  // --- 论文步骤1：从GMM采样新粒子（Importance sampling step）---
-  dpfPtr_->sampleParticlesFromGMM();
-
-  // --- 论文步骤2：状态预测 ---
-  dpfPtr_->predict();
-
-  // --- 论文步骤3：权重更新（仅有观测节点执行）---
-  if (has_obs) {
-    dpfPtr_->updateWeights(obs_pos, obs_rpy);
+  if (search_mode_active_) {
+    // =========================
+    // 【搜索模式处理流程】
+    // =========================
+    // 1. 更新搜索粒子状态
+    search_particles_manager_->updateAllSearchParticles();
+    
+    // 2. 使用负观测权重更新机制来处理搜索模式下的无观测情况
+    // 当前无人机没有观测到目标，但需要基于视场信息更新搜索粒子权重
+    if (!has_obs) {
+      // 使用负观测权重更新来降低在当前无人机视场内但未被观测到的搜索粒子权重
+      search_particles_manager_->updateSearchParticlesWithNegativeObservation(cam_p, cam_q, 0.05);
+    }
+    
+    // 3. 检查是否重新观测到目标，如果是则退出搜索模式
+    if (has_obs) {
+      search_mode_active_ = false;
+      consecutive_no_obs_count_ = 0;
+      ROS_WARN("[dpf%d] EXITING SEARCH MODE: Target reacquired!", drone_id_);
+    }
+    
+    // 4. 发布搜索状态
+    std_msgs::Bool search_state_msg;
+    search_state_msg.data = search_mode_active_;
+    search_state_pub_.publish(search_state_msg);
+    
+    return;  // 提前结束，不执行普通DPF流程
   }
-
-  // --- 论文步骤4：E步，计算本地统计量（所有节点执行，无观测节点也计算真实统计量）---
-  LocalStat local_stat = dpfPtr_->computeLocalStatsOnly(drone_id_, has_obs);
-
-  // --- 论文步骤5：收集邻居共识状态 ---
-  std::vector<NeighborConsensus> neighbor_consensus;
-  {
-    std::lock_guard<std::mutex> lock(stats_mutex_);
-    ros::Time current_time = ros::Time::now();
-    double time_threshold = 0.3;
-    for (auto& kv : received_consensus_) {
-      double time_diff = (current_time - kv.second.timestamp).toSec();
-      if (time_diff < time_threshold) {
-        neighbor_consensus.push_back(kv.second);
+  else {
+    // =========================
+    // 【普通DPF模式处理流程 - 对齐论文Algorithm 1】
+    // =========================
+    // --- 论文步骤1：从GMM采样新粒子（Importance sampling step）---
+    dpfPtr_->sampleParticlesFromGMM();
+    
+    // --- 论文步骤2：状态预测 ---
+    dpfPtr_->predict();
+    
+    // --- 论文步骤3：权重更新（仅有观测节点执行）---
+    if (has_obs) {
+      dpfPtr_->updateWeights(obs_pos, obs_rpy);
+    }
+    
+    // --- 论文步骤4：E步，计算本地统计量（所有节点执行，无观测节点也计算真实统计量）---
+    LocalStat local_stat = dpfPtr_->computeLocalStatsOnly(drone_id_, has_obs);
+    
+    // --- 论文步骤5：收集邻居共识状态并检测是否需要切换到搜索模式 ---
+    std::vector<NeighborConsensus> neighbor_consensus;
+    std::vector<int> neighbor_ids;
+    {
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      ros::Time current_time = ros::Time::now();
+      double time_threshold = 0.3;
+      for (auto& kv : received_consensus_) {
+        double time_diff = (current_time - kv.second.timestamp).toSec();
+        if (time_diff < time_threshold) {
+          neighbor_consensus.push_back(kv.second);
+          neighbor_ids.push_back(kv.first); // 存储邻居ID
+        }
+      }
+      // 兜底：无有效邻居时保留最近1个
+      if (neighbor_consensus.empty() && !received_consensus_.empty()) {
+        neighbor_consensus.push_back(received_consensus_.begin()->second);
+        neighbor_ids.push_back(received_consensus_.begin()->first);
       }
     }
-    // 兜底：无有效邻居时保留最近1个
-    if (neighbor_consensus.empty() && !received_consensus_.empty()) {
-      neighbor_consensus.push_back(received_consensus_.begin()->second);
+    
+    // 检查是否所有无人机都失去了观测（包括当前无人机和邻居）
+    bool all_drones_no_obs = true;
+    
+    // 检查当前无人机是否有观测
+    if (has_obs) {
+      all_drones_no_obs = false;
     }
-  }
-
-  // --- 论文步骤6：单步EM迭代（共识滤波+M步）---
-  dpfPtr_->emStep(drone_id_, neighbor_consensus, local_stat);
-  ROS_DEBUG("[dpf%d][EM] completed 1 step, fused %zu neighbors", drone_id_, neighbor_consensus.size());
-
-  // --- 论文步骤7：系统重采样（仅有观测节点执行）---
-  if (has_obs) {
-    dpfPtr_->systematicResample();
-  }
-
-  // --- 发布最新的共识状态ζ（给邻居下一帧使用）---
-  local_stats_pub_.publish(toMsg(local_stat, *dpfPtr_));
-
-  // --- 数值有效性检查 ---
-  if (!dpfPtr_->isValid()) {
-    ROS_ERROR("[dpf%d] update invalid! NaN/Inf detected, resetting.", drone_id_);
-    if (has_obs) dpfPtr_->reset(obs_pos, obs_rpy);
-    dpf_reset_suppress_count_ = 3;
-    return;
+    
+    // 检查邻居无人机是否有观测
+    for (size_t i = 0; i < neighbor_consensus.size(); ++i) {
+      if (neighbor_consensus[i].has_obs) {
+        all_drones_no_obs = false;
+        break;
+      }
+    }
+    
+    // 更新连续无观测计数
+    if (all_drones_no_obs) {
+      consecutive_no_obs_count_++;
+      if (consecutive_no_obs_count_ >= miss_detection_num_ && !search_mode_active_) {
+        // 立即进入搜索模式并进行初始化
+        search_mode_active_ = true;
+        last_global_obs_time_ = ros::Time::now();
+        ROS_WARN("[dpf%d] ENTERING SEARCH MODE: All drones lost target for %d consecutive frames!", 
+                 drone_id_, consecutive_no_obs_count_);
+        // 继承当前DPF粒子并分配意图标签
+        search_particles_manager_->inheritAndLabelParticles(dpfPtr_.get());
+        
+        // 发布搜索状态
+        std_msgs::Bool search_state_msg;
+        search_state_msg.data = search_mode_active_;
+        search_state_pub_.publish(search_state_msg);
+        
+        // 跳过后续普通DPF流程，直接返回
+        return;
+      }
+    } else {
+      // 有任意无人机重新观测到目标
+      consecutive_no_obs_count_ = 0;
+    }
+    
+    // --- 论文步骤6：单步EM迭代（共识滤波+M步）---
+    dpfPtr_->emStep(drone_id_, neighbor_consensus, local_stat);
+    ROS_DEBUG("[dpf%d][EM] completed 1 step, fused %zu neighbors", drone_id_, neighbor_consensus.size());
+    
+    // --- 论文步骤7：系统重采样（仅有观测节点执行）---
+    if (has_obs) {
+      dpfPtr_->systematicResample();
+    }
+    
+    // --- 发布最新的共识状态ζ（给邻居下一帧使用）---
+    local_stats_pub_.publish(toMsg(local_stat, *dpfPtr_));
+    
+    // --- 数值有效性检查 ---
+    if (!dpfPtr_->isValid()) {
+      ROS_ERROR("[dpf%d] update invalid! NaN/Inf detected, resetting.", drone_id_);
+      if (has_obs) dpfPtr_->reset(obs_pos, obs_rpy);
+      dpf_reset_suppress_count_ = 3;
+      return;
+    }
+    
+    // 发布搜索状态（在这种情况下为false）
+    std_msgs::Bool search_state_msg;
+    search_state_msg.data = search_mode_active_;
+    search_state_pub_.publish(search_state_msg);
   }
 
   // --- 发布目标odom ---
@@ -386,6 +483,8 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
   last_update_stamp_ = ros::Time::now();
 }
 
+
+
 int main(int argc, char** argv) {
   ros::init(argc, argv, "target_dpf");
   ros::NodeHandle nh("~");
@@ -410,6 +509,9 @@ int main(int argc, char** argv) {
   nh.getParam("pitch_thr", pitch_thr_);
   nh.getParam("check_fov", check_fov_);
 
+  // 搜索模式参数
+  nh.getParam("miss_detection_num", miss_detection_num_);
+
   // DPF参数
   int num_particles = 300;
   int num_components = 4;
@@ -420,10 +522,14 @@ int main(int argc, char** argv) {
   nh.getParam("num_em_iters", num_em_iters);
 
   dpfPtr_ = std::make_shared<DistributedPF>(1.0 / dpf_rate_, num_particles, num_components, num_em_iters);
+  
+  // 创建搜索粒子管理器
+  search_particles_manager_ = std::make_unique<SearchParticlesManager>(drone_id_);
 
   // 订阅/发布
   target_odom_pub_ = nh.advertise<nav_msgs::Odometry>("target_odom", 1);
   local_stats_pub_ = nh.advertise<target_ekf::LocalStats>("local_stats", 1);
+  search_state_pub_ = nh.advertise<std_msgs::Bool>("search_state", 1);
   
   // 地图订阅
   ros::Subscriber global_map_sub = nh.subscribe("global_map", 10, &global_map_callback);
