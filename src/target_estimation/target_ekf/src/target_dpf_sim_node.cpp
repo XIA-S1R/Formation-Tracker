@@ -642,7 +642,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     labeled_consensus_msg.header.frame_id = "world";
     labeled_consensus_msg.drone_id = drone_id_;
     labeled_consensus_msg.label = static_cast<int>(label);
-    labeled_consensus_msg.num_components = num_components;
+    labeled_consensus_msg.num_components = search_particles_manager_->getNumComponents();
     labeled_consensus_msg.state_dim = 9;
     labeled_consensus_msg.has_obs = false;  // 搜索模式中总是false
 

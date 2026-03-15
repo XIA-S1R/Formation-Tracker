@@ -57,9 +57,9 @@ public:
       num_components_(num_components), // 【修复2】添加缺失的成员变量初始化
       search_particles_initialized_(false),
       search_dt_(1.0 / 20.0),  // 搜索模式更新周期，默认20Hz
-      search_vmax_(1.5),        // 最大速度 m/s (默认值)
+      search_vmax_(2),        // 最大速度 m/s (默认值)
       search_vmin_(0.5),        // 最小速度 m/s
-      search_amax_(2.5),        // 最大加速度 m/s² (默认值)
+      search_amax_(4),        // 最大加速度 m/s² (默认值)
       intent_keep_prob_(0.8),   // 意图保持概率 80%
       search_pos_noise_(0.1),   // 位置噪声 m
       search_vel_noise_(0.2),   // 速度噪声 m/s
@@ -68,12 +68,16 @@ public:
       cam_width_(640.0), cam_height_(480.0), cam_max_range_(5.0) {
     // 从参数服务器读取动力学参数
     if (nh) {
-      double param_vmax = 1.5;
-      double param_amax = 2.5;
-      nh->param("/target/planning/vmax", param_vmax, param_vmax);
-      nh->param("/target/planning/amax", param_amax, param_amax);
-      search_vmax_ = param_vmax;
-      search_amax_ = param_amax;
+      nh->param("/target/planning/vmax", search_vmax_, search_vmax_);
+      nh->param("/target/planning/amax", search_amax_, search_amax_);
+      // 直接读取相机参数到成员变量
+      nh->param("/target/camera/fx", cam_fx_, cam_fx_);
+      nh->param("/target/camera/fy", cam_fy_, cam_fy_);
+      nh->param("/target/camera/cx", cam_cx_, cam_cx_);
+      nh->param("/target/camera/cy", cam_cy_, cam_cy_);
+      nh->param("/target/camera/width", cam_width_, cam_width_);
+      nh->param("/target/camera/height", cam_height_, cam_height_);
+      nh->param("/target/camera/max_range", cam_max_range_, cam_max_range_);
     }
     
     rng_.seed(std::random_device{}());
@@ -482,6 +486,10 @@ public:
   std::map<SearchIntent, std::vector<Eigen::MatrixXd>> getLabeledGMMCovs() const;
   std::map<SearchIntent, Eigen::VectorXd> getLabeledGMMPis() const;
   
+  // 在 SearchParticlesManager 类的 public 部分添加以下声明（大约在第484行附近）：
+  std::map<SearchIntent, Eigen::VectorXd> getLabeledZetaAlpha() const;
+  std::map<SearchIntent, std::vector<Eigen::VectorXd>> getLabeledZetaA() const;
+  std::map<SearchIntent, std::vector<Eigen::MatrixXd>> getLabeledZetaB() const;
   // 从GMM采样新粒子（基于标准DPF实现）
   void sampleParticlesFromGMM();
   
@@ -515,8 +523,12 @@ public:
   bool isInitialized() const {
     return search_particles_initialized_;
   }
+  
+  int getNumComponents() const {
+    return num_components_;
+  }
 
-  // Setter methods
+  /*// Setter methods
   void setDroneId(int drone_id) { drone_id_ = drone_id; }
   void setSearchDt(double dt) { search_dt_ = dt; }
   void setSearchVMax(double vmax) { search_vmax_ = vmax; }
@@ -528,7 +540,7 @@ public:
     cam_cx_ = cx; cam_cy_ = cy;
     cam_width_ = width; cam_height_ = height;
     cam_max_range_ = max_range;
-  }
+  }*/
   // 设置视线检查函数
   void setLineOfSightCheckFn(std::function<bool(const Eigen::Vector3d&, const Eigen::Vector3d&)> fn) {
     los_check_fn_ = fn;
@@ -666,6 +678,28 @@ inline std::vector<LabeledLocalStat> SearchParticlesManager::computeLabeledLocal
 }
 
 // 对每个标签的本地统计量，独立运行平均共识滤波
+inline void SearchParticlesManager::labeledConsensusFilter(const std::vector<LabeledNeighborConsensus>& neighbor_consensus,
+  const std::vector<LabeledLocalStat>& local_stats) {
+// 遍历每个标签，对每个标签独立运行共识滤波
+for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
+SearchIntent label = static_cast<SearchIntent>(label_int);
+
+// 找到该标签对应的本地统计量
+const LabeledLocalStat* local_stat = nullptr;
+for (const auto& stat : local_stats) {
+if (stat.label == label) {
+local_stat = &stat;
+break;
+}
+}
+
+if (local_stat) {
+consensusFilterForLabel(label, neighbor_consensus, *local_stat);
+}
+}
+}
+
+// 对每个标签的本地统计量，独立运行平均共识滤波
 inline void SearchParticlesManager::consensusFilterForLabel(SearchIntent label,
   const std::vector<LabeledNeighborConsensus>& neighbor_consensus,
   const LabeledLocalStat& local_stat) {
@@ -704,59 +738,6 @@ inline void SearchParticlesManager::consensusFilterForLabel(SearchIntent label,
   globalMStepForLabel(label);
   }
 
-// 单标签共识滤波
-inline void SearchParticlesManager::consensusFilterForLabel(SearchIntent label,
-                                                           const std::vector<LabeledNeighborConsensus>& neighbor_consensus,
-                                                           const LabeledLocalStat& local_stat) {
-  int C = num_components_;
-  int nx = 9;
-  
-  // 动态调整共识步长
-  int d_max = neighbor_consensus.size() + 1;
-  double adaptive_epsilon = 1.0 / d_max;
-  adaptive_epsilon = std::min(adaptive_epsilon, 0.3); // 上限0.3保证稳定
-  
-  // 对齐原DPF的共识迭代次数
-  for (int iter = 0; iter < 10; ++iter) {
-    for (int c = 0; c < C; ++c) {
-      // 计算邻居差值
-      double alpha_diff = 0.0;
-      Eigen::VectorXd a_diff = Eigen::VectorXd::Zero(nx);
-      Eigen::MatrixXd b_diff = Eigen::MatrixXd::Zero(nx, nx);
-      
-      int valid_neighbor = 0;
-      for (const auto& nc : neighbor_consensus) {
-        alpha_diff += nc.zeta_alpha(c) - zeta_alpha_[label](c);
-        a_diff += nc.zeta_a[c] - zeta_a_[label][c];
-        b_diff += nc.zeta_b[c] - zeta_b_[label][c];
-        valid_neighbor++;
-      }
-      
-      // 本地统计量处理
-      double local_alpha = 0.0;
-      Eigen::VectorXd local_a = Eigen::VectorXd::Zero(nx);
-      Eigen::MatrixXd local_b = Eigen::MatrixXd::Zero(nx, nx);
-      
-      if (local_stat.has_obs) {
-        local_alpha = local_stat.alpha(c);
-        local_a = local_stat.a[c];
-        local_b = local_stat.b[c];
-      } else {
-        local_alpha = zeta_alpha_[label](c);
-        local_a = zeta_a_[label][c];
-        local_b = zeta_b_[label][c];
-      }
-      
-      // 更新共识状态
-      zeta_alpha_[label](c) += adaptive_epsilon * (alpha_diff + (local_alpha - zeta_alpha_[label](c)));
-      zeta_a_[label][c] += adaptive_epsilon * (a_diff + (local_a - zeta_a_[label][c]));
-      zeta_b_[label][c] += adaptive_epsilon * (b_diff + (local_b - zeta_b_[label][c]));
-    }
-  }
-  
-  // 全局M步更新该标签的GMM
-  globalMStepForLabel(label);
-}
 
 // 单标签全局M步
 inline void SearchParticlesManager::globalMStepForLabel(SearchIntent label) {
@@ -888,34 +869,36 @@ inline void SearchParticlesManager::sampleParticlesFromGMM() {
       particle.state(6) = wrapAngle(particle.state(6));
       particle.state(7) = wrapAngle(particle.state(7));
       particle.state(8) = wrapAngle(particle.state(8));
+      // ✅ 重采样后重置权重为均匀分布
+      particle.weight = 1.0 / label_particle_count;
     }
   }
   
   ROS_DEBUG("[sp_mgr%d] Sampled new particles from GMM", drone_id_);
 }
-std::map<SearchIntent, Eigen::VectorXd> getLabeledZetaAlpha() const {
+inline std::map<SearchIntent, Eigen::VectorXd> SearchParticlesManager::getLabeledZetaAlpha() const {
   std::map<SearchIntent, Eigen::VectorXd> result;
   for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
     SearchIntent label = static_cast<SearchIntent>(label_int);
-    result[label] = zeta_alpha_[label];
+     result.insert({label, zeta_alpha_.at(label)});
   }
   return result;
 }
 
-std::map<SearchIntent, std::vector<Eigen::VectorXd>> getLabeledZetaA() const {
+inline std::map<SearchIntent, std::vector<Eigen::VectorXd>> SearchParticlesManager::getLabeledZetaA() const {
   std::map<SearchIntent, std::vector<Eigen::VectorXd>> result;
   for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
     SearchIntent label = static_cast<SearchIntent>(label_int);
-    result[label] = zeta_a_[label];
+    result.insert({label, zeta_a_.at(label)});
   }
   return result;
 }
 
-std::map<SearchIntent, std::vector<Eigen::MatrixXd>> getLabeledZetaB() const {
+inline std::map<SearchIntent, std::vector<Eigen::MatrixXd>> SearchParticlesManager::getLabeledZetaB() const {
   std::map<SearchIntent, std::vector<Eigen::MatrixXd>> result;
   for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
     SearchIntent label = static_cast<SearchIntent>(label_int);
-    result[label] = zeta_b_[label];
+    result.insert({label, zeta_b_.at(label)});
   }
   return result;
 }
