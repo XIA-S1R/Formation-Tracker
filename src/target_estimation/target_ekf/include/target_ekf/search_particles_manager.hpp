@@ -546,6 +546,101 @@ public:
     los_check_fn_ = fn;
   }
 
+
+
+// 调试：打印粒子分散趋势
+void debugPrintParticleDistribution(int frame_num) const {
+  if (!search_particles_initialized_) return;
+  
+  ROS_INFO("\n========== [Frame %d] Search Particles Distribution ==========", frame_num);
+  
+  // 按标签分组统计
+  std::map<SearchIntent, std::vector<size_t>> label_to_indices;
+  for (size_t i = 0; i < search_particles_.size(); ++i) {
+    label_to_indices[search_particles_[i].intent].push_back(i);
+  }
+  
+  const char* label_names[] = {"STRAIGHT", "LEFT_TURN", "RIGHT_TURN"};
+  
+  for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
+    SearchIntent label = static_cast<SearchIntent>(label_int);
+    auto it = label_to_indices.find(label);
+    if (it == label_to_indices.end() || it->second.empty()) continue;
+    
+    const auto& indices = it->second;
+    int count = indices.size();
+    
+    // 统计位置和速度范围
+    Eigen::Vector3d pos_min = Eigen::Vector3d::Constant(1e9);
+    Eigen::Vector3d pos_max = Eigen::Vector3d::Constant(-1e9);
+    Eigen::Vector3d vel_min = Eigen::Vector3d::Constant(1e9);
+    Eigen::Vector3d vel_max = Eigen::Vector3d::Constant(-1e9);
+    Eigen::Vector3d pos_mean = Eigen::Vector3d::Zero();
+    Eigen::Vector3d vel_mean = Eigen::Vector3d::Zero();
+    double weight_sum = 0.0;
+    double weight_max = 0.0;
+    
+    for (size_t idx : indices) {
+      const auto& p = search_particles_[idx];
+      Eigen::Vector3d pos = p.state.head(3);
+      Eigen::Vector3d vel = p.state.segment(3, 3);
+      
+      pos_min = pos_min.cwiseMin(pos);
+      pos_max = pos_max.cwiseMax(pos);
+      vel_min = vel_min.cwiseMin(vel);
+      vel_max = vel_max.cwiseMax(vel);
+      
+      pos_mean += p.weight * pos;
+      vel_mean += p.weight * vel;
+      weight_sum += p.weight;
+      weight_max = std::max(weight_max, p.weight);
+    }
+    
+    if (weight_sum > 1e-300) {
+      pos_mean /= weight_sum;
+      vel_mean /= weight_sum;
+    }
+    
+    // 计算位置和速度的标准差
+    Eigen::Vector3d pos_std = Eigen::Vector3d::Zero();
+    Eigen::Vector3d vel_std = Eigen::Vector3d::Zero();
+    for (size_t idx : indices) {
+      const auto& p = search_particles_[idx];
+      Eigen::Vector3d pos = p.state.head(3);
+      Eigen::Vector3d vel = p.state.segment(3, 3);
+      pos_std += p.weight * (pos - pos_mean).cwiseAbs2();
+      vel_std += p.weight * (vel - vel_mean).cwiseAbs2();
+    }
+    pos_std = (pos_std / weight_sum).cwiseSqrt();
+    vel_std = (vel_std / weight_sum).cwiseSqrt();
+    
+    // 打印标签信息
+    ROS_INFO("\n--- Label: %s (Count: %d) ---", label_names[label_int], count);
+    ROS_INFO("  Position Mean: (%.3f, %.3f, %.3f)", pos_mean.x(), pos_mean.y(), pos_mean.z());
+    ROS_INFO("  Position Std:  (%.3f, %.3f, %.3f)", pos_std.x(), pos_std.y(), pos_std.z());
+    ROS_INFO("  Position Range: X[%.2f, %.2f] Y[%.2f, %.2f] Z[%.2f, %.2f]",
+             pos_min.x(), pos_max.x(), pos_min.y(), pos_max.y(), pos_min.z(), pos_max.z());
+    
+    ROS_INFO("  Velocity Mean: (%.3f, %.3f, %.3f)", vel_mean.x(), vel_mean.y(), vel_mean.z());
+    ROS_INFO("  Velocity Std:  (%.3f, %.3f, %.3f)", vel_std.x(), vel_std.y(), vel_std.z());
+    ROS_INFO("  Velocity Range: X[%.2f, %.2f] Y[%.2f, %.2f] Z[%.2f, %.2f]",
+             vel_min.x(), vel_max.x(), vel_min.y(), vel_max.y(), vel_min.z(), vel_max.z());
+    
+    ROS_INFO("  Weight: Max=%.4f, Sum=%.4f, Avg=%.4f", weight_max, weight_sum, weight_sum / count);
+    
+    // 打印GMM参数
+    ROS_INFO("  GMM Components:");
+    for (int c = 0; c < num_components_; ++c) {
+      ROS_INFO("    [%d] pi=%.4f, mu=(%.2f,%.2f,%.2f), det(S)=%.2e",
+               c, gmm_pi_.at(label)(c),
+               gmm_mu_.at(label)[c](0), gmm_mu_.at(label)[c](1), gmm_mu_.at(label)[c](2),
+               gmm_S_.at(label)[c].determinant());
+    }
+  }
+  
+  ROS_INFO("===========================================================\n");
+}
+
 private:
   // 成员变量
   int drone_id_;

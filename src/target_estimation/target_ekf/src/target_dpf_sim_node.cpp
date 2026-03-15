@@ -623,6 +623,15 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     // --- 步骤5：标签化的共识滤波（每个标签独立运行共识）---
     search_particles_manager_->labeledConsensusFilter(neighbor_labeled_consensus, local_labeled_stats);
 
+    // ✅ 调试：打印前10帧的粒子分散趋势
+    static int search_frame_count = 0;
+    if (search_frame_count < 10) {
+      search_particles_manager_->debugPrintParticleDistribution(search_frame_count);
+      search_frame_count++;
+    } else if (search_frame_count == 10) {
+      ROS_INFO("[dpf%d] Search mode debug output completed (first 10 frames)", drone_id_);
+      search_frame_count++;
+    }
     // --- 步骤5.1：发布搜索粒子可视化---
     publishSearchParticlesVisualization();
 
