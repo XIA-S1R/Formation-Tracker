@@ -372,6 +372,17 @@ class Nodelet : public nodelet::Nodelet {
     gridmapPtr_->from_msg(map_msg_);
     replanStateMsg_.occmap = map_msg_;
     gridmap_lock_.clear();
+
+    // Check map freshness - allow up to 200ms delay for lidar mapping
+    double map_age = (ros::Time::now() - map_msg_.header.stamp).toSec();
+    if (map_age > 0.2) {
+      ROS_WARN("[drone %d planner] Map is stale: %.3f seconds", trajOptPtr_->drone_id_, map_age);
+      force_hover_ = true;
+      replanStateMsg_.state = 4;
+      replanState_pub_.publish(replanStateMsg_);
+      return;
+    }
+
     prePtr_->setMap(*gridmapPtr_);
 
     // Set swarm trajectories for collision avoidance

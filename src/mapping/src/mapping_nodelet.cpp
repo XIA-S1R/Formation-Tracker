@@ -40,6 +40,9 @@ class Nodelet : public nodelet::Nodelet {
 
   ros::Publisher gridmap_inflate_pub_;
 
+  ros::Timer odom_timeout_timer_;
+  ros::Time last_odom_time_;
+
   // NOTE for mask target
   bool use_mask_ = false;
   ros::Subscriber target_odom_sub_;
@@ -95,6 +98,7 @@ class Nodelet : public nodelet::Nodelet {
     cur_pos_.x() = msgPtr->pose.pose.position.x;
     cur_pos_.y() = msgPtr->pose.pose.position.y;
     cur_pos_.z() = msgPtr->pose.pose.position.z;
+    last_odom_time_ = ros::Time::now();
     odom_received_ = true;
     odom_lock_.clear();
   }
@@ -201,11 +205,19 @@ class Nodelet : public nodelet::Nodelet {
       odom_sub_ = nh.subscribe<nav_msgs::Odometry>("odom", 10, &Nodelet::odom_callback, this,
                                                     ros::TransportHints().tcpNoDelay());
       sense_timer_ = nh.createTimer(ros::Duration(1.0 / sensor_rate_), &Nodelet::sense_timer_callback, this);
+      odom_timeout_timer_ = nh.createTimer(ros::Duration(0.1), &Nodelet::odom_timeout_callback, this);
     }
 
     if (use_mask_) {
       target_odom_sub_ = nh.subscribe<nav_msgs::Odometry>("target", 1, &Nodelet::target_odom_callback, this,
                                                            ros::TransportHints().tcpNoDelay());
+    }
+  }
+
+  void odom_timeout_callback(const ros::TimerEvent&) {
+    if (ros::Time::now() - last_odom_time_ > ros::Duration(0.5)) {
+      odom_received_ = false;
+      ROS_ERROR("[mapping] Odometry timeout!");
     }
   }
 

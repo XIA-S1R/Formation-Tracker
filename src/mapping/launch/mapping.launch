@@ -19,7 +19,7 @@
     <remap from="~gridmap_inflate" to="gridmap_inflate"/>
     <!-- sensing parameters -->
     <param name="sensor_range"     value="5.0"/>
-    <param name="sensor_rate"      value="10.0"/>
+    <param name="sensor_rate"      value="20.0"/>
     <!-- raycasting parameters -->
     <param name="p_min" value="-199"/>
     <param name="p_max" value=" 220"/>
