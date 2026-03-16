@@ -555,6 +555,21 @@ class Nodelet : public nodelet::Nodelet {
       pub_hover_p(iniState.col(0), replan_stamp);
       return;
     } else {
+      // Update map with latest data before executing old trajectory
+      while (gridmap_lock_.test_and_set());
+      gridmapPtr_->from_msg(map_msg_);
+      gridmap_lock_.clear();
+
+      // Verify old trajectory with latest map
+      if (!validcheck(traj_poly_, replan_stamp_)) {
+        force_hover_ = true;
+        ROS_FATAL("[planner] EMERGENCY STOP - OLD TRAJ INVALID WITH LATEST MAP!!!");
+        replanStateMsg_.state = 2;
+        replanState_pub_.publish(replanStateMsg_);
+        pub_hover_p(iniState.col(0), replan_stamp);
+        return;
+      }
+
       ROS_ERROR("[planner] REPLAN FAILED, EXECUTE LAST TRAJ...");
       replanStateMsg_.state = 3;
       replanState_pub_.publish(replanStateMsg_);
@@ -726,19 +741,34 @@ class Nodelet : public nodelet::Nodelet {
       traj_poly_ = traj;
       replan_stamp_ = replan_stamp;
     } else if (force_hover_) {
-      ROS_ERROR("[planner] REPLAN FAILED, HOVERING...");
+      ROS_ERROR("[drone %d planner] REPLAN FAILED, HOVERING...", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 1;
       replanState_pub_.publish(replanStateMsg_);
       return;
     } else if (!validcheck(traj_poly_, replan_stamp_)) {
       force_hover_ = true;
-      ROS_FATAL("[planner] EMERGENCY STOP!!!");
+      ROS_FATAL("[drone %d planner] EMERGENCY STOP!!!", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 2;
       replanState_pub_.publish(replanStateMsg_);
       pub_hover_p(iniState.col(0), replan_stamp);
       return;
     } else {
-      ROS_ERROR("[planner] REPLAN FAILED, EXECUTE LAST TRAJ...");
+      // Update map with latest data before executing old trajectory
+      while (gridmap_lock_.test_and_set());
+      gridmapPtr_->from_msg(map_msg_);
+      gridmap_lock_.clear();
+
+      // Verify old trajectory with latest map
+      if (!validcheck(traj_poly_, replan_stamp_)) {
+        force_hover_ = true;
+        ROS_FATAL("[drone %d planner] EMERGENCY STOP - OLD TRAJ INVALID WITH LATEST MAP!!!", trajOptPtr_->drone_id_);
+        replanStateMsg_.state = 2;
+        replanState_pub_.publish(replanStateMsg_);
+        pub_hover_p(iniState.col(0), replan_stamp);
+        return;
+      }
+
+      ROS_ERROR("[drone %d planner] REPLAN FAILED, EXECUTE LAST TRAJ...", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 3;
       replanState_pub_.publish(replanStateMsg_);
       return;  // current generated traj invalid but last is valid

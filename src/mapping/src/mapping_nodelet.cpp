@@ -134,6 +134,11 @@ class Nodelet : public nodelet::Nodelet {
 
     ROS_INFO_THROTTLE(1, "[mapping] obs_pts: %zu", obs_pts.size());
 
+    // Set timestamp BEFORE updateMap to reflect actual observation time
+    quadrotor_msgs::OccMap3d gridmap_msg;
+    gridmap_msg.header.frame_id = "world";
+    gridmap_msg.header.stamp = ros::Time::now();
+
     gridmap_.updateMap(sensor_p, obs_pts);
 
     if (use_mask_) {
@@ -145,9 +150,6 @@ class Nodelet : public nodelet::Nodelet {
       target_lock_.clear();
     }
 
-    quadrotor_msgs::OccMap3d gridmap_msg;
-    gridmap_msg.header.frame_id = "world";
-    gridmap_msg.header.stamp = ros::Time::now();
     gridmap_.to_msg(gridmap_msg);
     gridmap_inflate_pub_.publish(gridmap_msg);
     ROS_DEBUG("[mapping] published gridmap");

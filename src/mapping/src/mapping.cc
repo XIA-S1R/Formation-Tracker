@@ -100,39 +100,6 @@ void OccGridMap::updateMap(const Eigen::Vector3d& sensor_p,
       } else {
         mis(idx);
       }
-    } else {
-      continue;
-    }
-    // ray casting
-
-    Eigen::Vector3i d_idx = sensor_idx - idx;
-    Eigen::Vector3i step = d_idx.array().sign().cast<int>();
-    Eigen::Vector3d delta_t;
-    Eigen::Vector3d dp = sensor_p - pt;
-    for (int i = 0; i < 3; ++i) {
-      delta_t(i) = dp(i) == 0 ? std::numeric_limits<double>::max() : 1.0 / std::fabs(dp(i));
-    }
-    Eigen::Vector3d t_max;
-    for (int i = 0; i < 3; ++i) {
-      t_max(i) = step(i) > 0 ? (idx(i) + 1) - pt(i) / resolution : pt(i) / resolution - idx(i);
-    }
-    t_max = t_max.cwiseProduct(delta_t);
-    Eigen::Vector3i rayIdx = idx;
-    while ((rayIdx - sensor_idx).squaredNorm() != 1) {
-      // find the shortest t_max
-      int s_dim = 0;
-      for (int i = 1; i < 3; ++i) {
-        s_dim = t_max(i) < t_max(s_dim) ? i : s_dim;
-      }
-      rayIdx(s_dim) += step(s_dim);
-      t_max(s_dim) += delta_t(s_dim);
-      Eigen::Vector3i rayAdd = occ.idx2add(rayIdx);
-      if (vis.at(rayAdd) == -1) {
-        break;
-      }
-      if (vis.at(rayAdd) != 1) {
-        mis(rayIdx);
-      }
     }
   }
 }
