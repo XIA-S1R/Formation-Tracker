@@ -280,8 +280,8 @@ Maps::randomMapGenerate()
   double column_width = right_third_length * 0.5; // 缩短宽度，占后1/3区域的50%
   double column_length = 1.0;
   double column_height = 6.0;
-  double column_spacing = 3.0; // 减小间距
-  double column_gap = 3.0; // 与大障碍物的间距，适当减小
+  double column_spacing = 5.0; // 减小间距
+  double column_gap = 5.0; // 与大障碍物的间距，适当减小
   
   // 计算矩形障碍的起始x位置（在大障碍物之后，确保在后1/3区域内）
   double column_x_min = big_obstacle_right + column_gap;

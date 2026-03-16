@@ -23,6 +23,21 @@
 #include <numeric>
 #include "target_ekf/search_particles_manager.hpp"
 
+// === 前向声明 ===
+struct GMMAssignment {
+  int drone_id;
+  int gmm_id;
+  double distance;
+};
+
+void matchGMMCenters(const std::vector<Eigen::Vector3d>& current_mu,
+                     const Eigen::VectorXd& current_pi,
+                     double distance_threshold = 2.0);
+std::vector<GMMAssignment> assignGMMTasks(const std::vector<Eigen::Vector3d>& drone_positions,
+                                          const std::vector<Eigen::Vector3d>& gmm_centers,
+                                          const std::vector<int>& gmm_ids,
+                                          const Eigen::VectorXd& gmm_weights);
+
 // === 全局变量 ===
 // 发布器
 ros::Publisher target_odom_pub_;
@@ -31,6 +46,7 @@ ros::Publisher labeled_consensus_pub_;
 ros::Publisher search_state_pub_;
 ros::Publisher search_particles_vis_pub_;
 ros::Publisher search_gmm_vis_pub_; // 搜索GMM分布可视化发布器
+ros::Publisher search_pos_gmm_pub_;  // 位置GMM发布器
 std::vector<ros::Subscriber> stats_subs_;
 
 // 相机外参
@@ -77,6 +93,12 @@ std::map<int, NeighborConsensus> received_consensus_;
 std::map<int, std::vector<LabeledNeighborConsensus>> received_labeled_consensus_;
 std::mutex stats_mutex_;
 std::mutex labeled_stats_mutex_;
+
+// === GMM中心帧间匹配相关 ===
+std::vector<Eigen::Vector3d> prev_pos_gmm_mu_;  // 上一帧的GMM中心
+std::vector<int> gmm_center_ids_;               // 每个中心的持久ID
+int next_gmm_id_ = 0;                           // 下一个可用的ID
+std::mt19937 rng_;                              // 随机数生成器
 
 // === 占据栅格 ===
 struct SimpleOccMap {
@@ -645,7 +667,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
 
   for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
     SearchIntent label = static_cast<SearchIntent>(label_int);
-    
+
     target_ekf::LabeledConsensusState labeled_consensus_msg;
     labeled_consensus_msg.header.stamp = ros::Time::now();
     labeled_consensus_msg.header.frame_id = "world";
@@ -659,19 +681,19 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     auto& zeta_alpha = zeta_alphas[label];
     auto& zeta_a = zeta_as[label];
     auto& zeta_b = zeta_bs[label];
-    
+
     labeled_consensus_msg.alpha.resize(zeta_alpha.size());
     for (int i = 0; i < zeta_alpha.size(); ++i) {
       labeled_consensus_msg.alpha[i] = zeta_alpha(i);  // ✅ 发布ζ
     }
-    
+
     labeled_consensus_msg.a.resize(zeta_a.size() * 9);
     for (int c = 0; c < zeta_a.size(); ++c) {
       for (int i = 0; i < 9; ++i) {
         labeled_consensus_msg.a[c * 9 + i] = zeta_a[c](i);
       }
     }
-    
+
     labeled_consensus_msg.b.resize(zeta_b.size() * 9 * 9);
     for (int c = 0; c < zeta_b.size(); ++c) {
       for (int i = 0; i < 9; ++i) {
@@ -680,9 +702,96 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
         }
       }
     }
-    
+
     labeled_consensus_pub_.publish(labeled_consensus_msg);
   }
+
+    // --- 步骤6.5：位置共识GMM拟合（不分标签，用于规划节点）---
+    // 从所有搜索粒子中提取位置，进行共识GMM拟合
+    const auto& search_particles = search_particles_manager_->getSearchParticles();
+    int num_components = search_particles_manager_->getNumComponents();
+
+    // 计算所有粒子位置的加权均值和协方差
+    Eigen::Vector3d pos_mean = Eigen::Vector3d::Zero();
+    double total_weight = 0.0;
+    for (const auto& p : search_particles) {
+      pos_mean += p.weight * p.state.head(3);
+      total_weight += p.weight;
+    }
+    if (total_weight > 1e-300) pos_mean /= total_weight;
+
+    // 计算位置协方差
+    Eigen::Matrix3d pos_cov = Eigen::Matrix3d::Zero();
+    for (const auto& p : search_particles) {
+      Eigen::Vector3d diff = p.state.head(3) - pos_mean;
+      pos_cov += p.weight * diff * diff.transpose();
+    }
+    if (total_weight > 1e-300) pos_cov /= total_weight;
+    pos_cov += Eigen::Matrix3d::Identity() * 1e-4;  // 保证正定
+
+    // 初始化位置GMM中心，围绕均值分散
+    std::vector<Eigen::Vector3d> pos_gmm_mu(num_components);
+    std::vector<Eigen::Matrix3d> pos_gmm_S(num_components);
+    Eigen::VectorXd pos_gmm_pi = Eigen::VectorXd::Constant(num_components, 1.0 / num_components);
+
+    std::normal_distribution<double> dist(0.0, 0.3);
+    for (int c = 0; c < num_components; ++c) {
+      pos_gmm_mu[c] = pos_mean;
+      for (int j = 0; j < 3; ++j) {
+        pos_gmm_mu[c](j) += dist(rng_);
+      }
+      pos_gmm_S[c] = pos_cov;
+    }
+
+    ROS_DEBUG_THROTTLE(1.0, "[dpf%d] Search mode position GMM: mean=(%.2f,%.2f,%.2f), det(S)=%.2e",
+                       drone_id_, pos_mean.x(), pos_mean.y(), pos_mean.z(), pos_cov.determinant());
+
+    // --- 步骤6.5.1：GMM中心帧间匹配 ---
+    matchGMMCenters(pos_gmm_mu, pos_gmm_pi);
+
+    // --- 步骤6.5.2：发布位置GMM给规划节点 ---
+    // 创建自定义消息或使用现有消息格式发布位置GMM
+    // 这里使用 LocalStats 消息的变体，只包含位置信息（3维）
+    target_ekf::LocalStats pos_gmm_msg;
+    pos_gmm_msg.header.stamp = ros::Time::now();
+    pos_gmm_msg.header.frame_id = "world";
+    pos_gmm_msg.drone_id = drone_id_;
+    pos_gmm_msg.num_components = num_components;
+    pos_gmm_msg.state_dim = 3;  // 只有位置，3维
+    pos_gmm_msg.has_observation = false;
+
+    // 打包GMM中心ID（用alpha存储）
+    pos_gmm_msg.alpha_local.resize(num_components);
+    for (int c = 0; c < num_components; ++c) {
+      pos_gmm_msg.alpha_local[c] = gmm_center_ids_[c];  // 存储持久ID
+    }
+
+    // 打包GMM中心位置（用a存储）
+    pos_gmm_msg.a_local.resize(num_components * 3);
+    for (int c = 0; c < num_components; ++c) {
+      for (int i = 0; i < 3; ++i) {
+        pos_gmm_msg.a_local[c * 3 + i] = pos_gmm_mu[c](i);
+      }
+    }
+
+    // 打包GMM权重（用zeta_alpha存储）
+    pos_gmm_msg.zeta_alpha.resize(num_components);
+    for (int c = 0; c < num_components; ++c) {
+      pos_gmm_msg.zeta_alpha[c] = pos_gmm_pi(c);
+    }
+
+    // 打包GMM协方差（用b存储3x3矩阵）
+    pos_gmm_msg.b_local.resize(num_components * 3 * 3);
+    for (int c = 0; c < num_components; ++c) {
+      for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+          pos_gmm_msg.b_local[c * 3 * 3 + i * 3 + j] = pos_gmm_S[c](i, j);
+        }
+      }
+    }
+
+    search_pos_gmm_pub_.publish(pos_gmm_msg);
+    ROS_DEBUG_THROTTLE(1.0, "[dpf%d] Published position GMM: %d components", drone_id_, num_components);
 
     // --- 步骤7：发布搜索状态---
     std_msgs::Bool search_state_msg;
@@ -831,6 +940,164 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
   last_update_stamp_ = ros::Time::now();
 }
 
+// === GMM中心帧间匹配（匈牙利贪心算法）===
+void matchGMMCenters(const std::vector<Eigen::Vector3d>& current_mu,
+                     const Eigen::VectorXd& current_pi,
+                     double distance_threshold) {
+  int num_components = current_mu.size();
+  std::vector<int> matched_ids(num_components, -1);
+
+  if (!prev_pos_gmm_mu_.empty() && prev_pos_gmm_mu_.size() == gmm_center_ids_.size()) {
+    // 构建代价矩阵：距离
+    Eigen::MatrixXd cost_matrix(num_components, num_components);
+    for (int i = 0; i < num_components; ++i) {
+      for (int j = 0; j < (int)prev_pos_gmm_mu_.size(); ++j) {
+        cost_matrix(i, j) = (current_mu[i] - prev_pos_gmm_mu_[j]).norm();
+      }
+    }
+
+    // 贪心匹配：按当前权重从高到低，匹配距离最近的上一帧簇
+    std::vector<int> sorted_indices(num_components);
+    std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
+    std::sort(sorted_indices.begin(), sorted_indices.end(),
+              [&](int a, int b) { return current_pi(a) > current_pi(b); });
+
+    std::vector<bool> prev_matched(prev_pos_gmm_mu_.size(), false);
+
+    for (int i : sorted_indices) {
+      int best_j = -1;
+      double best_dist = distance_threshold;
+      for (int j = 0; j < (int)prev_pos_gmm_mu_.size(); ++j) {
+        if (!prev_matched[j] && cost_matrix(i, j) < best_dist) {
+          best_j = j;
+          best_dist = cost_matrix(i, j);
+        }
+      }
+      if (best_j >= 0) {
+        matched_ids[i] = gmm_center_ids_[best_j];
+        prev_matched[best_j] = true;
+      } else {
+        matched_ids[i] = next_gmm_id_++;  // 新簇
+      }
+    }
+  } else {
+    // 第一帧或簇数变化，分配新ID
+    for (int i = 0; i < num_components; ++i) {
+      matched_ids[i] = next_gmm_id_++;
+    }
+  }
+
+  gmm_center_ids_ = matched_ids;
+  prev_pos_gmm_mu_ = current_mu;
+
+  ROS_DEBUG_THROTTLE(1.0, "[dpf%d] GMM center IDs: ", drone_id_);
+  for (int id : gmm_center_ids_) {
+    ROS_DEBUG_THROTTLE(1.0, "%d ", id);
+  }
+}
+
+// === 任务分配：根据簇数和无人机数量关系分配 ===
+// (GMMAssignment 已在文件开头定义)
+
+std::vector<GMMAssignment> assignGMMTasks(
+    const std::vector<Eigen::Vector3d>& drone_positions,
+    const std::vector<Eigen::Vector3d>& gmm_centers,
+    const std::vector<int>& gmm_ids,
+    const Eigen::VectorXd& gmm_pi) {
+
+  int num_drones = drone_positions.size();
+  int num_clusters = gmm_centers.size();
+  std::vector<GMMAssignment> assignments;
+
+  ROS_INFO("[dpf%d] Task assignment: %d drones, %d clusters", drone_id_, num_drones, num_clusters);
+
+  if (num_clusters > num_drones) {
+    // 簇数 > 无人机数：选择权重最高的 num_drones 个簇
+    std::vector<int> sorted_indices(num_clusters);
+    std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
+    std::sort(sorted_indices.begin(), sorted_indices.end(),
+              [&](int a, int b) { return gmm_pi(a) > gmm_pi(b); });
+
+    // 为每个无人机分配一个簇
+    for (int d = 0; d < num_drones; ++d) {
+      int cluster_idx = sorted_indices[d];
+      double dist = (drone_positions[d] - gmm_centers[cluster_idx]).norm();
+      assignments.push_back({d, gmm_ids[cluster_idx], dist});
+      ROS_INFO("  Drone %d -> Cluster %d (GMM_ID=%d, weight=%.3f, dist=%.2f)",
+               d, cluster_idx, gmm_ids[cluster_idx], gmm_pi(cluster_idx), dist);
+    }
+  } else if (num_clusters == num_drones) {
+    // 簇数 = 无人机数：一对一分配（最优匹配）
+    // 构建代价矩阵
+    Eigen::MatrixXd cost_matrix(num_drones, num_clusters);
+    for (int d = 0; d < num_drones; ++d) {
+      for (int c = 0; c < num_clusters; ++c) {
+        cost_matrix(d, c) = (drone_positions[d] - gmm_centers[c]).norm();
+      }
+    }
+
+    // 贪心匹配
+    std::vector<bool> cluster_assigned(num_clusters, false);
+    for (int d = 0; d < num_drones; ++d) {
+      int best_c = -1;
+      double best_dist = 1e9;
+      for (int c = 0; c < num_clusters; ++c) {
+        if (!cluster_assigned[c] && cost_matrix(d, c) < best_dist) {
+          best_c = c;
+          best_dist = cost_matrix(d, c);
+        }
+      }
+      if (best_c >= 0) {
+        cluster_assigned[best_c] = true;
+        assignments.push_back({d, gmm_ids[best_c], best_dist});
+        ROS_INFO("  Drone %d -> Cluster %d (GMM_ID=%d, weight=%.3f, dist=%.2f)",
+                 d, best_c, gmm_ids[best_c], gmm_pi(best_c), best_dist);
+      }
+    }
+  } else {
+    // 簇数 < 无人机数：先保证每个簇有一个无人机，剩余无人机分配到权重最高的簇
+    // 第一步：为每个簇分配最近的无人机
+    std::vector<bool> drone_assigned(num_drones, false);
+    for (int c = 0; c < num_clusters; ++c) {
+      int best_d = -1;
+      double best_dist = 1e9;
+      for (int d = 0; d < num_drones; ++d) {
+        if (!drone_assigned[d]) {
+          double dist = (drone_positions[d] - gmm_centers[c]).norm();
+          if (dist < best_dist) {
+            best_d = d;
+            best_dist = dist;
+          }
+        }
+      }
+      if (best_d >= 0) {
+        drone_assigned[best_d] = true;
+        assignments.push_back({best_d, gmm_ids[c], best_dist});
+        ROS_INFO("  Drone %d -> Cluster %d (GMM_ID=%d, weight=%.3f, dist=%.2f)",
+                 best_d, c, gmm_ids[c], gmm_pi(c), best_dist);
+      }
+    }
+
+    // 第二步：剩余无人机分配到权重最高的簇
+    int max_weight_cluster = 0;
+    for (int c = 1; c < num_clusters; ++c) {
+      if (gmm_pi(c) > gmm_pi(max_weight_cluster)) {
+        max_weight_cluster = c;
+      }
+    }
+    for (int d = 0; d < num_drones; ++d) {
+      if (!drone_assigned[d]) {
+        double dist = (drone_positions[d] - gmm_centers[max_weight_cluster]).norm();
+        assignments.push_back({d, gmm_ids[max_weight_cluster], dist});
+        ROS_INFO("  Drone %d -> Cluster %d (GMM_ID=%d, weight=%.3f, dist=%.2f) [extra]",
+                 d, max_weight_cluster, gmm_ids[max_weight_cluster], gmm_pi(max_weight_cluster), dist);
+      }
+    }
+  }
+
+  return assignments;
+}
+
 int main(int argc, char** argv) {
   ros::init(argc, argv, "target_dpf");
   ros::NodeHandle nh("~");
@@ -880,6 +1147,7 @@ int main(int argc, char** argv) {
   labeled_consensus_pub_ = nh.advertise<target_ekf::LabeledConsensusState>("labeled_consensus", 1);
   search_state_pub_ = nh.advertise<std_msgs::Bool>("search_state", 1);
   search_gmm_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>("search_gmm_vis", 1);
+  search_pos_gmm_pub_ = nh.advertise<target_ekf::LocalStats>("search_pos_gmm", 1);
   search_gmm_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>("search_gmm_vis", 1);
   search_particles_vis_pub_ = nh.advertise<sensor_msgs::PointCloud2>("search_particles_vis", 1);
   

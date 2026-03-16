@@ -143,7 +143,7 @@
     </node>
     <include file="$(find planning)/launch/planning.launch">
       <arg name="rhosVisibility_"  value="10000.0"/>
-      <arg name="rhoTracking_"     value="1000.0"/>
+      <arg name="rhoTracking_"     value="1.0"/>
       <arg name="target_name_"     value="/drone0/target_ekf_odom"/>
       <arg name="drone_id"         value="0"/>
       <arg name="formation_type_"  value="triangle"/>

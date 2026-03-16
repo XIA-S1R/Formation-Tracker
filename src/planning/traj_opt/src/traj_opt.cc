@@ -359,6 +359,33 @@ int TrajOpt::optimize(const double& delta) {
             << "ret: " << ret << "\033[0m" << std::endl;
   t_ = t;
   p_ = p;
+
+  // Print final cost breakdown after optimization
+  if (ret >= 0) {
+    Eigen::VectorXd T(N_);
+    Eigen::MatrixXd P(3, N_ - 1);
+    double sumT = sum_T_ + x_[dim_p_ + dim_t_] * x_[dim_p_ + dim_t_];
+    forwardT(t_, sumT, T);
+    forwardP(p_, cfgVs_, P);
+    jerkOpt_.generate(P, T);
+    double final_cost = jerkOpt_.getTrajJerkCost();
+    jerkOpt_.calGrads_CT();
+    debug_cost_corridor_ = 0;
+    debug_cost_vel_ = 0;
+    debug_cost_acc_ = 0;
+    debug_cost_collision_ = 0;
+    debug_cost_formation_ = 0;
+    debug_cost_tracking_ = 0;
+    debug_cost_vis_ = 0;
+    addTimeIntPenalty(final_cost);
+    addTimeCost(final_cost);
+    printf("\033[33m[drone %d FINAL] corridor=%.1f  vel=%.1f  acc=%.1f  "
+           "collision=%.1f  formation=%.1f  tracking=%.1f  vis=%.1f  total=%.1f\033[0m\n",
+           drone_id_,
+           debug_cost_corridor_, debug_cost_vel_, debug_cost_acc_,
+           debug_cost_collision_, debug_cost_formation_,
+           debug_cost_tracking_, debug_cost_vis_, final_cost);
+  }
   return ret;
 }
 

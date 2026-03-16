@@ -59,6 +59,7 @@ class Nodelet : public nodelet::Nodelet {
   quadrotor_msgs::OccMap3d occmap_msg_;
 
   double tracking_dur_, tracking_dist_, tolerance_d_;
+  double vmax_, amax_;
 
   Trajectory traj_poly_;
   ros::Time replan_stamp_;
@@ -543,13 +544,13 @@ class Nodelet : public nodelet::Nodelet {
       traj_poly_ = traj;
       replan_stamp_ = replan_stamp;
     } else if (force_hover_) {
-      ROS_ERROR("[planner] REPLAN FAILED, HOVERING...");
+      ROS_ERROR("[drone %d planner] REPLAN FAILED, HOVERING...", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 1;
       replanState_pub_.publish(replanStateMsg_);
       return;
     } else if (!validcheck(traj_poly_, replan_stamp_)) {
       force_hover_ = true;
-      ROS_FATAL("[planner] EMERGENCY STOP!!!");
+      ROS_FATAL("[drone %d planner] EMERGENCY STOP!!!", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 2;
       replanState_pub_.publish(replanStateMsg_);
       pub_hover_p(iniState.col(0), replan_stamp);
@@ -563,14 +564,14 @@ class Nodelet : public nodelet::Nodelet {
       // Verify old trajectory with latest map
       if (!validcheck(traj_poly_, replan_stamp_)) {
         force_hover_ = true;
-        ROS_FATAL("[planner] EMERGENCY STOP - OLD TRAJ INVALID WITH LATEST MAP!!!");
+        ROS_FATAL("[drone %d planner] EMERGENCY STOP - OLD TRAJ INVALID WITH LATEST MAP!!!", trajOptPtr_->drone_id_);
         replanStateMsg_.state = 2;
         replanState_pub_.publish(replanStateMsg_);
         pub_hover_p(iniState.col(0), replan_stamp);
         return;
       }
 
-      ROS_ERROR("[planner] REPLAN FAILED, EXECUTE LAST TRAJ...");
+      ROS_ERROR("[drone %d planner] REPLAN FAILED, EXECUTE LAST TRAJ...", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 3;
       replanState_pub_.publish(replanStateMsg_);
       return;  // current generated traj invalid but last is valid
@@ -914,6 +915,8 @@ class Nodelet : public nodelet::Nodelet {
     nh.getParam("tolerance_d", tolerance_d_);
     nh.getParam("debug", debug_);
     nh.getParam("fake", fake_);
+    nh.getParam("vmax", vmax_);
+    nh.getParam("amax", amax_);
 
     gridmapPtr_ = std::make_shared<mapping::OccGridMap>();
     envPtr_ = std::make_shared<env::Env>(nh, gridmapPtr_);
