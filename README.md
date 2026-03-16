@@ -26,7 +26,7 @@
 2. **启动仿真**
    运行以下命令启动仿真：
    ```bash
-   roslaunch simulation tracking_sim.launch
+   roslaunch simulation tracking_sim_triangle.launch
    ```
 
 3. **启动 RViz**
