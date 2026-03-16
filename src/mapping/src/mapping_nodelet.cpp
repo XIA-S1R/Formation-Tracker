@@ -65,10 +65,20 @@ class Nodelet : public nodelet::Nodelet {
   // lidar mode: just cache the raw point cloud
   void lidar_map_callback(const sensor_msgs::PointCloud2ConstPtr& msgPtr) {
     if (global_map_received_) return;
-    pcl::fromROSMsg(*msgPtr, global_cloud_);
+    pcl::PointCloud<pcl::PointXYZ> cloud;
+    pcl::fromROSMsg(*msgPtr, cloud);
+    
+    // 只保留感知范围附近的点（±60m）
+    for (const auto& pt : cloud) {
+      if (std::abs(pt.x) < 60 && std::abs(pt.y) < 60 && std::abs(pt.z) < 30) {
+        global_cloud_.push_back(pt);
+      }
+    }
+    
     global_map_received_ = true;
-    ROS_INFO("[mapping] global map received, %zu points", global_cloud_.size());
+    ROS_INFO("[mapping] filtered cloud: %zu / %zu points", global_cloud_.size(), cloud.size());
   }
+  
 
   void global_map_timer_callback(const ros::TimerEvent&) {
     if (!global_map_received_) return;
@@ -90,19 +100,35 @@ class Nodelet : public nodelet::Nodelet {
   }
 
   void sense_timer_callback(const ros::TimerEvent&) {
-    if (!global_map_received_ || !odom_received_) return;
+    ROS_DEBUG_THROTTLE(1, "[mapping] sense_timer fired: map=%d odom=%d", global_map_received_, odom_received_);
+    if (!global_map_received_ || !odom_received_) {
+      ROS_WARN_THROTTLE(5, "[mapping] waiting: map=%d odom=%d", global_map_received_, odom_received_);
+      return;
+    }
 
     while (odom_lock_.test_and_set());
     Eigen::Vector3d sensor_p = cur_pos_;
     odom_lock_.clear();
 
-    double range2 = sensor_range_ * sensor_range_;
+    ROS_INFO_THROTTLE(1, "[mapping] global_cloud size: %zu, sensor_p: (%.2f, %.2f, %.2f)", global_cloud_.size(), sensor_p.x(), sensor_p.y(), sensor_p.z());
+
     std::vector<Eigen::Vector3d> obs_pts;
     for (const auto& pt : global_cloud_) {
       Eigen::Vector3d p(pt.x, pt.y, pt.z);
-      if ((p - sensor_p).squaredNorm() <= range2)
-        obs_pts.push_back(p);
+      Eigen::Vector3d delta = p - sensor_p;
+
+      // horizontal distance (xy plane)
+      double xy_dist = std::sqrt(delta.x() * delta.x() + delta.y() * delta.y());
+      if (xy_dist > sensor_range_) continue;
+
+      // vertical angle: -30° to 30°
+      double z_angle_rad = std::atan2(delta.z(), xy_dist);
+      if (z_angle_rad < -M_PI / 6.0 || z_angle_rad > M_PI / 6.0) continue;
+
+      obs_pts.push_back(p);
     }
+
+    ROS_INFO_THROTTLE(1, "[mapping] obs_pts: %zu", obs_pts.size());
 
     gridmap_.updateMap(sensor_p, obs_pts);
 
@@ -120,6 +146,7 @@ class Nodelet : public nodelet::Nodelet {
     gridmap_msg.header.stamp = ros::Time::now();
     gridmap_.to_msg(gridmap_msg);
     gridmap_inflate_pub_.publish(gridmap_msg);
+    ROS_DEBUG("[mapping] published gridmap");
   }
 
   void target_odom_callback(const nav_msgs::OdometryConstPtr& msgPtr) {

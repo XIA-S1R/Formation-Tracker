@@ -528,21 +528,26 @@ class Nodelet : public nodelet::Nodelet {
       if (land_triger_received_) {
         yaw = 2 * std::atan2(target_q.z(), target_q.w());
       }
-      pub_traj(traj, yaw, replan_stamp);// 偏航角设置为朝向目标的方向（后续可更改逻辑）
+      pub_traj(traj, yaw, replan_stamp);
       traj_poly_ = traj;
       replan_stamp_ = replan_stamp;
-    } else if (validcheck(traj_poly_, replan_stamp_)) {
-      ROS_ERROR("[drone %d planner] REPLAN FAILED, EXECUTE LAST TRAJ...", trajOptPtr_->drone_id_);
-      replanStateMsg_.state = 3;
+    } else if (force_hover_) {
+      ROS_ERROR("[planner] REPLAN FAILED, HOVERING...");
+      replanStateMsg_.state = 1;
       replanState_pub_.publish(replanStateMsg_);
-      return;  // current generated traj invalid but last is valid
-    } else {
+      return;
+    } else if (!validcheck(traj_poly_, replan_stamp_)) {
       force_hover_ = true;
-      ROS_FATAL("[drone %d planner] EMERGENCY STOP!!!", trajOptPtr_->drone_id_);
+      ROS_FATAL("[planner] EMERGENCY STOP!!!");
       replanStateMsg_.state = 2;
       replanState_pub_.publish(replanStateMsg_);
       pub_hover_p(iniState.col(0), replan_stamp);
       return;
+    } else {
+      ROS_ERROR("[planner] REPLAN FAILED, EXECUTE LAST TRAJ...");
+      replanStateMsg_.state = 3;
+      replanState_pub_.publish(replanStateMsg_);
+      return;  // current generated traj invalid but last is valid
     }
     visPtr_->visualize_traj(traj, "traj");
   }

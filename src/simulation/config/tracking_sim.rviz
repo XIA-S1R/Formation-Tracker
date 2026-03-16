@@ -8,9 +8,8 @@ Panels:
         - /target1
         - /drone01
         - /drone01/mapping1
-        - /drone01/planning1
         - /drone11
-        - /drone11/local_inflate_map1
+        - /drone21
       Splitter Ratio: 0.46234309673309326
     Tree Height: 338
   - Class: rviz/Selection
@@ -214,8 +213,8 @@ Visualization Manager:
             - Alpha: 1
               Autocompute Intensity Bounds: true
               Autocompute Value Bounds:
-                Max Value: 8.175000190734863
-                Min Value: 3.825000047683716
+                Max Value: -9999
+                Min Value: 9999
                 Value: true
               Axis: Z
               Channel Name: intensity
@@ -447,14 +446,14 @@ Visualization Manager:
         - Alpha: 1
           Autocompute Intensity Bounds: true
           Autocompute Value Bounds:
-            Max Value: 10
-            Min Value: -10
+            Max Value: -0.5250000357627869
+            Min Value: -0.8250000476837158
             Value: true
           Axis: Z
           Channel Name: intensity
           Class: rviz/PointCloud2
           Color: 255; 255; 255
-          Color Transformer: Intensity
+          Color Transformer: AxisColor
           Decay Time: 0
           Enabled: true
           Invert Rainbow: false
@@ -465,7 +464,7 @@ Visualization Manager:
           Queue Size: 10
           Selectable: true
           Size (Pixels): 3
-          Size (m): 0.009999999776482582
+          Size (m): 0.20000000298023224
           Style: Flat Squares
           Topic: /drone1/mapping_vis/vs_gridmap_inflate
           Unreliable: false
@@ -524,14 +523,14 @@ Visualization Manager:
         - Alpha: 1
           Autocompute Intensity Bounds: true
           Autocompute Value Bounds:
-            Max Value: 10
-            Min Value: -10
+            Max Value: -9999
+            Min Value: 9999
             Value: true
           Axis: Z
           Channel Name: intensity
           Class: rviz/PointCloud2
           Color: 255; 255; 255
-          Color Transformer: Intensity
+          Color Transformer: AxisColor
           Decay Time: 0
           Enabled: true
           Invert Rainbow: false
@@ -542,7 +541,7 @@ Visualization Manager:
           Queue Size: 10
           Selectable: true
           Size (Pixels): 3
-          Size (m): 0.009999999776482582
+          Size (m): 0.20000000298023224
           Style: Flat Squares
           Topic: /drone2/mapping_vis/vs_gridmap_inflate
           Unreliable: false
@@ -901,7 +900,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/XYOrbit
-      Distance: 21.6982421875
+      Distance: 31.147037506103516
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -909,17 +908,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 12.523968696594238
-        Y: 5.068416118621826
-        Z: 1.4999980926513672
+        X: -22.093820571899414
+        Y: 1.1533231735229492
+        Z: 1.4999994039535522
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.0347959995269775
+      Pitch: 0.7147961854934692
       Target Frame: world
-      Yaw: 2.1850063800811768
+      Yaw: 2.340007781982422
     Saved: ~
 Window Geometry:
   Displays:
