@@ -15,6 +15,8 @@
   <depend>mapping</depend>
   <depend>traj_opt</depend>
   <depend>decomp_ros_utils</depend>
+  <depend>target_ekf</depend>
+  <depend>geometry_msgs</depend>
 
   <export>
     <nodelet plugin="${prefix}/nodelet_plugin.xml"/>

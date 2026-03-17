@@ -1,6 +1,7 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <mapping/mapping.h>
 #include <nav_msgs/Odometry.h>
+#include <geometry_msgs/PoseArray.h>
 #include <nodelet/nodelet.h>
 #include <quadrotor_msgs/OccMap3d.h>
 #include <quadrotor_msgs/PolyTraj.h>
@@ -10,9 +11,11 @@
 #include <std_msgs/Empty.h>
 #include <std_msgs/Bool.h>
 #include <traj_opt/traj_opt.h>
+#include <target_ekf/SearchLabelInfo.h>
 
 #include <Eigen/Core>
 #include <atomic>
+#include <algorithm>
 #include <env/env.hpp>
 #include <prediction/prediction.hpp>
 #include <thread>
@@ -34,6 +37,8 @@ class Nodelet : public nodelet::Nodelet {
   ros::Publisher traj_pub_, heartbeat_pub_, replanState_pub_;
   ros::Publisher broadcast_traj_pub_;
   ros::Subscriber search_state_sub_;
+  ros::Subscriber search_targets_sub_;  // 搜索目标点订阅器
+  std::vector<ros::Subscriber> search_label_info_subs_;  // 各掌管者的标签信息订阅器
 
   std::shared_ptr<mapping::OccGridMap> gridmapPtr_;
   std::shared_ptr<env::Env> envPtr_;
@@ -45,6 +50,14 @@ class Nodelet : public nodelet::Nodelet {
   bool search_mode_active_ = false;
   std::atomic_flag search_state_lock_ = ATOMIC_FLAG_INIT;
   std_msgs::Bool latest_search_state_;
+  geometry_msgs::PoseArray search_targets_;  // 三个搜索目标点
+  std::atomic_flag search_targets_lock_ = ATOMIC_FLAG_INIT;
+
+  // 搜索标签信息（从各掌管者接收）
+  std::map<int, target_ekf::SearchLabelInfo> search_label_infos_;  // label -> info
+  std::atomic_flag search_label_info_lock_ = ATOMIC_FLAG_INIT;
+  Eigen::Vector3d search_target_with_offset_;  // 本机的搜索目标点（含偏置）
+  double search_desired_yaw_ = 0.0;            // 搜索模式期望偏航角
 
   // NOTE planning or fake target
   bool fake_ = false;
@@ -235,6 +248,74 @@ class Nodelet : public nodelet::Nodelet {
     search_state_lock_.clear();
   }
 
+  void search_targets_callback(const geometry_msgs::PoseArray::ConstPtr& msgPtr) {
+    while (search_targets_lock_.test_and_set())
+      ;
+    search_targets_ = *msgPtr;
+    search_targets_lock_.clear();
+  }
+
+  // 搜索标签信息回调：接收掌管者发布的粒子群均值和分配信息
+  void search_label_info_callback(const target_ekf::SearchLabelInfo::ConstPtr& msgPtr) {
+    while (search_label_info_lock_.test_and_set())
+      ;
+    search_label_infos_[msgPtr->label] = *msgPtr;
+    search_label_info_lock_.clear();
+
+    // 检查本机是否在该标签的分配列表中
+    int my_drone_id = trajOptPtr_->drone_id_;
+    const auto& assigned_ids = msgPtr->assigned_drone_ids;
+    auto it = std::find(assigned_ids.begin(), assigned_ids.end(), my_drone_id);
+    if (it == assigned_ids.end()) {
+      return;  // 本机不在该标签内
+    }
+
+    // 计算本机在标签内的索引和偏置
+    int my_index = std::distance(assigned_ids.begin(), it);
+    int num_drones_in_label = assigned_ids.size();
+
+    Eigen::Vector3d mean_pos(msgPtr->mean_pos.x, msgPtr->mean_pos.y, msgPtr->mean_pos.z);
+    Eigen::Vector3d mean_vel(msgPtr->mean_vel.x, msgPtr->mean_vel.y, msgPtr->mean_vel.z);
+
+    // 计算速度方向（用于偏置和偏航角）
+    Eigen::Vector2d vel_dir(mean_vel.x(), mean_vel.y());
+    double vel_norm = vel_dir.norm();
+    if (vel_norm < 0.1) {
+      vel_dir = Eigen::Vector2d(1.0, 0.0);  // 默认朝x正方向
+    } else {
+      vel_dir.normalize();
+    }
+
+    // 垂直于速度方向的单位向量（用于横向偏置）
+    Eigen::Vector2d perp_dir(-vel_dir.y(), vel_dir.x());
+
+    // 计算偏置：多无人机时沿垂直方向展开，增加搜索覆盖面
+    double offset_spacing = 3.0;  // 无人机间距（米）
+    double lateral_offset = 0.0;
+    if (num_drones_in_label > 1) {
+      // 居中分布：-1, 0, 1 或 -1.5, -0.5, 0.5, 1.5 等
+      lateral_offset = (my_index - (num_drones_in_label - 1) / 2.0) * offset_spacing;
+    }
+
+    // 应用偏置
+    search_target_with_offset_ = mean_pos;
+    search_target_with_offset_.x() += lateral_offset * perp_dir.x();
+    search_target_with_offset_.y() += lateral_offset * perp_dir.y();
+
+    // 计算期望偏航角：朝向粒子群均值方向，但各无人机略微分散
+    double base_yaw = std::atan2(vel_dir.y(), vel_dir.x());
+    double yaw_spread = M_PI / 6.0;  // 30度扇形展开
+    double yaw_offset = 0.0;
+    if (num_drones_in_label > 1) {
+      yaw_offset = (my_index - (num_drones_in_label - 1) / 2.0) * yaw_spread / (num_drones_in_label - 1);
+    }
+    search_desired_yaw_ = base_yaw + yaw_offset;
+
+    ROS_DEBUG_THROTTLE(1.0, "[planner drone%d] Search label %d: offset=(%.2f,%.2f), yaw=%.2f",
+                       my_drone_id, msgPtr->label, lateral_offset * perp_dir.x(),
+                       lateral_offset * perp_dir.y(), search_desired_yaw_ * 180.0 / M_PI);
+  }
+
   // NOTE main callback
   void plan_timer_callback(const ros::TimerEvent& event) {
     heartbeat_pub_.publish(std_msgs::Empty());
@@ -324,17 +405,16 @@ class Nodelet : public nodelet::Nodelet {
       wait_hover_ = false;
     } else {//追踪逻辑
       if (search_mode_active_) {
-        // 搜索模式：执行预设的搜索轨迹或分散搜索
-        // 这里可以实现具体的搜索算法，比如螺旋搜索、网格搜索等
-        // 临时使用一个固定的搜索点，实际应用中应该实现动态搜索算法
-        ROS_WARN_THROTTLE(1.0, "[planner] IN SEARCH MODE: Executing search pattern");
-        
-        // 示例：简单的分散搜索 - 每架无人机前往预设的搜索区域
-        // 这里可以根据无人机ID分配不同的搜索区域
-        double search_offset_x = (trajOptPtr_->drone_id_ % 3 - 1) * 3.0; // -3, 0, 3
-        double search_offset_y = ((trajOptPtr_->drone_id_ / 3) % 3 - 1) * 3.0; // -3, 0, 3
-        target_p = odom_p + Eigen::Vector3d(search_offset_x, search_offset_y, 0.0);
-        target_p.z() = std::max(2.0, odom_p.z()); // 保持安全高度
+        // 搜索模式：使用从掌管者接收的带偏置目标点
+        // search_target_with_offset_ 在 search_label_info_callback 中更新
+        if (search_target_with_offset_.norm() > 0.1) {
+          target_p = search_target_with_offset_;
+        }
+        target_p.z() = std::max(2.0, odom_p.z());  // 保持安全高度
+
+        ROS_INFO_THROTTLE(1.0, "[planner drone%d] SEARCH MODE: target=(%.2f,%.2f,%.2f), yaw=%.1f deg",
+                          trajOptPtr_->drone_id_, target_p.x(), target_p.y(), target_p.z(),
+                          search_desired_yaw_ * 180.0 / M_PI);
       } else {
         target_p.z() += 1.0;// 追踪目标定在目标上方1m处
 
@@ -348,7 +428,14 @@ class Nodelet : public nodelet::Nodelet {
       // NOTE determin whether to replan
       Eigen::Vector3d dp = target_p - odom_p;
       // std::cout << "dist : " << dp.norm() << std::endl;
-      double desired_yaw = std::atan2(dp.y(), dp.x());// 期望偏航角设置为朝向目标的方向
+      double desired_yaw;
+      if (search_mode_active_) {
+        // 搜索模式：使用分配的期望偏航角（增加搜索覆盖面）
+        desired_yaw = search_desired_yaw_;
+      } else {
+        // 追踪模式：朝向目标方向
+        desired_yaw = std::atan2(dp.y(), dp.x());
+      }
       Eigen::Vector3d project_yaw = odom_q.toRotationMatrix().col(0);  // NOTE ZYX
       double now_yaw = std::atan2(project_yaw.y(), project_yaw.x());
       if (std::fabs((target_p - odom_p).norm() - tracking_dist_) < tolerance_d_ &&
@@ -946,6 +1033,15 @@ class Nodelet : public nodelet::Nodelet {
     odom_sub_ = nh.subscribe<nav_msgs::Odometry>("odom", 10, &Nodelet::odom_callback, this, ros::TransportHints().tcpNoDelay());
     target_sub_ = nh.subscribe<nav_msgs::Odometry>("target", 10, &Nodelet::target_callback, this, ros::TransportHints().tcpNoDelay());
     search_state_sub_ = nh.subscribe<std_msgs::Bool>("search_state", 10, &Nodelet::search_state_callback, this, ros::TransportHints().tcpNoDelay());
+    search_targets_sub_ = nh.subscribe<geometry_msgs::PoseArray>("search_targets", 10, &Nodelet::search_targets_callback, this, ros::TransportHints().tcpNoDelay());
+
+    // 订阅各掌管者的搜索标签信息（drone0-2 可能是掌管者）
+    for (int i = 0; i < 3; ++i) {
+      std::string topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/search_label_info";
+      search_label_info_subs_.push_back(
+          nh.subscribe<target_ekf::SearchLabelInfo>(topic, 10, &Nodelet::search_label_info_callback, this, ros::TransportHints().tcpNoDelay()));
+    }
+
     triger_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("triger", 10, &Nodelet::triger_callback, this, ros::TransportHints().tcpNoDelay());
     land_triger_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("land_triger", 10, &Nodelet::land_triger_callback, this, ros::TransportHints().tcpNoDelay());
     broadcast_traj_sub_ = nh.subscribe<quadrotor_msgs::PolyTraj>("/planning/broadcast_traj_recv", 100,

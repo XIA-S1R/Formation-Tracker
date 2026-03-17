@@ -26,11 +26,13 @@ add_message_files(
   FILES
   LocalStats.msg
   LabeledConsensusState.msg
+  SearchLabelInfo.msg
 )
 
 generate_messages(
   DEPENDENCIES
   std_msgs
+  geometry_msgs
 )
 
 catkin_package(

@@ -4,6 +4,7 @@
 #include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/time_synchronizer.h>
 #include <nav_msgs/Odometry.h>
+#include <geometry_msgs/PoseArray.h>
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <visualization_msgs/MarkerArray.h>
@@ -17,6 +18,7 @@
 #include <target_ekf/target_dpf.hpp>
 #include <target_ekf/LocalStats.h>
 #include <target_ekf/LabeledConsensusState.h>
+#include <target_ekf/SearchLabelInfo.h>
 #include <std_msgs/Bool.h>
 #include <unordered_set>
 #include <algorithm>
@@ -47,6 +49,8 @@ ros::Publisher search_state_pub_;
 ros::Publisher search_particles_vis_pub_;
 ros::Publisher search_gmm_vis_pub_; // 搜索GMM分布可视化发布器
 ros::Publisher search_pos_gmm_pub_;  // 位置GMM发布器
+ros::Publisher search_targets_pub_;  // 搜索目标点发布器
+ros::Publisher search_label_info_pub_;  // 搜索标签信息发布器
 std::vector<ros::Subscriber> stats_subs_;
 
 // 相机外参
@@ -83,6 +87,16 @@ int miss_detection_num_ = 10; // 连续多少帧都没有观测后进入搜索�
 int consecutive_no_obs_count_ = 0; // 连续无观测计数
 bool search_mode_active_ = false; // 是否处于搜索模式
 ros::Time last_global_obs_time_;
+
+// 邻居无人机位置（用于匈牙利分配）
+std::map<int, Eigen::Vector3d> neighbor_positions_;
+std::mutex neighbor_odom_mutex_;
+std::vector<ros::Subscriber> neighbor_odom_subs_;
+
+// 标签分配结果
+SearchIntent my_assigned_label_ = STRAIGHT;  // 本机分配到的标签
+bool is_label_master_ = false;               // 是否是该标签的掌管者
+std::map<SearchIntent, std::vector<int>> label_to_drones_;  // 每个标签分配到的无人机ID列表
 
 // 搜索粒子管理器
 std::unique_ptr<SearchParticlesManager> search_particles_manager_;
@@ -456,6 +470,154 @@ void labeled_consensus_callback(const target_ekf::LabeledConsensusState::ConstPt
   received_labeled_consensus_[msg->drone_id].push_back(nc);
 }
 
+// === 邻居无人机odom回调：存储邻居位置用于匈牙利分配 ===
+void neighbor_odom_callback(const nav_msgs::OdometryConstPtr& msg, int neighbor_id) {
+  std::lock_guard<std::mutex> lock(neighbor_odom_mutex_);
+  neighbor_positions_[neighbor_id] = Eigen::Vector3d(
+      msg->pose.pose.position.x,
+      msg->pose.pose.position.y,
+      msg->pose.pose.position.z);
+}
+
+// === 匈牙利算法分配标签 ===
+// 输入：各无人机位置，三个搜索目标点
+// 输出：每个无人机分配到的标签，以及谁是掌管者
+void hungarianAssignLabels(const std::vector<Eigen::Vector3d>& search_targets) {
+  // 收集所有无人机位置（包括自己）
+  std::vector<std::pair<int, Eigen::Vector3d>> drone_positions;
+
+  // 添加自己的位置
+  {
+    std::lock_guard<std::mutex> lock(odom_mutex_);
+    drone_positions.push_back({drone_id_, latest_odom_pos_});
+  }
+
+  // 添加邻居位置
+  {
+    std::lock_guard<std::mutex> lock(neighbor_odom_mutex_);
+    for (const auto& kv : neighbor_positions_) {
+      drone_positions.push_back({kv.first, kv.second});
+    }
+  }
+
+  // 按drone_id排序
+  std::sort(drone_positions.begin(), drone_positions.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  int n_drones = drone_positions.size();
+  int n_labels = 3;  // STRAIGHT, LEFT_TURN, RIGHT_TURN
+
+  ROS_INFO("[dpf%d] Hungarian assignment: %d drones, 3 labels", drone_id_, n_drones);
+
+  // 构建代价矩阵：drone到各搜索目标点的距离
+  Eigen::MatrixXd cost_matrix(n_drones, n_labels);
+  for (int d = 0; d < n_drones; ++d) {
+    for (int l = 0; l < n_labels; ++l) {
+      cost_matrix(d, l) = (drone_positions[d].second - search_targets[l]).norm();
+    }
+  }
+
+  // 贪心匈牙利分配（保证每个标签至少有一个无人机）
+  std::vector<int> assignments(n_drones, -1);  // drone -> label
+  std::vector<int> label_masters(n_labels, -1); // label -> master drone_id
+
+  if (n_drones <= n_labels) {
+    // 无人机数 <= 3：一对一分配
+    std::vector<bool> label_assigned(n_labels, false);
+
+    // 按距离排序所有(drone, label)对
+    std::vector<std::tuple<double, int, int>> dist_pairs;
+    for (int d = 0; d < n_drones; ++d) {
+      for (int l = 0; l < n_labels; ++l) {
+        dist_pairs.push_back({cost_matrix(d, l), d, l});
+      }
+    }
+    std::sort(dist_pairs.begin(), dist_pairs.end());
+
+    std::vector<bool> drone_assigned(n_drones, false);
+    for (const auto& [dist, d, l] : dist_pairs) {
+      if (!drone_assigned[d] && !label_assigned[l]) {
+        assignments[d] = l;
+        label_masters[l] = drone_positions[d].first;
+        drone_assigned[d] = true;
+        label_assigned[l] = true;
+      }
+    }
+  } else {
+    // 无人机数 > 3：先分配前3个掌管者，再分配剩余
+    std::vector<bool> label_assigned(n_labels, false);
+    std::vector<bool> drone_assigned(n_drones, false);
+
+    // 第一轮：为每个标签找最近的无人机作为掌管者
+    for (int l = 0; l < n_labels; ++l) {
+      int best_d = -1;
+      double best_dist = 1e9;
+      for (int d = 0; d < n_drones; ++d) {
+        if (!drone_assigned[d] && cost_matrix(d, l) < best_dist) {
+          best_d = d;
+          best_dist = cost_matrix(d, l);
+        }
+      }
+      if (best_d >= 0) {
+        assignments[best_d] = l;
+        label_masters[l] = drone_positions[best_d].first;
+        drone_assigned[best_d] = true;
+        label_assigned[l] = true;
+      }
+    }
+
+    // 第二轮：剩余无人机分配到最近的标签
+    for (int d = 0; d < n_drones; ++d) {
+      if (!drone_assigned[d]) {
+        int best_l = 0;
+        double best_dist = cost_matrix(d, 0);
+        for (int l = 1; l < n_labels; ++l) {
+          if (cost_matrix(d, l) < best_dist) {
+            best_l = l;
+            best_dist = cost_matrix(d, l);
+          }
+        }
+        assignments[d] = best_l;
+      }
+    }
+  }
+
+  // 找到本机的分配结果
+  for (int d = 0; d < n_drones; ++d) {
+    if (drone_positions[d].first == drone_id_) {
+      my_assigned_label_ = static_cast<SearchIntent>(assignments[d]);
+      is_label_master_ = (label_masters[assignments[d]] == drone_id_);
+      break;
+    }
+  }
+
+  const char* label_names[] = {"STRAIGHT", "LEFT_TURN", "RIGHT_TURN"};
+  ROS_WARN("[dpf%d] Assigned to label %s, is_master=%d",
+           drone_id_, label_names[my_assigned_label_], is_label_master_);
+
+  // 构建每个标签分配到的无人机列表
+  label_to_drones_.clear();
+  for (int l = 0; l < n_labels; ++l) {
+    label_to_drones_[static_cast<SearchIntent>(l)] = std::vector<int>();
+  }
+  for (int d = 0; d < n_drones; ++d) {
+    SearchIntent label = static_cast<SearchIntent>(assignments[d]);
+    label_to_drones_[label].push_back(drone_positions[d].first);
+  }
+  // 对每个标签内的无人机ID排序
+  for (auto& kv : label_to_drones_) {
+    std::sort(kv.second.begin(), kv.second.end());
+  }
+
+  // 打印完整分配结果
+  for (int d = 0; d < n_drones; ++d) {
+    ROS_INFO("  drone%d -> %s %s",
+             drone_positions[d].first,
+             label_names[assignments[d]],
+             (label_masters[assignments[d]] == drone_positions[d].first) ? "(master)" : "");
+  }
+}
+
 // === 【关键修复】无人机odom回调：仅保存最新位姿，不执行核心逻辑 ===
 void odom_callback(const nav_msgs::OdometryConstPtr& odom_msg) {
   std::lock_guard<std::mutex> lock(odom_mutex_);
@@ -613,11 +775,11 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       return;
     }
 
-    // --- 步骤1：状态预测（搜索粒子状态更新）---
-    search_particles_manager_->updateAllSearchParticles();
+    // --- 步骤1：状态预测（单标签粒子群更新，带意图切换衰减）---
+    search_particles_manager_->updateSingleLabelParticles();
 
-    // --- 步骤2：负观测权重更新（此处 has_obs 已确认为 false）---
-    search_particles_manager_->updateSearchParticlesWithNegativeObservation(cam_p, cam_q, 0.05);
+    // --- 步骤2：负观测更新（删除在FOV内但未观测到目标的粒子，复制其他粒子补充）---
+    search_particles_manager_->applyNegativeObservationDelete(cam_p, cam_q);
 
     // --- 步骤3：标签化的E步，计算每个标签的本地统计量（所有节点执行）---
     std::vector<LabeledLocalStat> local_labeled_stats = search_particles_manager_->computeLabeledLocalStats();
@@ -798,6 +960,55 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     search_state_msg.data = search_mode_active_;
     search_state_pub_.publish(search_state_msg);
 
+    // --- 步骤8：发布目标odom和标签信息（使用单标签粒子群均值位置）---
+    if (is_label_master_) {
+      Eigen::Vector3d search_target_pos = search_particles_manager_->getSingleLabelMeanPosition();
+
+      // 计算粒子群均值速度方向
+      auto particles_weights = search_particles_manager_->getParticlesAndWeights();
+      Eigen::Vector3d mean_vel = Eigen::Vector3d::Zero();
+      double total_w = 0.0;
+      for (int i = 0; i < particles_weights.first.cols(); ++i) {
+        mean_vel += particles_weights.second(i) * particles_weights.first.col(i).segment(3, 3);
+        total_w += particles_weights.second(i);
+      }
+      if (total_w > 1e-300) mean_vel /= total_w;
+
+      // 发布 SearchLabelInfo 消息
+      target_ekf::SearchLabelInfo label_info_msg;
+      label_info_msg.header.stamp = ros::Time::now();
+      label_info_msg.header.frame_id = "world";
+      label_info_msg.source_drone_id = drone_id_;
+      label_info_msg.label = static_cast<int>(my_assigned_label_);
+      label_info_msg.mean_pos.x = search_target_pos.x();
+      label_info_msg.mean_pos.y = search_target_pos.y();
+      label_info_msg.mean_pos.z = search_target_pos.z();
+      label_info_msg.mean_vel.x = mean_vel.x();
+      label_info_msg.mean_vel.y = mean_vel.y();
+      label_info_msg.mean_vel.z = mean_vel.z();
+      label_info_msg.assigned_drone_ids = label_to_drones_[my_assigned_label_];
+      label_info_msg.num_particles = search_particles_manager_->getSearchParticles().size();
+      search_label_info_pub_.publish(label_info_msg);
+
+      // 发布 target_odom（掌管者自己也用这个）
+      nav_msgs::Odometry target_odom;
+      target_odom.header.stamp = ros::Time::now();
+      target_odom.header.frame_id = "world";
+      target_odom.pose.pose.position.x = search_target_pos.x();
+      target_odom.pose.pose.position.y = search_target_pos.y();
+      target_odom.pose.pose.position.z = search_target_pos.z();
+      target_odom.twist.twist.linear.x = mean_vel.x();
+      target_odom.twist.twist.linear.y = mean_vel.y();
+      target_odom.twist.twist.linear.z = mean_vel.z();
+      target_odom_pub_.publish(target_odom);
+
+      ROS_INFO_THROTTLE(1.0, "[dpf%d] Search label %s: pos=(%.2f,%.2f,%.2f), %zu drones assigned",
+                        drone_id_, SearchParticlesManager::getLabelName(my_assigned_label_),
+                        search_target_pos.x(), search_target_pos.y(), search_target_pos.z(),
+                        label_to_drones_[my_assigned_label_].size());
+    }
+
+    last_update_stamp_ = ros::Time::now();
     return;  // 提前结束，不执行普通DPF流程
   }
   else {
@@ -864,16 +1075,42 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
         // 立即进入搜索模式并进行初始化
         search_mode_active_ = true;
         last_global_obs_time_ = ros::Time::now();
-        ROS_WARN("[dpf%d] ENTERING SEARCH MODE: All drones lost target for %d consecutive frames!", 
+        ROS_WARN("[dpf%d] ENTERING SEARCH MODE: All drones lost target for %d consecutive frames!",
                  drone_id_, consecutive_no_obs_count_);
-        // 继承当前DPF粒子并分配意图标签
-        search_particles_manager_->inheritAndLabelParticles(dpfPtr_.get());
-        
+
+        // 计算三个搜索目标点（反推位置）
+        auto particles_and_weights = dpfPtr_->getParticlesAndWeights();
+        auto search_targets = search_particles_manager_->computeSearchTargets(
+            particles_and_weights.first,
+            particles_and_weights.second,
+            consecutive_no_obs_count_);
+
+        // 构建搜索目标点向量用于匈牙利分配
+        std::vector<Eigen::Vector3d> target_points = {
+            search_targets.forward,
+            search_targets.left_45,
+            search_targets.right_45
+        };
+
+        // 匈牙利算法分配标签
+        hungarianAssignLabels(target_points);
+
+        // 更新搜索粒子管理器的标签信息
+        search_particles_manager_->setLabelAssignment(my_assigned_label_, is_label_master_);
+
+        // 只有掌管者才初始化粒子群
+        if (is_label_master_) {
+          search_particles_manager_->initializeSingleLabelParticles(
+              search_targets.mean_pos,
+              search_targets.mean_vel,
+              consecutive_no_obs_count_);
+        }
+
         // 发布搜索状态
         std_msgs::Bool search_state_msg;
         search_state_msg.data = search_mode_active_;
         search_state_pub_.publish(search_state_msg);
-        
+
         // 跳过后续普通DPF流程，直接返回
         return;
       }
@@ -1150,6 +1387,8 @@ int main(int argc, char** argv) {
   search_pos_gmm_pub_ = nh.advertise<target_ekf::LocalStats>("search_pos_gmm", 1);
   search_gmm_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>("search_gmm_vis", 1);
   search_particles_vis_pub_ = nh.advertise<sensor_msgs::PointCloud2>("search_particles_vis", 1);
+  search_targets_pub_ = nh.advertise<geometry_msgs::PoseArray>("search_targets", 1);
+  search_label_info_pub_ = nh.advertise<target_ekf::SearchLabelInfo>("search_label_info", 1);
   
   // 地图订阅
   ros::Subscriber global_map_sub = nh.subscribe("global_map", 10, &global_map_callback);
@@ -1157,14 +1396,20 @@ int main(int argc, char** argv) {
   ros::Subscriber odom_sub = nh.subscribe("odom", 100, &odom_callback, ros::TransportHints().tcpNoDelay());
   // YOLO目标订阅（单独订阅，不再同步）
   ros::Subscriber yolo_sub = nh.subscribe("yolo", 1, &yolo_callback, ros::TransportHints().tcpNoDelay());
-  // 订阅其他无人机的局部统计量
+  // 订阅其他无人机的局部统计量和odom
   for (int i = 0; i < num_drones_; ++i) {
     if (i == drone_id_) continue;
     std::string topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/local_stats";
     stats_subs_.push_back(nh.subscribe(topic, 10, &stats_callback));
     std::string labeled_topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/labeled_consensus";
     stats_subs_.push_back(nh.subscribe(labeled_topic, 10, &labeled_consensus_callback));
-    ROS_INFO("[dpf%d] Subscribing to %s and %s", drone_id_, topic.c_str(), labeled_topic.c_str());
+
+    // 订阅邻居无人机的odom（用于匈牙利分配）
+    std::string odom_topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_visual_slam/odom";
+    neighbor_odom_subs_.push_back(
+        nh.subscribe<nav_msgs::Odometry>(odom_topic, 10,
+            boost::bind(&neighbor_odom_callback, _1, i)));
+    ROS_INFO("[dpf%d] Subscribing to neighbor %d: stats, labeled_consensus, odom", drone_id_, i);
   }
   // 【核心】固定频率Timer执行DPF核心逻辑
   ros::Timer dpf_core_timer = nh.createTimer(ros::Duration(1.0 / dpf_rate_), &dpf_core_timer_callback);

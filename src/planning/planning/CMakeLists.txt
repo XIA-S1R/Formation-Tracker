@@ -13,11 +13,12 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   nodelet
   decomp_ros_utils
+  target_ekf
 )
 
 catkin_package(
   INCLUDE_DIRS include ${EIGEN3_INCLUDE_DIR}
-  CATKIN_DEPENDS quadrotor_msgs traj_opt mapping roscpp nodelet decomp_ros_utils
+  CATKIN_DEPENDS quadrotor_msgs traj_opt mapping roscpp nodelet decomp_ros_utils target_ekf
   LIBRARIES ${PROJECT_NAME}
   DEPENDS EIGEN3
 )

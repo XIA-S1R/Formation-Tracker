@@ -52,10 +52,13 @@ struct LabeledNeighborConsensus {
 class SearchParticlesManager {
 public:
   // 构造函数
-  SearchParticlesManager(int drone_id = 0, int num_components = 4, ros::NodeHandle* nh = nullptr) 
-    : drone_id_(drone_id), 
-      num_components_(num_components), // 【修复2】添加缺失的成员变量初始化
+  SearchParticlesManager(int drone_id = 0, int num_components = 4, ros::NodeHandle* nh = nullptr)
+    : drone_id_(drone_id),
+      num_components_(num_components),
       search_particles_initialized_(false),
+      my_label_(static_cast<SearchIntent>(drone_id % 3)),  // 根据ID分配标签
+      is_label_master_(drone_id < 3),                       // 前3架是掌管者
+      frames_since_init_(0),
       search_dt_(1.0 / 20.0),  // 搜索模式更新周期，默认20Hz
       search_vmax_(2),        // 最大速度 m/s (默认值)
       search_vmin_(0.5),        // 最小速度 m/s
@@ -528,6 +531,30 @@ public:
     return num_components_;
   }
 
+  // 获取本无人机负责的标签
+  SearchIntent getMyLabel() const {
+    return my_label_;
+  }
+
+  // 是否是该标签的掌管者
+  bool isLabelMaster() const {
+    return is_label_master_;
+  }
+
+  // 获取标签名称（用于日志）
+  static const char* getLabelName(SearchIntent label) {
+    static const char* names[] = {"STRAIGHT", "LEFT_TURN", "RIGHT_TURN"};
+    return names[static_cast<int>(label)];
+  }
+
+  // 设置标签分配结果（由匈牙利算法计算后调用）
+  void setLabelAssignment(SearchIntent label, bool is_master) {
+    my_label_ = label;
+    is_label_master_ = is_master;
+    ROS_INFO("[sp_mgr%d] Label assignment updated: %s, is_master=%d",
+             drone_id_, getLabelName(label), is_master);
+  }
+
   /*// Setter methods
   void setDroneId(int drone_id) { drone_id_ = drone_id; }
   void setSearchDt(double dt) { search_dt_ = dt; }
@@ -546,6 +573,396 @@ public:
     los_check_fn_ = fn;
   }
 
+  // === 初始化单标签的粒子群（新方法：无共识） ===
+  // 只有掌管者才初始化粒子群，根据反推的平均位置和速度，按意图动力学步进
+  void initializeSingleLabelParticles(const Eigen::Vector3d& mean_pos,
+                                      const Eigen::Vector3d& mean_vel,
+                                      int num_frames_back,
+                                      int num_particles = 300) {
+    if (!is_label_master_) {
+      ROS_INFO("[sp_mgr%d] Not a label master for %s, skip initialization",
+               drone_id_, getLabelName(my_label_));
+      return;
+    }
+
+    // 清空现有粒子，重置帧计数
+    search_particles_.clear();
+    search_particles_.reserve(num_particles);
+    frames_since_init_ = 0;
+
+    // 只为本无人机负责的标签创建粒子群
+    for (int i = 0; i < num_particles; ++i) {
+      SearchParticle particle;
+      particle.state.setZero(9);
+      particle.state.head(3) = mean_pos;
+      particle.state.segment(3, 3) = mean_vel;
+      particle.state(8) = std::atan2(mean_vel.y(), mean_vel.x());  // yaw
+      particle.weight = 1.0 / num_particles;
+      particle.intent = my_label_;  // 初始都是本标签
+      particle.particle_id = i;
+      search_particles_.push_back(particle);
+    }
+
+    ROS_INFO("[sp_mgr%d] Initialized %d particles for label %s",
+             drone_id_, num_particles, getLabelName(my_label_));
+
+    // 步进 num_frames_back 步（初始化阶段不切换意图）
+    for (int step = 0; step < num_frames_back; ++step) {
+      for (auto& particle : search_particles_) {
+        updateSearchParticleState(particle);
+      }
+    }
+
+    search_particles_initialized_ = true;
+
+    ROS_INFO("[sp_mgr%d] Label %s: %d particles stepped %d frames, ready",
+             drone_id_, getLabelName(my_label_), num_particles, num_frames_back);
+  }
+
+  // === 计算当前保持意图的概率（随帧数衰减：90% -> 60%） ===
+  double computeKeepIntentProb() const {
+    // 初始90%，衰减到60%，衰减时间常数约100帧
+    const double init_prob = 0.90;
+    const double min_prob = 0.60;
+    const double decay_rate = 0.02;  // 每帧衰减率
+
+    double prob = init_prob - decay_rate * frames_since_init_;
+    return std::max(min_prob, prob);
+  }
+
+  // === 意图切换（带衰减概率） ===
+  void switchIntentsWithDecay() {
+    if (!search_particles_initialized_ || search_particles_.empty()) {
+      return;
+    }
+
+    double keep_prob = computeKeepIntentProb();
+    double switch_prob = (1.0 - keep_prob) / 2.0;  // 平均分配给另外两个意图
+
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+
+    for (auto& particle : search_particles_) {
+      double rand_val = uniform(rng_);
+      SearchIntent old_intent = particle.intent;
+
+      if (rand_val < keep_prob) {
+        // 保持原意图
+        continue;
+      } else if (rand_val < keep_prob + switch_prob) {
+        // 切换到第一个其他意图
+        if (old_intent == STRAIGHT) particle.intent = LEFT_TURN;
+        else if (old_intent == LEFT_TURN) particle.intent = STRAIGHT;
+        else particle.intent = STRAIGHT;
+      } else {
+        // 切换到第二个其他意图
+        if (old_intent == STRAIGHT) particle.intent = RIGHT_TURN;
+        else if (old_intent == LEFT_TURN) particle.intent = RIGHT_TURN;
+        else particle.intent = LEFT_TURN;
+      }
+    }
+  }
+
+  // === 更新单标签粒子群（新方法：带意图切换） ===
+  void updateSingleLabelParticles() {
+    if (!is_label_master_ || !search_particles_initialized_) {
+      return;
+    }
+
+    // 步骤1：意图切换（带衰减概率）
+    switchIntentsWithDecay();
+
+    // 步骤2：更新粒子状态
+    for (auto& particle : search_particles_) {
+      updateSearchParticleState(particle);
+    }
+
+    // 增加帧计数
+    frames_since_init_++;
+
+    ROS_DEBUG("[sp_mgr%d] Updated %zu particles, keep_prob=%.2f, frame=%d",
+              drone_id_, search_particles_.size(), computeKeepIntentProb(), frames_since_init_);
+  }
+
+  // === 获取单标签粒子群的加权均值位置（用于规划目标点） ===
+  Eigen::Vector3d getSingleLabelMeanPosition() const {
+    if (search_particles_.empty()) {
+      return Eigen::Vector3d::Zero();
+    }
+
+    Eigen::Vector3d mean_pos = Eigen::Vector3d::Zero();
+    double total_weight = 0.0;
+
+    for (const auto& p : search_particles_) {
+      mean_pos += p.weight * p.state.head(3);
+      total_weight += p.weight;
+    }
+
+    if (total_weight > 1e-300) {
+      mean_pos /= total_weight;
+    }
+
+    return mean_pos;
+  }
+
+  // === 负观测更新：删除在FOV内但未观测到目标的粒子，复制其他粒子补充 ===
+  // cam_p: 相机位置, cam_q: 相机姿态
+  // 返回被删除的粒子数
+  int applyNegativeObservationDelete(const Eigen::Vector3d& cam_p,
+                                     const Eigen::Quaterniond& cam_q) {
+    if (!search_particles_initialized_ || search_particles_.empty()) {
+      return 0;
+    }
+
+    double fx = cam_fx_;
+    double fy = cam_fy_;
+    double cx = cam_cx_;
+    double cy = cam_cy_;
+    double max_range = cam_max_range_;
+    double min_range = 0.1;
+    double fov_width = cam_width_;
+    double fov_height = cam_height_;
+
+    // 标记需要删除的粒子索引
+    std::vector<bool> to_delete(search_particles_.size(), false);
+    int delete_count = 0;
+
+    for (size_t i = 0; i < search_particles_.size(); ++i) {
+      const auto& particle = search_particles_[i];
+      Eigen::Vector3d particle_pos = particle.state.head(3);
+
+      // 将粒子位置转换到相机坐标系
+      Eigen::Vector3d p_in_cam = cam_q.inverse() * (particle_pos - cam_p);
+
+      // 检查是否在视场距离范围内
+      if (p_in_cam.z() <= min_range || p_in_cam.z() >= max_range) {
+        continue;  // 不在距离范围内，保留
+      }
+
+      // 投影到图像平面
+      double x_img = p_in_cam.x() * fx / p_in_cam.z() + cx;
+      double y_img = p_in_cam.y() * fy / p_in_cam.z() + cy;
+
+      // 检查是否在图像范围内
+      if (x_img >= 0 && x_img <= fov_width && y_img >= 0 && y_img <= fov_height) {
+        // 在FOV内，检查视线是否被遮挡
+        bool los_clear = !los_check_fn_ || los_check_fn_(cam_p, particle_pos);
+        if (los_clear) {
+          // 在FOV内且视线清晰，但没有观测到目标 -> 删除
+          to_delete[i] = true;
+          delete_count++;
+        }
+      }
+    }
+
+    if (delete_count == 0) {
+      return 0;  // 没有需要删除的粒子
+    }
+
+    // 收集保留的粒子
+    std::vector<SearchParticle> surviving_particles;
+    surviving_particles.reserve(search_particles_.size() - delete_count);
+    for (size_t i = 0; i < search_particles_.size(); ++i) {
+      if (!to_delete[i]) {
+        surviving_particles.push_back(search_particles_[i]);
+      }
+    }
+
+    // 如果所有粒子都被删除，保留原粒子群（避免粒子耗尽）
+    if (surviving_particles.empty()) {
+      ROS_WARN("[sp_mgr%d] All particles in FOV, keeping original particles", drone_id_);
+      return 0;
+    }
+
+    // 计算需要复制的粒子数
+    int num_to_copy = delete_count;
+
+    // 按权重复制存活粒子来补充
+    // 先归一化存活粒子的权重
+    double sum_w = 0.0;
+    for (const auto& p : surviving_particles) {
+      sum_w += p.weight;
+    }
+    if (sum_w > 1e-300) {
+      for (auto& p : surviving_particles) {
+        p.weight /= sum_w;
+      }
+    }
+
+    // 按权重随机选择粒子进行复制
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    std::vector<SearchParticle> copied_particles;
+    copied_particles.reserve(num_to_copy);
+
+    for (int i = 0; i < num_to_copy; ++i) {
+      double rand_val = uniform(rng_);
+      double cumsum = 0.0;
+      size_t selected_idx = 0;
+
+      for (size_t j = 0; j < surviving_particles.size(); ++j) {
+        cumsum += surviving_particles[j].weight;
+        if (rand_val <= cumsum) {
+          selected_idx = j;
+          break;
+        }
+      }
+
+      // 复制选中的粒子，添加小扰动
+      SearchParticle new_particle = surviving_particles[selected_idx];
+      new_particle.particle_id = search_particles_.size() + i;
+
+      // 添加位置和速度扰动
+      std::normal_distribution<double> pos_noise(0.0, 0.3);
+      std::normal_distribution<double> vel_noise(0.0, 0.1);
+      new_particle.state(0) += pos_noise(rng_);
+      new_particle.state(1) += pos_noise(rng_);
+      new_particle.state(3) += vel_noise(rng_);
+      new_particle.state(4) += vel_noise(rng_);
+
+      copied_particles.push_back(new_particle);
+    }
+
+    // 合并存活粒子和复制粒子
+    search_particles_.clear();
+    search_particles_.reserve(surviving_particles.size() + copied_particles.size());
+    search_particles_.insert(search_particles_.end(), surviving_particles.begin(), surviving_particles.end());
+    search_particles_.insert(search_particles_.end(), copied_particles.begin(), copied_particles.end());
+
+    // 重新归一化权重
+    double total_w = 0.0;
+    for (const auto& p : search_particles_) {
+      total_w += p.weight;
+    }
+    if (total_w > 1e-300) {
+      for (auto& p : search_particles_) {
+        p.weight /= total_w;
+      }
+    }
+
+    ROS_INFO_THROTTLE(1.0, "[sp_mgr%d] Negative obs: deleted %d particles, copied %d, total=%zu",
+                      drone_id_, delete_count, num_to_copy, search_particles_.size());
+
+    return delete_count;
+  }
+
+  // === 旧版初始化函数（保留兼容，后续弃用） ===
+  struct SearchTargets {
+    Eigen::Vector3d forward;      // 沿速度方向前进
+    Eigen::Vector3d left_45;      // 左前45度
+    Eigen::Vector3d right_45;     // 右前45度
+    Eigen::Vector3d mean_pos;     // 均值位置（反推后）
+    Eigen::Vector3d mean_vel;     // 均值速度
+  };
+
+  SearchTargets computeSearchTargets(const Eigen::MatrixXd& dpf_particles,
+                                     const Eigen::VectorXd& dpf_weights,
+                                     int num_frames_back,
+                                     double search_distance = 5.0) {
+    SearchTargets targets;
+    int N = dpf_particles.cols();
+    double dt = search_dt_;
+
+    // 步骤1：计算当前粒子的加权均值位置和速度
+    Eigen::Vector3d pos_mean = Eigen::Vector3d::Zero();
+    Eigen::Vector3d vel_mean = Eigen::Vector3d::Zero();
+    double total_weight = 0.0;
+
+    for (int i = 0; i < N; ++i) {
+      pos_mean += dpf_weights(i) * dpf_particles.col(i).head(3);
+      vel_mean += dpf_weights(i) * dpf_particles.col(i).segment(3, 3);
+      total_weight += dpf_weights(i);
+    }
+
+    if (total_weight > 1e-300) {
+      pos_mean /= total_weight;
+      vel_mean /= total_weight;
+    }
+
+    // 步骤2：反推num_frames_back帧前的位置（使用匀速模型）
+    Eigen::Vector3d pos_back = pos_mean - vel_mean * dt * num_frames_back;
+
+    targets.mean_pos = pos_back;
+    targets.mean_vel = vel_mean;
+
+    // 步骤3：计算三个搜索目标点
+    Eigen::Vector3d vel_horiz = vel_mean;
+    vel_horiz.z() = 0.0;
+    double v_horiz = vel_horiz.norm();
+
+    Eigen::Vector3d forward_dir = Eigen::Vector3d::Zero();
+    if (v_horiz > 0.1) {
+      forward_dir = vel_horiz.normalized();
+    } else {
+      forward_dir = Eigen::Vector3d(1.0, 0.0, 0.0);
+    }
+
+    // 左前45度方向：旋转-45度
+    double angle_45 = M_PI / 4.0;
+    Eigen::Vector3d left_45_dir;
+    left_45_dir.x() = forward_dir.x() * std::cos(angle_45) - forward_dir.y() * std::sin(angle_45);
+    left_45_dir.y() = forward_dir.x() * std::sin(angle_45) + forward_dir.y() * std::cos(angle_45);
+    left_45_dir.z() = 0.0;
+
+    // 右前45度方向：旋转+45度
+    Eigen::Vector3d right_45_dir;
+    right_45_dir.x() = forward_dir.x() * std::cos(-angle_45) - forward_dir.y() * std::sin(-angle_45);
+    right_45_dir.y() = forward_dir.x() * std::sin(-angle_45) + forward_dir.y() * std::cos(-angle_45);
+    right_45_dir.z() = 0.0;
+
+    // 三个搜索点
+    targets.forward = pos_back + search_distance * forward_dir;
+    targets.left_45 = pos_back + search_distance * left_45_dir;
+    targets.right_45 = pos_back + search_distance * right_45_dir;
+
+    // 保持z高度
+    targets.forward.z() = pos_back.z();
+    targets.left_45.z() = pos_back.z();
+    targets.right_45.z() = pos_back.z();
+
+    return targets;
+  }
+
+  // === 初始化三个标签的粒子群（搜索模式入口） ===
+  // 根据反推的平均位置和速度，为三个意图标签各创建一个粒子群
+  // 每个粒子群通过动力学步进 num_frames_back 步来初始化
+  void initializeLabeledParticles(const Eigen::Vector3d& mean_pos,
+                                  const Eigen::Vector3d& mean_vel,
+                                  int num_frames_back) {
+    if (!search_particles_initialized_) {
+      ROS_WARN("[sp_mgr%d] Search particles not initialized, cannot initialize labeled particles", drone_id_);
+      return;
+    }
+
+    int num_particles_per_label = search_particles_.size() / 3;
+    if (num_particles_per_label == 0) num_particles_per_label = 100;  // 默认每个标签100个粒子
+
+    // 清空现有粒子
+    search_particles_.clear();
+
+    // 为三个标签各创建粒子群
+    std::vector<SearchIntent> labels = {STRAIGHT, LEFT_TURN, RIGHT_TURN};
+
+    for (SearchIntent label : labels) {
+      // 为该标签创建粒子
+      for (int i = 0; i < num_particles_per_label; ++i) {
+        SearchParticle particle;
+        particle.state.setZero(9);
+        particle.state.head(3) = mean_pos;
+        particle.state.segment(3, 3) = mean_vel;
+        particle.state(8) = std::atan2(mean_vel.y(), mean_vel.x());  // yaw
+        particle.weight = 1.0 / (3 * num_particles_per_label);
+        particle.intent = label;
+        particle.particle_id = search_particles_.size();
+        search_particles_.push_back(particle);
+      }
+    }
+
+    // 步进 num_frames_back 步（不考虑意图切换）
+    for (int step = 0; step < num_frames_back; ++step) {
+      for (auto& particle : search_particles_) {
+        updateSearchParticleState(particle);
+      }
+    }
+  }
 
 
 // 调试：打印粒子分散趋势
@@ -647,6 +1064,11 @@ private:
   int num_components_; // 【修复2】添加缺失的成员变量
   std::vector<SearchParticle> search_particles_;
   bool search_particles_initialized_;
+
+  // 单标签模式：每个无人机只掌管一个标签
+  SearchIntent my_label_;        // 本无人机负责的标签
+  bool is_label_master_;         // 是否是该标签的掌管者（drone_id < 3）
+  int frames_since_init_;        // 初始化后经过的帧数（用于意图切换概率衰减）
   
   // 搜索粒子动力学参数
   double search_dt_;
