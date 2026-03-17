@@ -37,7 +37,7 @@
     <param name="debug"          value="false"/>
 
     <param name="prediction/rho_a" value="1.0"/><!-- A*搜索中对加速度的惩罚 -->
-    <param name="prediction/vmax"  value="4.0"/>
+    <param name="prediction/vmax"  value="1.5"/>
     <param name="num_drones"       value="$(arg num_drones)" type="int"/>
 
     <!-- Swarm / formation parameters -->

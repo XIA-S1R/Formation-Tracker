@@ -458,6 +458,7 @@ class Env {
       std::cout << "[env] search costs more than " << MAX_DURATION << "s!" << std::endl;
     }
     while (visited_nodes_.size() < MAX_MEMORY && t_cost <= MAX_DURATION) {
+      t_cost = (ros::Time::now() - t_start_).toSec();
       for (const auto& neighbor : neighbors) {
         auto neighbor_idx = curPtr->idx + neighbor.first;
         auto neighbor_dist = neighbor.second;
@@ -719,6 +720,27 @@ class Env {
                           std::vector<Eigen::Vector3d>& path) {
     Eigen::Vector3i start_idx = mapPtr_->pos2idx(start_p);
     Eigen::Vector3i end_idx = mapPtr_->pos2idx(end_p);
+
+    // 如果终点被占用，沿 终点→起点 方向回退找空闲点
+    if (mapPtr_->isOccupied(end_idx)) {
+      Eigen::Vector3d dir = (start_p - end_p).normalized();
+      double step = mapPtr_->resolution;
+      bool found = false;
+      for (double d = step; d < 5.0; d += step) {
+        Eigen::Vector3d adjusted = end_p + dir * d;
+        Eigen::Vector3i adj_idx = mapPtr_->pos2idx(adjusted);
+        if (!mapPtr_->isOccupied(adj_idx)) {
+          end_idx = adj_idx;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        std::cout << "[short astar] end occupied, no free point along retreat dir!" << std::endl;
+        return false;
+      }
+    }
+
     if (start_idx == end_idx) {
       path.clear();
       path.push_back(start_p);
@@ -763,7 +785,15 @@ class Env {
     calulateHeuristic(curPtr);
     curPtr->state = CLOSE;
 
+    ros::Time t_start = ros::Time::now();
     while (visited_nodes_.size() < MAX_MEMORY) {
+      // 超时检查，防止卡死
+      double t_cost = (ros::Time::now() - t_start).toSec();
+      if (t_cost > MAX_DURATION) {
+        std::cout << "[short astar] timeout after " << t_cost << "s, visited: "
+                  << visited_nodes_.size() << " nodes" << std::endl;
+        break;
+      }
       for (const auto& neighbor : neighbors) {
         auto neighbor_idx = curPtr->idx + neighbor.first;
         auto neighbor_dist = neighbor.second;

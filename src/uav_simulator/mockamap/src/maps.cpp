@@ -79,8 +79,8 @@ Maps::randomMapGenerate()
   double map_width_z = info.sizeZ / info.scale; // z轴总长度
   
   // 计算x方向的区域划分（考虑地图中心在原点）
-  double left_third = map_width_x / 6.0; // 左侧1/6区域长度
-  double middle_third = map_width_x * 2.0 / 3.0; // 中间2/3区域长度
+  double left_third = map_width_x / 3.0; // 左侧1/3区域长度
+  double middle_third = map_width_x / 3.0; // 中间1/3区域长度
   double right_third = map_width_x / 3.0; // 右侧1/3区域长度
   
   // 计算各区域的边界
@@ -248,7 +248,7 @@ Maps::randomMapGenerate()
   // 计算x轴后1/3区域的长度
   double right_third_length = right_end - right_start;
   
-  // 在x方向的后1/3区域添加大障碍物
+  /*// 在x方向的后1/3区域添加大障碍物
   double big_obstacle_width = right_third_length * 0.4; // 缩短宽度，占后1/3区域的40%
   double big_obstacle_length = 10.0;
   double big_obstacle_height = 8.0;
@@ -270,18 +270,53 @@ Maps::randomMapGenerate()
   
   generateBox(big_obstacle_x, big_obstacle_y, big_obstacle_z, 
               actual_big_width, actual_big_length, big_obstacle_height, 
-              _resolution, pt_random);
-  
-  // 计算大障碍物的实际右边界
-  double big_obstacle_right = big_obstacle_x + actual_big_width / 2.0;
-  
+              _resolution, pt_random);*/
+              // 在x方向的后1/3区域添加大障碍物（带裂缝版本）
+  double big_obstacle_width = right_third_length * 0.4; // 缩短宽度，占后1/3区域的40%
+  double big_obstacle_length = 10.0;
+  double big_obstacle_height = 8.0;
+
+  // 计算大障碍物的位置，确保整个障碍在后1/3区域内
+  double big_obstacle_x_min = right_start;
+  double big_obstacle_x_max = right_start + right_third_length * 0.45; // 为矩形障碍留出空间
+  double big_obstacle_y_min = map_min_y + big_obstacle_length / 2.0;
+  double big_obstacle_y_max = map_max_y - big_obstacle_length / 2.0;
+
+  // 确保大障碍物的尺寸合理
+  double actual_big_width = std::min(big_obstacle_width, big_obstacle_x_max - big_obstacle_x_min);
+  double actual_big_length = std::min(big_obstacle_length, big_obstacle_y_max - big_obstacle_y_min);
+
+  // 将大障碍物分成3个部分，中间留出裂缝
+  int num_parts = 3;  // 分成3个部分
+  double crack_width = actual_big_width * 0.2; // 裂缝宽度为总宽度的5%
+  double part_width = (actual_big_width - 2 * crack_width) / num_parts; // 每个部分的宽度
+
+  // 计算大障碍物的中心位置
+  double big_obstacle_x = (big_obstacle_x_min + big_obstacle_x_max) / 2.0;
+  double big_obstacle_y = 0.0;
+  double big_obstacle_z = 0.0;
+
+  // 生成带裂缝的大障碍物
+  for (int i = 0; i < num_parts; i++) {
+      double part_x = big_obstacle_x_min + i * (part_width + crack_width) + (part_width + crack_width) / 2.0;
+      double part_y = 0.0;
+
+      generateBox(part_x, part_y, big_obstacle_z,
+                  part_width, actual_big_length, big_obstacle_height,
+                  _resolution, pt_random);
+  }
+
+  // 计算带裂缝大障碍物的实际右边界（最后一个part的右边）
+  double last_part_x = big_obstacle_x_min + (num_parts - 1) * (part_width + crack_width) + (part_width + crack_width) / 2.0;
+  double big_obstacle_right = last_part_x + part_width / 2.0;
+
   // 在大障碍物之后添加几列沿x轴方向的长矩形障碍
-  int num_columns = 5; // 增加数量
-  double column_width = right_third_length * 0.5; // 缩短宽度，占后1/3区域的50%
+  int num_columns = 5;
+  double column_width = right_third_length * 0.4;
   double column_length = 1.0;
-  double column_height = 6.0;
-  double column_spacing = 5.0; // 减小间距
-  double column_gap = 5.0; // 与大障碍物的间距，适当减小
+  double column_height = 8.0;
+  double column_spacing = 5.0;
+  double column_gap = 20; // 与大障碍物的间距，拉远到20米
   
   // 计算矩形障碍的起始x位置（在大障碍物之后，确保在后1/3区域内）
   double column_x_min = big_obstacle_right + column_gap;

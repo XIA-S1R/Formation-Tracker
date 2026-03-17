@@ -1,5 +1,5 @@
 <launch>
-
+<env name="ROSCONSOLE_CONFIG_FILE" value="$(find planning)/config/rosconsole.conf"/>
   <!-- ============================================================
        Map generator
   ============================================================ -->
@@ -74,8 +74,8 @@
       <remap from="~triger"          to="/move_base_simple/goal"/>
       <param name="plan_hz"          value="20"/>
       <param name="K"                value="8"/>
-      <param name="vmax"             value="2"/>
-      <param name="amax"             value="4"/>
+      <param name="vmax"             value="1.5"/>
+      <param name="amax"             value="3"/>
       <param name="rhoT"             value="100.0"/>
       <param name="rhoP"             value="10000.0"/>
       <param name="rhoV"             value="1000.0"/>
@@ -186,7 +186,7 @@
     </node>
     <include file="$(find planning)/launch/planning.launch">
       <arg name="rhosVisibility_"  value="10000.0"/>
-      <arg name="rhoTracking_"     value="1000.0"/>
+      <arg name="rhoTracking_"     value="1.0"/>
       <arg name="target_name_"     value="/drone1/target_ekf_odom"/>
       <arg name="drone_id"         value="1"/>
       <arg name="formation_type_"  value="triangle"/>
@@ -229,7 +229,7 @@
     </node>
     <include file="$(find planning)/launch/planning.launch">
       <arg name="rhosVisibility_"  value="10000.0"/>
-      <arg name="rhoTracking_"     value="1000.0"/>
+      <arg name="rhoTracking_"     value="1.0"/>
       <arg name="target_name_"     value="/drone2/target_ekf_odom"/>
       <arg name="drone_id"         value="2"/>
       <arg name="formation_type_"  value="triangle"/>

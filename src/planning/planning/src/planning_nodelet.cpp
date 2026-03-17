@@ -319,14 +319,16 @@ class Nodelet : public nodelet::Nodelet {
   // NOTE main callback
   void plan_timer_callback(const ros::TimerEvent& event) {
     heartbeat_pub_.publish(std_msgs::Empty());
+    ROS_INFO_THROTTLE(5.0, "[drone %d] plan_timer alive", trajOptPtr_->drone_id_);  // 确认回调在执行
     if (!odom_received_ || !map_received_) {
       return;
     }
     // obtain state of odom
-    while (odom_lock_.test_and_set())
-      ;
+    ROS_DEBUG("[drone %d] acquiring odom_lock", trajOptPtr_->drone_id_);
+    while (odom_lock_.test_and_set());
     auto odom_msg = odom_msg_;
     odom_lock_.clear();//odom_lock_用于保证读取odom_msg_时的线程安全
+    ROS_DEBUG("[drone %d] odom_lock released", trajOptPtr_->drone_id_);
     Eigen::Vector3d odom_p(odom_msg.pose.pose.position.x,
                            odom_msg.pose.pose.position.y,
                            odom_msg.pose.pose.position.z);
@@ -455,11 +457,14 @@ class Nodelet : public nodelet::Nodelet {
     }
 
     // NOTE obtain map
+    ROS_DEBUG("[drone %d] acquiring gridmap_lock", trajOptPtr_->drone_id_);
     while (gridmap_lock_.test_and_set())
       ;
     gridmapPtr_->from_msg(map_msg_);
     replanStateMsg_.occmap = map_msg_;
     gridmap_lock_.clear();
+    ROS_DEBUG("[drone %d] gridmap_lock released", trajOptPtr_->drone_id_);
+
 
     // Check map freshness - allow up to 200ms delay for lidar mapping
     double map_age = (ros::Time::now() - map_msg_.header.stamp).toSec();
@@ -533,12 +538,16 @@ class Nodelet : public nodelet::Nodelet {
     // double t_path = 0;
 
     if (generate_new_traj_success) {
-      // ros::Time t_front0 = ros::Time::now();
-      if (land_triger_received_) {
-        generate_new_traj_success = envPtr_->short_astar(p_start, target_p, path);
-      } else {
-        generate_new_traj_success = envPtr_->findVisiblePath(p_start, target_predcit, way_pts, path);//env类中定义的A*搜索，包含视线能清晰观察到目标的路径搜索逻辑。输出与预测时间点同步的路径点和路径
-      }
+      // 统一使用 short_astar 搜索到目标位置（终点调整已在 short_astar 内部处理）
+      ROS_DEBUG("[drone %d] starting path search", trajOptPtr_->drone_id_);
+      generate_new_traj_success = envPtr_->short_astar(p_start, target_p, path);
+      ROS_DEBUG("[drone %d] path search done: %d", trajOptPtr_->drone_id_, generate_new_traj_success);
+      // 原可见路径逻辑（已注释）:
+      // if (land_triger_received_) {
+      //   generate_new_traj_success = envPtr_->short_astar(p_start, target_p, path);
+      // } else {
+      //   generate_new_traj_success = envPtr_->findVisiblePath(p_start, target_predcit, way_pts, path);
+      // }
       // ros::Time t_end0 = ros::Time::now();
       // t_path += (t_end0 - t_front0).toSec() * 1e3;
     }
@@ -548,40 +557,37 @@ class Nodelet : public nodelet::Nodelet {
     Trajectory traj;
     if (generate_new_traj_success) {
       visPtr_->visualize_path(path, "astar");
-      if (land_triger_received_) {
-        for (const auto& p : target_predcit) {
-          path.push_back(p);
-        }
-      } else {
-        // NOTE generate visible regions
-        target_predcit.pop_back();
-        way_pts.pop_back();
-        // ros::Time t_front1 = ros::Time::now();
-        envPtr_->generate_visible_regions(target_predcit, way_pts,
-                                          visible_ps, thetas);//使用预测的目标未来轨迹和A*搜索得到的路径点，生成可观测区域（扇形）的圆心点列visible_ps和对应的角度thetas，可参见论文定义
-        // ros::Time t_end1 = ros::Time::now();
-        // t_path += (t_end1 - t_front1).toSec() * 1e3;
-        visPtr_->visualize_pointcloud(visible_ps, "visible_ps");
-        visPtr_->visualize_fan_shape_meshes(target_predcit, visible_ps, thetas, "visible_region");// 通过对目标未来轨迹的预测和之前A*搜索得到的路径点，生成可观测区域并可视化
-
-        // TODO change the final state
-        std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> rays;
-        for (int i = 0; i < (int)way_pts.size(); ++i) {
-          rays.emplace_back(target_predcit[i], way_pts[i]);
-        }
-        visPtr_->visualize_pointcloud(way_pts, "way_pts");
-        way_pts.insert(way_pts.begin(), p_start);
-        // ros::Time t_front2 = ros::Time::now();
-        envPtr_->pts2path(way_pts, path);// 目前的路径点已经保障了可观测到目标，现在平滑连接得到最终路径
-        // ros::Time t_end2 = ros::Time::now();
-        // t_path += (t_end2 - t_front2).toSec() * 1e3;
+      // 统一拼接预测轨迹（不再区分 land_triger）
+      for (const auto& p : target_predcit) {
+        path.push_back(p);
       }
+      // 原可见区域逻辑（已注释）:
+      // if (land_triger_received_) {
+      //   for (const auto& p : target_predcit) {
+      //     path.push_back(p);
+      //   }
+      // } else {
+      //   target_predcit.pop_back();
+      //   way_pts.pop_back();
+      //   envPtr_->generate_visible_regions(target_predcit, way_pts, visible_ps, thetas);
+      //   visPtr_->visualize_pointcloud(visible_ps, "visible_ps");
+      //   visPtr_->visualize_fan_shape_meshes(target_predcit, visible_ps, thetas, "visible_region");
+      //   std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> rays;
+      //   for (int i = 0; i < (int)way_pts.size(); ++i) {
+      //     rays.emplace_back(target_predcit[i], way_pts[i]);
+      //   }
+      //   visPtr_->visualize_pointcloud(way_pts, "way_pts");
+      //   way_pts.insert(way_pts.begin(), p_start);
+      //   envPtr_->pts2path(way_pts, path);
+      // }
       // NOTE corridor generating
       std::vector<Eigen::MatrixXd> hPolys;
       std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> keyPts;
 
       // ros::Time t_front3 = ros::Time::now();
+      ROS_DEBUG("[drone %d] starting generateSFC", trajOptPtr_->drone_id_);
       envPtr_->generateSFC(path, 2.0, hPolys, keyPts);
+      ROS_DEBUG("[drone %d] generateSFC done", trajOptPtr_->drone_id_);
       // ros::Time t_end3 = ros::Time::now();
       // double t_corridor = (t_end3 - t_front3).toSec() * 1e3;
 
@@ -591,15 +597,19 @@ class Nodelet : public nodelet::Nodelet {
       // NOTE trajectory optimization
       Eigen::MatrixXd finState;
       finState.setZero(3, 3);
-      finState.col(0) = path.back();
+      finState.col(0) = target_predcit.back();  // 统一用预测终点
       finState.col(1) = target_v;
-      if (land_triger_received_) {
-        finState.col(0) = target_predcit.back();
-        generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, traj);
-      } else {
-        generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState,
-                                                               target_predcit, hPolys, traj);
-      }
+      // 原逻辑（已注释）:
+      // if (land_triger_received_) {
+      //   finState.col(0) = target_predcit.back();
+      //   generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, traj);
+      // } else {
+      //   finState.col(0) = path.back();
+      //   generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, traj);
+      // }
+      ROS_DEBUG("[drone %d] starting traj optimization", trajOptPtr_->drone_id_);
+      generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, traj);
+      ROS_DEBUG("[drone %d] traj optimization done: %d", trajOptPtr_->drone_id_, generate_new_traj_success);
 
       visPtr_->visualize_traj(traj, "traj");
     }

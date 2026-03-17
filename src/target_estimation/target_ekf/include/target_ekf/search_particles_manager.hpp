@@ -301,54 +301,57 @@ public:
 
     switch(particle.intent) {
       case STRAIGHT: {
-        std::uniform_real_distribution<double> uniform_acc(-search_amax_/2, search_amax_);  
-        double anom = uniform_acc(rng_);
-        double amag = anom + acc_noise(rng_);
-        // 硬约束最大加速度
-        amag = clamp(amag, -search_amax_, search_amax_);
+        // 直行：主要沿速度方向加速，偏向正加速度以维持前进
+        // 使用偏向正值的分布：均值为 amax/2，确保平均加速度为正
+        std::normal_distribution<double> acc_dist(search_amax_ * 0.3, search_amax_ * 0.3);
+        double amag = acc_dist(rng_) + acc_noise(rng_);
+        amag = clamp(amag, -search_amax_ * 0.3, search_amax_);
         // 速度上限约束
         if (v + amag * search_dt_ > search_vmax_) amag = (search_vmax_ - v) / search_dt_;
+        // 速度下限约束：如果速度太低，强制加速
+        if (v < search_vmin_ * 1.5) amag = std::max(amag, search_amax_ * 0.5);
         acc.head(2) = amag * ev.head(2);
         break;
       }
       case LEFT_TURN: {
-        // 左转加速度：垂直速度方向向左
+        // 左转：横向加速度 + 正向前进加速度
         Eigen::Vector3d eleft = Eigen::Vector3d::Zero();
         eleft.x() = -ev.y();
         eleft.y() = ev.x();
-        // 生成一个在 0 到 search_amax 之间，越接近 search_amax 概率越高的分布
-        // 使用幂次分布：aturn = search_amax * (u^k)，其中 k < 1
+
+        // 横向加速度（向左）
         std::uniform_real_distribution<double> uniform(0.0, 1.0);
         double u = uniform(rng_);
-        double k = 0.5; // k 越小，越偏向于 search_amax
-        double aturn = search_amax_ * std::pow(u, k);
-        double amag = clamp(aturn + acc_noise(rng_), 0.0, search_amax_);
-        // akeep 设计为在 -search_amax_/2 和 search_amax_/2 之间正态分布的随机值
-        std::normal_distribution<double> akeep_dist(0.0, search_amax_/4); // 均值0，标准差为amax/4
-        double akeep = akeep_dist(rng_);
-        akeep = clamp(akeep, -search_amax_/2, search_amax_/2);
-        acc.head(2) = amag * eleft.head(2) + akeep * ev.head(2);
-        // 硬约束总加速度不超过amax
+        double aturn = search_amax_ * 0.7 * std::pow(u, 0.5);  // 偏向较大值
+        aturn = clamp(aturn + acc_noise(rng_), 0.0, search_amax_ * 0.8);
+
+        // 前向加速度：保持正值以维持速度
+        double akeep = search_amax_ * 0.3;  // 固定正向加速度
+        if (v > search_vmax_ * 0.8) akeep = 0;  // 速度够快时不再加速
+        if (v < search_vmin_ * 1.5) akeep = search_amax_ * 0.5;  // 速度太慢时加速
+
+        acc.head(2) = aturn * eleft.head(2) + akeep * ev.head(2);
         if (acc.norm() > search_amax_) acc = acc.normalized() * search_amax_;
         break;
       }
       case RIGHT_TURN: {
-        // 右转加速度：垂直速度方向向右
+        // 右转：横向加速度 + 正向前进加速度
         Eigen::Vector3d eright = Eigen::Vector3d::Zero();
         eright.x() = ev.y();
         eright.y() = -ev.x();
-        // 生成一个在 0 到 search_amax 之间，越接近 search_amax 概率越高的分布
-        // 使用幂次分布：aturn = search_amax * (u^k)，其中 k < 1
+
+        // 横向加速度（向右）
         std::uniform_real_distribution<double> uniform(0.0, 1.0);
         double u = uniform(rng_);
-        double k = 0.5; // k 越小，越偏向于 search_amax
-        double aturn = search_amax_ * std::pow(u, k);
-        double amag = clamp(aturn + acc_noise(rng_), 0.0, search_amax_);
-        // akeep 设计为在 -search_amax_/2 和 search_amax_/2 之间正态分布的随机值
-        std::normal_distribution<double> akeep_dist(0.0, search_amax_/4); // 均值0，标准差为amax/4
-        double akeep = akeep_dist(rng_);
-        akeep = clamp(akeep, -search_amax_/2, search_amax_/2);
-        acc.head(2) = amag * eright.head(2) + akeep* ev.head(2);
+        double aturn = search_amax_ * 0.7 * std::pow(u, 0.5);
+        aturn = clamp(aturn + acc_noise(rng_), 0.0, search_amax_ * 0.8);
+
+        // 前向加速度：保持正值以维持速度
+        double akeep = search_amax_ * 0.3;
+        if (v > search_vmax_ * 0.8) akeep = 0;
+        if (v < search_vmin_ * 1.5) akeep = search_amax_ * 0.5;
+
+        acc.head(2) = aturn * eright.head(2) + akeep * ev.head(2);
         if (acc.norm() > search_amax_) acc = acc.normalized() * search_amax_;
         break;
       }
@@ -476,36 +479,25 @@ public:
     }
   }
 
-  // 分标签GMM拟合与分布式共识（核心功能）
-  // 对每个标签l，单独筛选该标签下的粒子，计算本地统计量
-  std::vector<LabeledLocalStat> computeLabeledLocalStats();
-  
-  // 对每个标签的本地统计量，独立运行平均共识滤波
-  void labeledConsensusFilter(const std::vector<LabeledNeighborConsensus>& neighbor_consensus,
-                             const std::vector<LabeledLocalStat>& local_stats);
-  
-  // 获取每个标签的GMM参数（用于轨迹规划）
-  std::map<SearchIntent, std::vector<Eigen::VectorXd>> getLabeledGMMMeans() const;
-  std::map<SearchIntent, std::vector<Eigen::MatrixXd>> getLabeledGMMCovs() const;
-  std::map<SearchIntent, Eigen::VectorXd> getLabeledGMMPis() const;
-  
-  // 在 SearchParticlesManager 类的 public 部分添加以下声明（大约在第484行附近）：
-  std::map<SearchIntent, Eigen::VectorXd> getLabeledZetaAlpha() const;
-  std::map<SearchIntent, std::vector<Eigen::VectorXd>> getLabeledZetaA() const;
-  std::map<SearchIntent, std::vector<Eigen::MatrixXd>> getLabeledZetaB() const;
+  // ========== 以下为旧的标签化共识滤波接口（已弃用）==========
+  // std::vector<LabeledLocalStat> computeLabeledLocalStats();
+  // void labeledConsensusFilter(const std::vector<LabeledNeighborConsensus>& neighbor_consensus,
+  //                            const std::vector<LabeledLocalStat>& local_stats);
+  // std::map<SearchIntent, std::vector<Eigen::VectorXd>> getLabeledGMMMeans() const;
+  // std::map<SearchIntent, std::vector<Eigen::MatrixXd>> getLabeledGMMCovs() const;
+  // std::map<SearchIntent, Eigen::VectorXd> getLabeledGMMPis() const;
+  // std::map<SearchIntent, Eigen::VectorXd> getLabeledZetaAlpha() const;
+  // std::map<SearchIntent, std::vector<Eigen::VectorXd>> getLabeledZetaA() const;
+  // std::map<SearchIntent, std::vector<Eigen::MatrixXd>> getLabeledZetaB() const;
+  // void consensusFilterForLabel(SearchIntent label, ...);
+  // void globalMStepForLabel(SearchIntent label);
+  // ========== 旧接口结束 ==========
+
   // 从GMM采样新粒子（基于标准DPF实现）
   void sampleParticlesFromGMM();
-  
+
   // 计算有效粒子数（用于判断是否需要重采样）
   double computeEffectiveSampleSize() const;
-  
-  // 单标签共识滤波（内部使用）
-  void consensusFilterForLabel(SearchIntent label,
-                              const std::vector<LabeledNeighborConsensus>& neighbor_consensus,
-                              const LabeledLocalStat& local_stat);
-  
-  // 单标签全局M步（内部使用）
-  void globalMStepForLabel(SearchIntent label);
 
   // 获取粒子和权重（用于同步回DPF）
   inline std::pair<Eigen::MatrixXd, Eigen::VectorXd> getParticlesAndWeights() const {
@@ -603,8 +595,14 @@ public:
       search_particles_.push_back(particle);
     }
 
-    ROS_INFO("[sp_mgr%d] Initialized %d particles for label %s",
-             drone_id_, num_particles, getLabelName(my_label_));
+    double v_horiz = mean_vel.head(2).norm();
+    double yaw_init = std::atan2(mean_vel.y(), mean_vel.x());
+    ROS_INFO("[sp_mgr%d] Initialized %d particles for label %s, mean_vel=(%.3f,%.3f,%.3f), v_horiz=%.3f, yaw=%.3f deg",
+             drone_id_, num_particles, getLabelName(my_label_),
+             mean_vel.x(), mean_vel.y(), mean_vel.z(), v_horiz, yaw_init * 180.0 / M_PI);
+
+    // 记录初始位置
+    Eigen::Vector3d init_pos = mean_pos;
 
     // 步进 num_frames_back 步（初始化阶段不切换意图）
     for (int step = 0; step < num_frames_back; ++step) {
@@ -615,8 +613,16 @@ public:
 
     search_particles_initialized_ = true;
 
-    ROS_INFO("[sp_mgr%d] Label %s: %d particles stepped %d frames, ready",
-             drone_id_, getLabelName(my_label_), num_particles, num_frames_back);
+    // 计算步进后的均值位置
+    Eigen::Vector3d final_mean_pos = getSingleLabelMeanPosition();
+    Eigen::Vector3d displacement = final_mean_pos - init_pos;
+    double disp_angle = std::atan2(displacement.y(), displacement.x()) * 180.0 / M_PI;
+    double vel_angle = yaw_init * 180.0 / M_PI;
+
+    ROS_INFO("[sp_mgr%d] Label %s: %d particles stepped %d frames, displacement=(%.3f,%.3f,%.3f), disp_angle=%.1f deg, vel_angle=%.1f deg, diff=%.1f deg",
+             drone_id_, getLabelName(my_label_), num_particles, num_frames_back,
+             displacement.x(), displacement.y(), displacement.z(),
+             disp_angle, vel_angle, disp_angle - vel_angle);
   }
 
   // === 计算当前保持意图的概率（随帧数衰减：90% -> 60%） ===
@@ -965,6 +971,7 @@ public:
   }
 
 
+/* 调试函数已弃用
 // 调试：打印粒子分散趋势
 void debugPrintParticleDistribution(int frame_num) const {
   if (!search_particles_initialized_) return;
@@ -1057,6 +1064,7 @@ void debugPrintParticleDistribution(int frame_num) const {
   
   ROS_INFO("===========================================================\n");
 }
+调试函数结束 */
 
 private:
   // 成员变量
@@ -1100,6 +1108,9 @@ private:
   // 视线检查回调函数
   std::function<bool(const Eigen::Vector3d&, const Eigen::Vector3d&)> los_check_fn_;
 };
+
+// ========== 以下为旧的标签化共识滤波实现（已弃用，保留供参考）==========
+#if 0  // 旧代码开始
 
 // ================== 分标签GMM拟合与分布式共识实现 ==================
 // 对每个标签l，单独筛选该标签下的粒子，计算本地统计量
@@ -1419,3 +1430,6 @@ inline std::map<SearchIntent, std::vector<Eigen::MatrixXd>> SearchParticlesManag
   }
   return result;
 }
+
+#endif  // 旧代码结束
+// ========== 旧的标签化共识滤波实现结束 ==========

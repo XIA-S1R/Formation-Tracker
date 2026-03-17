@@ -167,7 +167,7 @@ void global_map_callback(const sensor_msgs::PointCloud2ConstPtr& msg) {
 }
 
 // === 发布搜索粒子可视化 ===
-void publishSearchParticlesVisualization() {
+/*void publishSearchParticlesVisualization() {
   if (!search_particles_manager_ || !search_particles_manager_->isInitialized()) return;
   
   const auto& search_particles = search_particles_manager_->getSearchParticles();
@@ -351,7 +351,7 @@ void publishGMMVisualization() {
   
   // 发布GMM可视化
   search_gmm_vis_pub_.publish(marker_array);
-}
+}*/
 
 // === LocalStats 消息 <-> 结构体转换 ===
 LocalStat fromMsg(const target_ekf::LocalStats::ConstPtr& msg) {
@@ -508,6 +508,21 @@ void hungarianAssignLabels(const std::vector<Eigen::Vector3d>& search_targets) {
   int n_labels = 3;  // STRAIGHT, LEFT_TURN, RIGHT_TURN
 
   ROS_INFO("[dpf%d] Hungarian assignment: %d drones, 3 labels", drone_id_, n_drones);
+
+  // 打印所有无人机位置
+  for (int d = 0; d < n_drones; ++d) {
+    ROS_INFO("[dpf%d]   drone%d pos: (%.2f, %.2f, %.2f)",
+             drone_id_, drone_positions[d].first,
+             drone_positions[d].second.x(), drone_positions[d].second.y(), drone_positions[d].second.z());
+  }
+
+  // 打印搜索目标点
+  const char* target_names[] = {"STRAIGHT", "LEFT_TURN", "RIGHT_TURN"};
+  for (int l = 0; l < n_labels; ++l) {
+    ROS_INFO("[dpf%d]   target %s: (%.2f, %.2f, %.2f)",
+             drone_id_, target_names[l],
+             search_targets[l].x(), search_targets[l].y(), search_targets[l].z());
+  }
 
   // 构建代价矩阵：drone到各搜索目标点的距离
   Eigen::MatrixXd cost_matrix(n_drones, n_labels);
@@ -781,186 +796,15 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     // --- 步骤2：负观测更新（删除在FOV内但未观测到目标的粒子，复制其他粒子补充）---
     search_particles_manager_->applyNegativeObservationDelete(cam_p, cam_q);
 
-    // --- 步骤3：标签化的E步，计算每个标签的本地统计量（所有节点执行）---
-    std::vector<LabeledLocalStat> local_labeled_stats = search_particles_manager_->computeLabeledLocalStats();
+    // --- 步骤3：发布搜索粒子可视化---
+    //publishSearchParticlesVisualization();
 
-    // --- 步骤4：收集邻居标签化共识状态---
-    std::vector<LabeledNeighborConsensus> neighbor_labeled_consensus;
-    {
-      std::lock_guard<std::mutex> lock(labeled_stats_mutex_);
-      ros::Time current_time = ros::Time::now();
-      double time_threshold = 0.3;
-      for (auto& kv : received_labeled_consensus_) {
-        if (kv.first != drone_id_) { // 不包括自己
-          for (const auto& labeled_nc : kv.second) {
-            double time_diff = (current_time - labeled_nc.timestamp).toSec();
-            if (time_diff < time_threshold) {
-              neighbor_labeled_consensus.push_back(labeled_nc);
-            }
-          }
-        }
-      }
-      // 清理过期数据
-      received_labeled_consensus_.clear();
-    }
-
-    // --- 步骤5：标签化的共识滤波（每个标签独立运行共识）---
-    search_particles_manager_->labeledConsensusFilter(neighbor_labeled_consensus, local_labeled_stats);
-
-    // ✅ 调试：打印前10帧的粒子分散趋势
-    static int search_frame_count = 0;
-    if (search_frame_count < 10) {
-      search_particles_manager_->debugPrintParticleDistribution(search_frame_count);
-      search_frame_count++;
-    } else if (search_frame_count == 10) {
-      ROS_INFO("[dpf%d] Search mode debug output completed (first 10 frames)", drone_id_);
-      search_frame_count++;
-    }
-    // --- 步骤5.1：发布搜索粒子可视化---
-    publishSearchParticlesVisualization();
-
-    // --- 步骤5.2：发布GMM分布可视化---
-    publishGMMVisualization();
-
-    // --- 步骤6：发布标签化共识状态（用于邻居间通信）---
-  auto zeta_alphas = search_particles_manager_->getLabeledZetaAlpha();
-  auto zeta_as = search_particles_manager_->getLabeledZetaA();
-  auto zeta_bs = search_particles_manager_->getLabeledZetaB();
-
-  for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
-    SearchIntent label = static_cast<SearchIntent>(label_int);
-
-    target_ekf::LabeledConsensusState labeled_consensus_msg;
-    labeled_consensus_msg.header.stamp = ros::Time::now();
-    labeled_consensus_msg.header.frame_id = "world";
-    labeled_consensus_msg.drone_id = drone_id_;
-    labeled_consensus_msg.label = static_cast<int>(label);
-    labeled_consensus_msg.num_components = search_particles_manager_->getNumComponents();
-    labeled_consensus_msg.state_dim = 9;
-    labeled_consensus_msg.has_obs = false;  // 搜索模式中总是false
-
-    // 填充ζ而不是u
-    auto& zeta_alpha = zeta_alphas[label];
-    auto& zeta_a = zeta_as[label];
-    auto& zeta_b = zeta_bs[label];
-
-    labeled_consensus_msg.alpha.resize(zeta_alpha.size());
-    for (int i = 0; i < zeta_alpha.size(); ++i) {
-      labeled_consensus_msg.alpha[i] = zeta_alpha(i);  // ✅ 发布ζ
-    }
-
-    labeled_consensus_msg.a.resize(zeta_a.size() * 9);
-    for (int c = 0; c < zeta_a.size(); ++c) {
-      for (int i = 0; i < 9; ++i) {
-        labeled_consensus_msg.a[c * 9 + i] = zeta_a[c](i);
-      }
-    }
-
-    labeled_consensus_msg.b.resize(zeta_b.size() * 9 * 9);
-    for (int c = 0; c < zeta_b.size(); ++c) {
-      for (int i = 0; i < 9; ++i) {
-        for (int j = 0; j < 9; ++j) {
-          labeled_consensus_msg.b[c * 9 * 9 + i * 9 + j] = zeta_b[c](i, j);
-        }
-      }
-    }
-
-    labeled_consensus_pub_.publish(labeled_consensus_msg);
-  }
-
-    // --- 步骤6.5：位置共识GMM拟合（不分标签，用于规划节点）---
-    // 从所有搜索粒子中提取位置，进行共识GMM拟合
-    const auto& search_particles = search_particles_manager_->getSearchParticles();
-    int num_components = search_particles_manager_->getNumComponents();
-
-    // 计算所有粒子位置的加权均值和协方差
-    Eigen::Vector3d pos_mean = Eigen::Vector3d::Zero();
-    double total_weight = 0.0;
-    for (const auto& p : search_particles) {
-      pos_mean += p.weight * p.state.head(3);
-      total_weight += p.weight;
-    }
-    if (total_weight > 1e-300) pos_mean /= total_weight;
-
-    // 计算位置协方差
-    Eigen::Matrix3d pos_cov = Eigen::Matrix3d::Zero();
-    for (const auto& p : search_particles) {
-      Eigen::Vector3d diff = p.state.head(3) - pos_mean;
-      pos_cov += p.weight * diff * diff.transpose();
-    }
-    if (total_weight > 1e-300) pos_cov /= total_weight;
-    pos_cov += Eigen::Matrix3d::Identity() * 1e-4;  // 保证正定
-
-    // 初始化位置GMM中心，围绕均值分散
-    std::vector<Eigen::Vector3d> pos_gmm_mu(num_components);
-    std::vector<Eigen::Matrix3d> pos_gmm_S(num_components);
-    Eigen::VectorXd pos_gmm_pi = Eigen::VectorXd::Constant(num_components, 1.0 / num_components);
-
-    std::normal_distribution<double> dist(0.0, 0.3);
-    for (int c = 0; c < num_components; ++c) {
-      pos_gmm_mu[c] = pos_mean;
-      for (int j = 0; j < 3; ++j) {
-        pos_gmm_mu[c](j) += dist(rng_);
-      }
-      pos_gmm_S[c] = pos_cov;
-    }
-
-    ROS_DEBUG_THROTTLE(1.0, "[dpf%d] Search mode position GMM: mean=(%.2f,%.2f,%.2f), det(S)=%.2e",
-                       drone_id_, pos_mean.x(), pos_mean.y(), pos_mean.z(), pos_cov.determinant());
-
-    // --- 步骤6.5.1：GMM中心帧间匹配 ---
-    matchGMMCenters(pos_gmm_mu, pos_gmm_pi);
-
-    // --- 步骤6.5.2：发布位置GMM给规划节点 ---
-    // 创建自定义消息或使用现有消息格式发布位置GMM
-    // 这里使用 LocalStats 消息的变体，只包含位置信息（3维）
-    target_ekf::LocalStats pos_gmm_msg;
-    pos_gmm_msg.header.stamp = ros::Time::now();
-    pos_gmm_msg.header.frame_id = "world";
-    pos_gmm_msg.drone_id = drone_id_;
-    pos_gmm_msg.num_components = num_components;
-    pos_gmm_msg.state_dim = 3;  // 只有位置，3维
-    pos_gmm_msg.has_observation = false;
-
-    // 打包GMM中心ID（用alpha存储）
-    pos_gmm_msg.alpha_local.resize(num_components);
-    for (int c = 0; c < num_components; ++c) {
-      pos_gmm_msg.alpha_local[c] = gmm_center_ids_[c];  // 存储持久ID
-    }
-
-    // 打包GMM中心位置（用a存储）
-    pos_gmm_msg.a_local.resize(num_components * 3);
-    for (int c = 0; c < num_components; ++c) {
-      for (int i = 0; i < 3; ++i) {
-        pos_gmm_msg.a_local[c * 3 + i] = pos_gmm_mu[c](i);
-      }
-    }
-
-    // 打包GMM权重（用zeta_alpha存储）
-    pos_gmm_msg.zeta_alpha.resize(num_components);
-    for (int c = 0; c < num_components; ++c) {
-      pos_gmm_msg.zeta_alpha[c] = pos_gmm_pi(c);
-    }
-
-    // 打包GMM协方差（用b存储3x3矩阵）
-    pos_gmm_msg.b_local.resize(num_components * 3 * 3);
-    for (int c = 0; c < num_components; ++c) {
-      for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-          pos_gmm_msg.b_local[c * 3 * 3 + i * 3 + j] = pos_gmm_S[c](i, j);
-        }
-      }
-    }
-
-    search_pos_gmm_pub_.publish(pos_gmm_msg);
-    ROS_DEBUG_THROTTLE(1.0, "[dpf%d] Published position GMM: %d components", drone_id_, num_components);
-
-    // --- 步骤7：发布搜索状态---
+    // --- 步骤4：发布搜索状态---
     std_msgs::Bool search_state_msg;
     search_state_msg.data = search_mode_active_;
     search_state_pub_.publish(search_state_msg);
 
-    // --- 步骤8：发布目标odom和标签信息（使用单标签粒子群均值位置）---
+    // --- 步骤5：发布目标odom和标签信息（使用单标签粒子群均值位置）---
     if (is_label_master_) {
       Eigen::Vector3d search_target_pos = search_particles_manager_->getSingleLabelMeanPosition();
 
@@ -1405,11 +1249,11 @@ int main(int argc, char** argv) {
     stats_subs_.push_back(nh.subscribe(labeled_topic, 10, &labeled_consensus_callback));
 
     // 订阅邻居无人机的odom（用于匈牙利分配）
-    std::string odom_topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_visual_slam/odom";
+    std::string odom_topic = "/drone" + std::to_string(i) + "/odom";
     neighbor_odom_subs_.push_back(
         nh.subscribe<nav_msgs::Odometry>(odom_topic, 10,
             boost::bind(&neighbor_odom_callback, _1, i)));
-    ROS_INFO("[dpf%d] Subscribing to neighbor %d: stats, labeled_consensus, odom", drone_id_, i);
+    ROS_INFO("[dpf%d] Subscribing to neighbor %d: stats, labeled_consensus, odom (%s)", drone_id_, i, odom_topic.c_str());
   }
   // 【核心】固定频率Timer执行DPF核心逻辑
   ros::Timer dpf_core_timer = nh.createTimer(ros::Duration(1.0 / dpf_rate_), &dpf_core_timer_callback);
