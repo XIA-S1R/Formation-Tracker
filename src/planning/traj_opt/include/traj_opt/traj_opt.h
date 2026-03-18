@@ -58,6 +58,8 @@ class TrajOpt {
   bool use_formation_;
   int formation_type_;
   Eigen::Vector3d formation_offset_;  // 本机在期望编队中的偏移（相对编队质心），仅供外部参考，不用于锁定 finState
+  bool use_soft_constraint_ = false;  // true: ESDF软约束, false: 走廊硬约束
+  bool emergency_recovery_ = false;   // 紧急刹车后首次规划：跳过编队+追踪代价
 
   // Absolute time at the start of each optimization call (fixed during one L-BFGS run)
   double t_now_;
@@ -80,6 +82,7 @@ class TrajOpt {
   TrajOpt(ros::NodeHandle& nh);
   ~TrajOpt() {}
 
+  // --- Soft constraint (ESDF) ---
   void setBoundConds(const Eigen::MatrixXd& iniState, const Eigen::MatrixXd& finState,
                      const std::vector<Eigen::Vector3d>& path = {});
   int optimize(const double& delta = 1e-4);
@@ -100,6 +103,19 @@ class TrajOpt {
                      const Eigen::MatrixXd& finState,
                      const std::vector<Eigen::MatrixXd>& hPolys,
                      Trajectory& traj);
+
+  // --- Hard constraint (corridor) ---
+  void setBoundCondsHard(const Eigen::MatrixXd& iniState, const Eigen::MatrixXd& finState);
+  int optimizeHard(const double& delta = 1e-4);
+  bool generate_traj_hard(const Eigen::MatrixXd& iniState,
+                          const Eigen::MatrixXd& finState,
+                          const std::vector<Eigen::Vector3d>& target_predcit,
+                          const std::vector<Eigen::MatrixXd>& hPolys,
+                          Trajectory& traj);
+  bool generate_traj_hard(const Eigen::MatrixXd& iniState,
+                          const Eigen::MatrixXd& finState,
+                          const std::vector<Eigen::MatrixXd>& hPolys,
+                          Trajectory& traj);
 
   void addTimeIntPenalty(double& cost);
   void addTimeCost(double& cost);

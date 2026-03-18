@@ -361,6 +361,7 @@ TrajOpt::TrajOpt(ros::NodeHandle& nh) : nh_(nh) {
   if (!nh.getParam("rhoSwarm", rhoSwarm_)) {
     rhoSwarm_ = 1000.0;
   }
+  nh.param("use_soft_constraint", use_soft_constraint_, false);
 
   // Initialize SwarmGraph
   swarm_graph_.reset(new SwarmGraph());
@@ -709,6 +710,219 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
   return true;
 }
 
+// === Hard constraint functions ===
+
+static inline double objectiveFuncHard(void* ptrObj,
+                                       const double* x,
+                                       double* grad,
+                                       const int n) {
+  TrajOpt& obj = *(TrajOpt*)ptrObj;
+
+  Eigen::Map<const Eigen::VectorXd> t(x, obj.dim_t_);
+  Eigen::Map<const Eigen::VectorXd> p(x + obj.dim_t_, obj.dim_p_);
+  Eigen::Map<Eigen::VectorXd> gradt(grad, obj.dim_t_);
+  Eigen::Map<Eigen::VectorXd> gradp(grad + obj.dim_t_, obj.dim_p_);
+  double deltaT = x[obj.dim_t_ + obj.dim_p_];
+
+  Eigen::VectorXd T(obj.N_);
+  Eigen::MatrixXd P(3, obj.N_ - 1);
+  double sumT = obj.sum_T_ + deltaT * deltaT;
+  forwardT(t, sumT, T);
+  forwardP(p, obj.cfgVs_, P);
+
+  obj.jerkOpt_.generate(P, T);
+  double cost = obj.jerkOpt_.getTrajJerkCost();
+  obj.jerkOpt_.calGrads_CT();
+
+  obj.debug_cost_corridor_  = 0;
+  obj.debug_cost_vel_       = 0;
+  obj.debug_cost_acc_       = 0;
+  obj.debug_cost_collision_ = 0;
+  obj.debug_cost_formation_ = 0;
+  obj.debug_cost_tracking_  = 0;
+  obj.debug_cost_vis_       = 0;
+
+  obj.addTimeIntPenalty(cost);
+  obj.addTimeCost(cost);
+  obj.jerkOpt_.calGrads_PT();
+  grad[obj.dim_t_ + obj.dim_p_] = obj.jerkOpt_.gdT.dot(T) / sumT + obj.rhoT_;
+  cost += obj.rhoT_ * deltaT * deltaT;
+  grad[obj.dim_t_ + obj.dim_p_] *= 2 * deltaT;
+  addLayerTGrad(t, sumT, obj.jerkOpt_.gdT, gradt);
+  addLayerPGrad(p, obj.cfgVs_, obj.jerkOpt_.gdP, gradp);
+
+  if (obj.debug_print_once_) {
+    obj.debug_print_once_ = false;
+    printf("\033[36m[drone %d cost] corridor=%.1f  vel=%.1f  acc=%.1f  "
+           "collision=%.1f  formation=%.1f  tracking=%.1f  vis=%.1f  total=%.1f\033[0m\n",
+           obj.drone_id_,
+           obj.debug_cost_corridor_, obj.debug_cost_vel_, obj.debug_cost_acc_,
+           obj.debug_cost_collision_, obj.debug_cost_formation_,
+           obj.debug_cost_tracking_, obj.debug_cost_vis_, cost);
+  }
+
+  return cost;
+}
+
+void TrajOpt::setBoundCondsHard(const Eigen::MatrixXd& iniState,
+                                const Eigen::MatrixXd& finState) {
+  Eigen::MatrixXd initS = iniState;
+  Eigen::MatrixXd finalS = finState;
+  double tempNorm = initS.col(1).norm();
+  initS.col(1) *= tempNorm > vmax_ ? (vmax_ / tempNorm) : 1.0;
+  tempNorm = finalS.col(1).norm();
+  finalS.col(1) *= tempNorm > vmax_ ? (vmax_ / tempNorm) : 1.0;
+  tempNorm = initS.col(2).norm();
+  initS.col(2) *= tempNorm > amax_ ? (amax_ / tempNorm) : 1.0;
+  tempNorm = finalS.col(2).norm();
+  finalS.col(2) *= tempNorm > amax_ ? (amax_ / tempNorm) : 1.0;
+
+  Eigen::VectorXd T(N_);
+  T.setConstant(sum_T_ / N_);
+  backwardT(T, t_);
+  Eigen::MatrixXd P(3, N_ - 1);
+  for (int i = 0; i < N_ - 1; ++i) {
+    int k = cfgVs_[i].cols() - 1;
+    P.col(i) = cfgVs_[i].rightCols(k).rowwise().sum() / (1.0 + k) + cfgVs_[i].col(0);
+  }
+  backwardP(P, cfgVs_, p_);
+  jerkOpt_.reset(initS, finalS, N_);
+  return;
+}
+
+int TrajOpt::optimizeHard(const double& delta) {
+  t_now_ = ros::Time::now().toSec();
+  debug_print_once_ = true;
+
+  lbfgs::lbfgs_parameter_t lbfgs_params;
+  lbfgs::lbfgs_load_default_parameters(&lbfgs_params);
+  lbfgs_params.mem_size = 16;
+  lbfgs_params.past = 3;
+  lbfgs_params.g_epsilon = 0.1;
+  lbfgs_params.min_step = 1e-32;
+  lbfgs_params.delta = delta;
+  lbfgs_params.max_iterations = 60;
+  Eigen::Map<Eigen::VectorXd> t(x_, dim_t_);
+  Eigen::Map<Eigen::VectorXd> p(x_ + dim_t_, dim_p_);
+  t = t_;
+  p = p_;
+  double minObjective;
+  auto ret = lbfgs::lbfgs_optimize(dim_t_ + dim_p_ + 1, x_, &minObjective,
+                                   &objectiveFuncHard, nullptr,
+                                   &earlyExit, this, &lbfgs_params);
+  std::cout << "\033[32m"
+            << "ret: " << ret << "\033[0m" << std::endl;
+  t_ = t;
+  p_ = p;
+
+  // Print final cost breakdown after optimization
+  {
+    Eigen::VectorXd T(N_);
+    Eigen::MatrixXd P(3, N_ - 1);
+    double sumT = sum_T_ + x_[dim_p_ + dim_t_] * x_[dim_p_ + dim_t_];
+    forwardT(t_, sumT, T);
+    forwardP(p_, cfgVs_, P);
+    jerkOpt_.generate(P, T);
+    double final_cost = jerkOpt_.getTrajJerkCost();
+    jerkOpt_.calGrads_CT();
+    debug_cost_corridor_ = 0;
+    debug_cost_vel_ = 0;
+    debug_cost_acc_ = 0;
+    debug_cost_collision_ = 0;
+    debug_cost_formation_ = 0;
+    debug_cost_tracking_ = 0;
+    debug_cost_vis_ = 0;
+    addTimeIntPenalty(final_cost);
+    addTimeCost(final_cost);
+    printf("\033[33m[drone %d FINAL ret=%d] corridor=%.1f  vel=%.1f  acc=%.1f  "
+           "collision=%.1f  formation=%.1f  tracking=%.1f  vis=%.1f  total=%.1f\033[0m\n",
+           drone_id_, ret,
+           debug_cost_corridor_, debug_cost_vel_, debug_cost_acc_,
+           debug_cost_collision_, debug_cost_formation_,
+           debug_cost_tracking_, debug_cost_vis_, final_cost);
+  }
+  return ret;
+}
+
+bool TrajOpt::generate_traj_hard(const Eigen::MatrixXd& iniState,
+                                 const Eigen::MatrixXd& finState,
+                                 const std::vector<Eigen::Vector3d>& target_predcit,
+                                 const std::vector<Eigen::MatrixXd>& hPolys,
+                                 Trajectory& traj) {
+  landing_ = false;
+  cfgHs_ = hPolys;
+  if (cfgHs_.size() == 1) {
+    cfgHs_.push_back(cfgHs_[0]);
+  }
+  if (!extractVs(cfgHs_, cfgVs_)) {
+    ROS_ERROR("extractVs fail!");
+    return false;
+  }
+  N_ = 2 * cfgHs_.size();
+  sum_T_ = tracking_dur_;
+  dim_t_ = N_ - 1;
+  dim_p_ = 0;
+  for (const auto& cfgV : cfgVs_) {
+    dim_p_ += cfgV.cols() - 1;
+  }
+  p_.resize(dim_p_);
+  t_.resize(dim_t_);
+  x_ = new double[dim_p_ + dim_t_ + 1];
+  Eigen::VectorXd T(N_);
+  Eigen::MatrixXd P(3, N_ - 1);
+  tracking_ps_ = target_predcit;
+  setBoundCondsHard(iniState, finState);
+  x_[dim_p_ + dim_t_] = 0.1;
+  int opt_ret = optimizeHard();
+  // 对齐软约束：不因 ret<0 丢弃结果，交给后续碰撞检查
+  double sumT = sum_T_ + x_[dim_p_ + dim_t_] * x_[dim_p_ + dim_t_];
+  forwardT(t_, sumT, T);
+  forwardP(p_, cfgVs_, P);
+  jerkOpt_.generate(P, T);
+  traj = jerkOpt_.getTraj();
+  delete[] x_;
+  return true;
+}
+
+bool TrajOpt::generate_traj_hard(const Eigen::MatrixXd& iniState,
+                                 const Eigen::MatrixXd& finState,
+                                 const std::vector<Eigen::MatrixXd>& hPolys,
+                                 Trajectory& traj) {
+  landing_ = false;
+  cfgHs_ = hPolys;
+  if (cfgHs_.size() == 1) {
+    cfgHs_.push_back(cfgHs_[0]);
+  }
+  if (!extractVs(cfgHs_, cfgVs_)) {
+    ROS_ERROR("extractVs fail!");
+    return false;
+  }
+  N_ = 2 * cfgHs_.size();
+  sum_T_ = tracking_dur_;
+  dim_t_ = N_ - 1;
+  dim_p_ = 0;
+  for (const auto& cfgV : cfgVs_) {
+    dim_p_ += cfgV.cols() - 1;
+  }
+  p_.resize(dim_p_);
+  t_.resize(dim_t_);
+  x_ = new double[dim_p_ + dim_t_ + 1];
+  Eigen::VectorXd T(N_);
+  Eigen::MatrixXd P(3, N_ - 1);
+  tracking_ps_.clear();
+  setBoundCondsHard(iniState, finState);
+  x_[dim_p_ + dim_t_] = 0.1;
+  int opt_ret = optimizeHard();
+  // 对齐软约束：不因 ret<0 丢弃结果，交给后续碰撞检查
+  double sumT = sum_T_ + x_[dim_p_ + dim_t_] * x_[dim_p_ + dim_t_];
+  forwardT(t_, sumT, T);
+  forwardP(p_, cfgVs_, P);
+  jerkOpt_.generate(P, T);
+  traj = jerkOpt_.getTraj();
+  delete[] x_;
+  return true;
+}
+
 void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度走廊约束、加速度约束代价，并加到总成本中；同时计算这些约束的梯度，并加到总梯度中
   Eigen::Vector3d pos, vel, acc, jer;
   Eigen::Vector3d grad_tmp;
@@ -751,24 +965,25 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度走�
       // Accumulated trajectory time at this sample point
       double t_sample = t_acc + s1;
 
-      // === OLD corridor penalty (hard constraint mode) ===
-      // if (grad_cost_p_corridor(pos, hPoly, grad_tmp, cost_tmp)) {
-      //   gradViolaPc = beta0 * grad_tmp.transpose();
-      //   gradViolaPt = alpha * grad_tmp.transpose() * vel;
-      //   jerkOpt_.gdC.block<6, 3>(i * 6, 0) += omg * step * gradViolaPc;
-      //   jerkOpt_.gdT(i) += omg * (cost_tmp / K_ + step * gradViolaPt);
-      //   cost += omg * step * cost_tmp;
-      //   debug_cost_corridor_ += omg * step * cost_tmp;
-      // }
-
-      // === NEW obstacle penalty (soft constraint mode, gridmap-based) ===
-      if (grad_cost_obstacle(pos, grad_tmp, cost_tmp)) {
-        gradViolaPc = beta0 * grad_tmp.transpose();
-        gradViolaPt = alpha * grad_tmp.transpose() * vel;
-        jerkOpt_.gdC.block<6, 3>(i * 6, 0) += omg * step * gradViolaPc;
-        jerkOpt_.gdT(i) += omg * (cost_tmp / K_ + step * gradViolaPt);
-        cost += omg * step * cost_tmp;
-        debug_cost_corridor_ += omg * step * cost_tmp;
+      // === corridor / obstacle penalty (switched by use_soft_constraint_) ===
+      if (use_soft_constraint_) {
+        if (grad_cost_obstacle(pos, grad_tmp, cost_tmp)) {
+          gradViolaPc = beta0 * grad_tmp.transpose();
+          gradViolaPt = alpha * grad_tmp.transpose() * vel;
+          jerkOpt_.gdC.block<6, 3>(i * 6, 0) += omg * step * gradViolaPc;
+          jerkOpt_.gdT(i) += omg * (cost_tmp / K_ + step * gradViolaPt);
+          cost += omg * step * cost_tmp;
+          debug_cost_corridor_ += omg * step * cost_tmp;
+        }
+      } else {
+        if (grad_cost_p_corridor(pos, hPoly, grad_tmp, cost_tmp)) {
+          gradViolaPc = beta0 * grad_tmp.transpose();
+          gradViolaPt = alpha * grad_tmp.transpose() * vel;
+          jerkOpt_.gdC.block<6, 3>(i * 6, 0) += omg * step * gradViolaPc;
+          jerkOpt_.gdT(i) += omg * (cost_tmp / K_ + step * gradViolaPt);
+          cost += omg * step * cost_tmp;
+          debug_cost_corridor_ += omg * step * cost_tmp;
+        }
       }
       if (grad_cost_v(vel, grad_tmp, cost_tmp)) {
         gradViolaVc = beta1 * grad_tmp.transpose();
@@ -806,7 +1021,7 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度走�
 
       // ---- Formation cost ----
       // 只在轨迹前2/3部分计算编队代价（对齐swarm-formation，避免末端约束冲突）
-      if (use_formation_ && t_sample > 0 && t_sample < sum_T_ * 2.0 / 3.0) {
+      if (use_formation_ && !emergency_recovery_ && t_sample > 0 && t_sample < sum_T_ * 2.0 / 3.0) {
         double gradt_form = 0, grad_prev_t_form = 0, costp_form = 0;
         if (grad_cost_swarm_formation(i, t_sample, pos, vel,
                                        grad_tmp, gradt_form, grad_prev_t_form, costp_form)) {
@@ -1000,6 +1215,7 @@ bool TrajOpt::grad_cost_swarm_formation(const int piece,
 }
 
 void TrajOpt::addTimeCost(double& cost) {
+  if (emergency_recovery_) return;  // 紧急恢复：跳过追踪代价
   const auto& T = jerkOpt_.T1;
   int piece = 0;
   int M = tracking_ps_.size() * 4 / 5;

@@ -125,9 +125,9 @@ class Nodelet : public nodelet::Nodelet {
       double xy_dist = std::sqrt(delta.x() * delta.x() + delta.y() * delta.y());
       if (xy_dist > sensor_range_) continue;
 
-      // vertical angle: -30° to 30°
+      // vertical angle: -90° to 90°
       double z_angle_rad = std::atan2(delta.z(), xy_dist);
-      if (z_angle_rad < -M_PI / 6.0 || z_angle_rad > M_PI / 6.0) continue;
+      if (z_angle_rad < -M_PI / 2.0 || z_angle_rad > M_PI / 2.0) continue;
 
       obs_pts.push_back(p);
     }

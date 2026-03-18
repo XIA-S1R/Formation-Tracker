@@ -74,8 +74,8 @@
       <remap from="~triger"          to="/move_base_simple/goal"/>
       <param name="plan_hz"          value="20"/>
       <param name="K"                value="8"/>
-      <param name="vmax"             value="1.5"/>
-      <param name="amax"             value="2.5"/>
+      <param name="vmax"             value="3"/>
+      <param name="amax"             value="6"/>
       <param name="rhoT"             value="100.0"/>
       <param name="rhoP"             value="10000.0"/>
       <param name="rhoV"             value="1000.0"/>

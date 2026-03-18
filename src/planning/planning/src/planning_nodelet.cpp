@@ -107,6 +107,59 @@ class Nodelet : public nodelet::Nodelet {
     traj_msg.traj_id = traj_id_++;
     traj_pub_.publish(traj_msg);
   }
+  // 紧急刹车：生成5阶多项式刹车轨迹，显式规划减速到零
+  void emergency_brake(const Eigen::MatrixXd& iniState, const ros::Time& stamp) {
+    Eigen::Vector3d p0 = iniState.col(0);
+    Eigen::Vector3d v0 = iniState.col(1);
+    Eigen::Vector3d a0 = iniState.col(2);
+    double v_norm = v0.norm();
+    if (v_norm < 0.3) {
+      pub_hover_p(p0, stamp);
+      return;
+    }
+    // 刹车时间: v/a_max, 至少0.5s
+    double a_max = 5.0;
+    double T = std::max(v_norm / a_max, 0.5);
+    // 刹车终点(匀减速近似)，沿速度方向检查障碍物安全性
+    Eigen::Vector3d pf_ideal = p0 + v0 * T * 0.5;
+    Eigen::Vector3d dir = v0.normalized();
+    double max_d = (pf_ideal - p0).norm();
+    Eigen::Vector3d pf = p0;
+    for (double d = 0.1; d <= max_d; d += 0.1) {
+      Eigen::Vector3d c = p0 + d * dir;
+      if (gridmapPtr_->isOccupied(c)) break;
+      pf = c;
+    }
+    // 解5阶多项式系数: p(t)=c5+c4*t+c3*t^2+c2*t^3+c1*t^4+c0*t^5
+    // 边界: p(0)=p0,v(0)=v0,a(0)=a0, p(T)=pf,v(T)=0,a(T)=0
+    double T2=T*T, T3=T2*T, T4=T3*T, T5=T4*T;
+    Eigen::Matrix3d A;
+    A <<   T3,    T4,     T5,
+         3*T2,  4*T3,   5*T4,
+         6*T,  12*T2,  20*T3;
+    Eigen::Matrix3d Ainv = A.inverse();
+    CoefficientMat cMat;
+    cMat.setZero();
+    cMat.col(5) = p0;
+    cMat.col(4) = v0;
+    cMat.col(3) = a0 / 2.0;
+    for (int d = 0; d < 3; d++) {
+      Eigen::Vector3d rhs(pf(d) - p0(d) - v0(d)*T - a0(d)/2.0*T2,
+                          -v0(d) - a0(d)*T,
+                          -a0(d));
+      Eigen::Vector3d sol = Ainv * rhs;
+      cMat(d, 2) = sol(0);
+      cMat(d, 1) = sol(1);
+      cMat(d, 0) = sol(2);
+    }
+    std::vector<double> durs = {T};
+    std::vector<CoefficientMat> cMats = {cMat};
+    Trajectory traj(durs, cMats);
+    double yaw = atan2(v0.y(), v0.x());
+    pub_traj(traj, yaw, stamp);
+    traj_poly_ = traj;
+    replan_stamp_ = stamp;
+  }
   void pub_traj(const Trajectory& traj, const double& yaw, const ros::Time& stamp) {
     quadrotor_msgs::PolyTraj traj_msg;
     traj_msg.hover = false;
@@ -467,7 +520,9 @@ class Nodelet : public nodelet::Nodelet {
     while (gridmap_lock_.test_and_set())
       ;
     gridmapPtr_->from_msg(map_msg_);
-    gridmapPtr_->updateESDF();  // 规划端自己算 ESDF（from_msg 只传占据数据）
+    if (trajOptPtr_->use_soft_constraint_) {
+      gridmapPtr_->updateESDF();  // 软约束模式需要 ESDF
+    }
     replanStateMsg_.occmap = map_msg_;
     gridmap_lock_.clear();
     ROS_DEBUG("[drone %d] gridmap_lock released", trajOptPtr_->drone_id_);
@@ -646,7 +701,11 @@ class Nodelet : public nodelet::Nodelet {
       //   generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, traj);
       // }
       ROS_DEBUG("[drone %d] starting traj optimization", trajOptPtr_->drone_id_);
-      generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, path, traj);
+      if (trajOptPtr_->use_soft_constraint_) {
+        generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, path, traj);
+      } else {
+        generate_new_traj_success = trajOptPtr_->generate_traj_hard(iniState, finState, target_predcit, hPolys, traj);
+      }
       ROS_DEBUG("[drone %d] traj optimization done: %d", trajOptPtr_->drone_id_, generate_new_traj_success);
 
       visPtr_->visualize_traj(traj, "traj");
@@ -666,6 +725,7 @@ class Nodelet : public nodelet::Nodelet {
     }
     if (valid) {
       force_hover_ = false;
+      trajOptPtr_->emergency_recovery_ = false;
       ROS_WARN("[drone %d planner] REPLAN SUCCESS", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 0;
       replanState_pub_.publish(replanStateMsg_);
@@ -692,7 +752,8 @@ class Nodelet : public nodelet::Nodelet {
       ROS_FATAL("[drone %d planner] EMERGENCY STOP!!!", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 2;
       replanState_pub_.publish(replanStateMsg_);
-      pub_hover_p(iniState.col(0), replan_stamp);
+      trajOptPtr_->emergency_recovery_ = true;
+      emergency_brake(iniState, replan_stamp);
       return;
     } else {
       // Update map with latest data before executing old trajectory
@@ -703,13 +764,15 @@ class Nodelet : public nodelet::Nodelet {
         ROS_FATAL("[drone %d planner] EMERGENCY STOP - OLD TRAJ INVALID WITH LATEST MAP!!!", trajOptPtr_->drone_id_);
         replanStateMsg_.state = 2;
         replanState_pub_.publish(replanStateMsg_);
-        pub_hover_p(iniState.col(0), replan_stamp);
+        trajOptPtr_->emergency_recovery_ = true;
+        emergency_brake(iniState, replan_stamp);
         return;
       }
 
       ROS_ERROR("[drone %d planner] REPLAN FAILED, EXECUTE LAST TRAJ...", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 3;
       replanState_pub_.publish(replanStateMsg_);
+      trajOptPtr_->emergency_recovery_ = true;
       return;  // current generated traj invalid but last is valid
     }
     visPtr_->visualize_traj(traj, "traj");
@@ -874,6 +937,7 @@ class Nodelet : public nodelet::Nodelet {
     }
     if (valid) {
       force_hover_ = false;
+      trajOptPtr_->emergency_recovery_ = false;
       ROS_WARN("[planner] REPLAN SUCCESS");
       replanStateMsg_.state = 0;
       replanState_pub_.publish(replanStateMsg_);
@@ -894,7 +958,8 @@ class Nodelet : public nodelet::Nodelet {
       ROS_FATAL("[drone %d planner] EMERGENCY STOP!!!", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 2;
       replanState_pub_.publish(replanStateMsg_);
-      pub_hover_p(iniState.col(0), replan_stamp);
+      trajOptPtr_->emergency_recovery_ = true;
+      emergency_brake(iniState, replan_stamp);
       return;
     } else {
       // Update map with latest data before executing old trajectory
@@ -908,13 +973,15 @@ class Nodelet : public nodelet::Nodelet {
         ROS_FATAL("[drone %d planner] EMERGENCY STOP - OLD TRAJ INVALID WITH LATEST MAP!!!", trajOptPtr_->drone_id_);
         replanStateMsg_.state = 2;
         replanState_pub_.publish(replanStateMsg_);
-        pub_hover_p(iniState.col(0), replan_stamp);
+        trajOptPtr_->emergency_recovery_ = true;
+      emergency_brake(iniState, replan_stamp);
         return;
       }
 
       ROS_ERROR("[drone %d planner] REPLAN FAILED, EXECUTE LAST TRAJ...", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 3;
       replanState_pub_.publish(replanStateMsg_);
+      trajOptPtr_->emergency_recovery_ = true;
       return;  // current generated traj invalid but last is valid
     }
     visPtr_->visualize_traj(traj, "traj");
