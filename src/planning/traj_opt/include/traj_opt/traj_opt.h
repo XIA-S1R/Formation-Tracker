@@ -3,6 +3,7 @@
 
 #include "minco.hpp"
 #include <swarm_graph/swarm_graph.hpp>
+#include <mapping/mapping.h>
 
 struct SwarmTrajData {
   int drone_id = -1;
@@ -28,6 +29,8 @@ class TrajOpt {
   double rhoTracking_, rhosVisibility_;
   double clearance_d_, tolerance_d_, theta_clearance_;
   double rhoSwarm_;
+  // gridmap pointer for obstacle distance penalty
+  mapping::OccGridMap* mapPtr_ = nullptr;
   // corridor
   std::vector<Eigen::MatrixXd> cfgVs_;
   std::vector<Eigen::MatrixXd> cfgHs_;
@@ -77,7 +80,8 @@ class TrajOpt {
   TrajOpt(ros::NodeHandle& nh);
   ~TrajOpt() {}
 
-  void setBoundConds(const Eigen::MatrixXd& iniState, const Eigen::MatrixXd& finState);
+  void setBoundConds(const Eigen::MatrixXd& iniState, const Eigen::MatrixXd& finState,
+                     const std::vector<Eigen::Vector3d>& path = {});
   int optimize(const double& delta = 1e-4);
   bool generate_traj(const Eigen::MatrixXd& iniState,
                      const Eigen::MatrixXd& finState,
@@ -90,6 +94,7 @@ class TrajOpt {
                      const Eigen::MatrixXd& finState,
                      const std::vector<Eigen::Vector3d>& target_predcit,
                      const std::vector<Eigen::MatrixXd>& hPolys,
+                     const std::vector<Eigen::Vector3d>& path,
                      Trajectory& traj);
   bool generate_traj(const Eigen::MatrixXd& iniState,
                      const Eigen::MatrixXd& finState,
@@ -100,6 +105,7 @@ class TrajOpt {
   void addTimeCost(double& cost);
   void setDesiredFormation(int type);
   void setSwarmTrajs(const std::vector<SwarmTrajData>& swarm_trajs) { swarm_trajs_ = swarm_trajs; }
+  void setMap(mapping::OccGridMap* map) { mapPtr_ = map; }
 
   // Formation cost
   bool grad_cost_swarm_formation(const int piece,
@@ -125,6 +131,10 @@ class TrajOpt {
                             const Eigen::MatrixXd& hPoly,
                             Eigen::Vector3d& gradp,
                             double& costp);
+  // Gridmap-based smooth obstacle penalty (replaces corridor penalty in soft constraint mode)
+  bool grad_cost_obstacle(const Eigen::Vector3d& p,
+                          Eigen::Vector3d& gradp,
+                          double& costp);
   bool grad_cost_p_tracking(const Eigen::Vector3d& p,
                             const Eigen::Vector3d& target_p,
                             Eigen::Vector3d& gradp,

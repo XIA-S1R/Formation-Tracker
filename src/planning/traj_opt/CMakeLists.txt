@@ -9,12 +9,13 @@ find_package(Eigen3 REQUIRED)
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   swarm_graph
+  mapping
 )
 
 catkin_package(
   INCLUDE_DIRS include ${EIGEN3_INCLUDE_DIR}
   LIBRARIES ${PROJECT_NAME}
-  CATKIN_DEPENDS roscpp swarm_graph
+  CATKIN_DEPENDS roscpp swarm_graph mapping
   DEPENDS EIGEN3
 )
 

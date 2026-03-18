@@ -375,6 +375,7 @@ class Nodelet : public nodelet::Nodelet {
     target_q.x() = replanStateMsg_.target.pose.pose.orientation.x;
     target_q.y() = replanStateMsg_.target.pose.pose.orientation.y;
     target_q.z() = replanStateMsg_.target.pose.pose.orientation.z;
+    Eigen::Vector3d raw_target_p = target_p;  // 保存原始目标位置（编队偏移前）
 
     // NOTE detect ekf reset
     if (last_target_p_valid_) {
@@ -418,25 +419,30 @@ class Nodelet : public nodelet::Nodelet {
                           trajOptPtr_->drone_id_, target_p.x(), target_p.y(), target_p.z(),
                           search_desired_yaw_ * 180.0 / M_PI);
       } else {
-        target_p.z() += 1.0;// 追踪目标定在目标上方1m处
+        target_p.z() += 0.3;// 追踪目标定在目标上方1m处
 
-        // 仿照 Swarm-Formation：每架无人机终点 = 目标位置 + 本机编队偏移
-        // 路径搜索、走廊、finState 全部自然对齐到本机专属位置
+        // 仿照 Swarm-Formation：每架无人机终点 = 目标位置 + 编队偏移（放缩到 tracking_dist_ 圆环上）
+        // 原始编队偏移归一化后乘以 tracking_dist_，使无人机分布在以目标为中心的圆环上
         if (trajOptPtr_->use_formation_) {
-          target_p += trajOptPtr_->formation_offset_;
+          Eigen::Vector3d offset = trajOptPtr_->formation_offset_;
+          double r = offset.head(2).norm();
+          if (r > 1e-3) {
+            target_p += offset * (tracking_dist_ / r);
+          }
         }
       }
 
       // NOTE determin whether to replan
-      Eigen::Vector3d dp = target_p - odom_p;
+      
       // std::cout << "dist : " << dp.norm() << std::endl;
       double desired_yaw;
       if (search_mode_active_) {
         // 搜索模式：使用分配的期望偏航角（增加搜索覆盖面）
         desired_yaw = search_desired_yaw_;
       } else {
-        // 追踪模式：朝向目标方向
-        desired_yaw = std::atan2(dp.y(), dp.x());
+        // 追踪模式：朝向原始目标方向
+        Eigen::Vector3d dp_yaw = raw_target_p - odom_p;
+        desired_yaw = std::atan2(dp_yaw.y(), dp_yaw.x());
       }
       Eigen::Vector3d project_yaw = odom_q.toRotationMatrix().col(0);  // NOTE ZYX
       double now_yaw = std::atan2(project_yaw.y(), project_yaw.x());
@@ -461,6 +467,7 @@ class Nodelet : public nodelet::Nodelet {
     while (gridmap_lock_.test_and_set())
       ;
     gridmapPtr_->from_msg(map_msg_);
+    gridmapPtr_->updateESDF();  // 规划端自己算 ESDF（from_msg 只传占据数据）
     replanStateMsg_.occmap = map_msg_;
     gridmap_lock_.clear();
     ROS_DEBUG("[drone %d] gridmap_lock released", trajOptPtr_->drone_id_);
@@ -515,9 +522,16 @@ class Nodelet : public nodelet::Nodelet {
       iniState.col(1) = odom_v;
     } else {//上次规划的轨迹还没执行完就重规划，就从上次规划的轨迹状态重新规划，保证新轨迹和上次规划的轨迹衔接平滑
       // should replan from the last trajectory
-      iniState.col(0) = traj_poly_.getPos(replan_t);
-      iniState.col(1) = traj_poly_.getVel(replan_t);
-      iniState.col(2) = traj_poly_.getAcc(replan_t);
+      Eigen::Vector3d traj_pos = traj_poly_.getPos(replan_t);
+      if ((traj_pos - odom_p).norm() > 0.5) {
+        ROS_WARN("[drone %d] traj-odom drift %.2fm, replan from odom", trajOptPtr_->drone_id_, (traj_pos - odom_p).norm());
+        iniState.col(0) = odom_p;
+        iniState.col(1) = odom_v;
+      } else {
+        iniState.col(0) = traj_pos;
+        iniState.col(1) = traj_poly_.getVel(replan_t);
+        iniState.col(2) = traj_poly_.getAcc(replan_t);
+      }
     }
     replanStateMsg_.header.stamp = ros::Time::now();
     replanStateMsg_.iniState.resize(9);
@@ -540,8 +554,18 @@ class Nodelet : public nodelet::Nodelet {
     if (generate_new_traj_success) {
       // 统一使用 short_astar 搜索到目标位置（终点调整已在 short_astar 内部处理）
       ROS_DEBUG("[drone %d] starting path search", trajOptPtr_->drone_id_);
-      generate_new_traj_success = envPtr_->short_astar(p_start, target_p, path);
+      Eigen::Vector3d actual_target;
+      generate_new_traj_success = envPtr_->short_astar(p_start, target_p, path, &actual_target);;
       ROS_DEBUG("[drone %d] path search done: %d", trajOptPtr_->drone_id_, generate_new_traj_success);
+
+      // 如果目标位置被调整过，预测轨迹也要相应偏移
+      if (generate_new_traj_success && (actual_target - target_p).norm() > 0.01) {
+        Eigen::Vector3d offset = actual_target - target_p;
+        for (auto& p : target_predcit) {
+          p += offset;
+        }
+        ROS_DEBUG("[drone %d] target adjusted, offset prediction by %.2fm", trajOptPtr_->drone_id_, offset.norm());
+      }
       // 原可见路径逻辑（已注释）:
       // if (land_triger_received_) {
       //   generate_new_traj_success = envPtr_->short_astar(p_start, target_p, path);
@@ -557,9 +581,23 @@ class Nodelet : public nodelet::Nodelet {
     Trajectory traj;
     if (generate_new_traj_success) {
       visPtr_->visualize_path(path, "astar");
-      // 统一拼接预测轨迹（不再区分 land_triger）
+      // 对预测轨迹做点间避障搜索
+      // 注意：pts2path 会清空 path，所以需要先保存 short_astar 的路径
+      std::vector<Eigen::Vector3d> astar_path = path;  // 保存前半段
+
+      std::vector<Eigen::Vector3d> predict_waypts;
+      predict_waypts.push_back(astar_path.back());  // 从 short_astar 终点开始
       for (const auto& p : target_predcit) {
-        path.push_back(p);
+        predict_waypts.push_back(p);
+      }
+
+      std::vector<Eigen::Vector3d> predict_path;
+      envPtr_->pts2path(predict_waypts, predict_path);  // 预测轨迹的避障路径
+
+      // 合并：astar_path + predict_path（去掉重复的连接点）
+      path = astar_path;
+      for (size_t i = 1; i < predict_path.size(); ++i) {
+        path.push_back(predict_path[i]);
       }
       // 原可见区域逻辑（已注释）:
       // if (land_triger_received_) {
@@ -597,7 +635,7 @@ class Nodelet : public nodelet::Nodelet {
       // NOTE trajectory optimization
       Eigen::MatrixXd finState;
       finState.setZero(3, 3);
-      finState.col(0) = target_predcit.back();  // 统一用预测终点
+      finState.col(0) = path.back();  // 用路径终点（pts2path 处理后的安全点）
       finState.col(1) = target_v;
       // 原逻辑（已注释）:
       // if (land_triger_received_) {
@@ -608,7 +646,7 @@ class Nodelet : public nodelet::Nodelet {
       //   generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, traj);
       // }
       ROS_DEBUG("[drone %d] starting traj optimization", trajOptPtr_->drone_id_);
-      generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, traj);
+      generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, path, traj);
       ROS_DEBUG("[drone %d] traj optimization done: %d", trajOptPtr_->drone_id_, generate_new_traj_success);
 
       visPtr_->visualize_traj(traj, "traj");
@@ -616,6 +654,10 @@ class Nodelet : public nodelet::Nodelet {
 
     // NOTE collision check
     bool valid = false;
+    // 从消息更新网格地图
+    while (gridmap_lock_.test_and_set());
+    gridmapPtr_->from_msg(map_msg_);
+    gridmap_lock_.clear();
     if (generate_new_traj_success) {
       valid = validcheck(traj, replan_stamp);
     } else {
@@ -627,7 +669,7 @@ class Nodelet : public nodelet::Nodelet {
       ROS_WARN("[drone %d planner] REPLAN SUCCESS", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 0;
       replanState_pub_.publish(replanStateMsg_);
-      Eigen::Vector3d dp = target_p + target_v * 0.03 - iniState.col(0);
+      Eigen::Vector3d dp = raw_target_p + target_v * 0.03 - iniState.col(0);
       // NOTE : if the drone is going to unknown areas, watch that direction
       // Eigen::Vector3d un_known_p = traj.getPos(1.0);
       // if (gridmapPtr_->isUnKnown(un_known_p)) {
@@ -654,9 +696,6 @@ class Nodelet : public nodelet::Nodelet {
       return;
     } else {
       // Update map with latest data before executing old trajectory
-      while (gridmap_lock_.test_and_set());
-      gridmapPtr_->from_msg(map_msg_);
-      gridmap_lock_.clear();
 
       // Verify old trajectory with latest map
       if (!validcheck(traj_poly_, replan_stamp_)) {
@@ -765,9 +804,16 @@ class Nodelet : public nodelet::Nodelet {
       iniState.col(1) = odom_v;
     } else {//上次规划的轨迹还没执行完就重规划，就从上次规划的轨迹状态重新规划，保证新轨迹和上次规划的轨迹衔接平滑
       // should replan from the last trajectory
-      iniState.col(0) = traj_poly_.getPos(replan_t);
-      iniState.col(1) = traj_poly_.getVel(replan_t);
-      iniState.col(2) = traj_poly_.getAcc(replan_t);
+      Eigen::Vector3d traj_pos = traj_poly_.getPos(replan_t);
+      if ((traj_pos - odom_p).norm() > 1.0) {
+        ROS_WARN("[drone %d] traj-odom drift %.2fm, replan from odom", trajOptPtr_->drone_id_, (traj_pos - odom_p).norm());
+        iniState.col(0) = odom_p;
+        iniState.col(1) = odom_v;
+      } else {
+        iniState.col(0) = traj_pos;
+        iniState.col(1) = traj_poly_.getVel(replan_t);
+        iniState.col(2) = traj_poly_.getAcc(replan_t);
+      }
     }
     replanStateMsg_.header.stamp = ros::Time::now();
     replanStateMsg_.iniState.resize(9);
@@ -961,7 +1007,7 @@ class Nodelet : public nodelet::Nodelet {
       finState.col(1) = target_v;
 
       generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState,
-                                                             target_predcit, hPolys, traj);
+                                                             target_predcit, hPolys, path, traj);
       visPtr_->visualize_traj(traj, "traj");
     }
     if (!generate_new_traj_success) {
@@ -990,11 +1036,20 @@ class Nodelet : public nodelet::Nodelet {
     }
   }
 
-  bool validcheck(const Trajectory& traj, const ros::Time& t_start, const double& check_dur = 1.0) {
+  bool validcheck(const Trajectory& traj, const ros::Time& t_start, const double& check_dur = 2.0) {
     double t0 = (ros::Time::now() - t_start).toSec();
     t0 = t0 > 0.0 ? t0 : 0.0;
-    double delta_t = check_dur < traj.getTotalDuration() ? check_dur : traj.getTotalDuration();
-    for (double t = t0; t < t0 + delta_t; t += 0.01) {
+    double total_dur = traj.getTotalDuration();
+
+    // 如果轨迹已经过期，认为无效
+    if (t0 >= total_dur) {
+      ROS_WARN_THROTTLE(1.0, "[validcheck] trajectory expired: t0=%.2f >= total_dur=%.2f", t0, total_dur);
+      return false;
+    }
+
+    // 检查从当前时刻到轨迹结束或 check_dur 内的碰撞
+    double t_end = std::min(t0 + check_dur, total_dur);
+    for (double t = t0; t < t_end; t += 0.01) {
       Eigen::Vector3d p = traj.getPos(t);
       if (gridmapPtr_->isOccupied(p)) {
         return false;
@@ -1019,6 +1074,7 @@ class Nodelet : public nodelet::Nodelet {
     envPtr_ = std::make_shared<env::Env>(nh, gridmapPtr_);
     visPtr_ = std::make_shared<visualization::Visualization>(nh);
     trajOptPtr_ = std::make_shared<traj_opt::TrajOpt>(nh);
+    trajOptPtr_->setMap(gridmapPtr_.get());
     prePtr_ = std::make_shared<prediction::Predict>(nh);
 
     heartbeat_pub_ = nh.advertise<std_msgs::Empty>("heartbeat", 10);

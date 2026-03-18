@@ -4,8 +4,14 @@
 #include <ros/ros.h>
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/Imu.h>
+#include <sensor_msgs/PointCloud2.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <tf/transform_broadcaster.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <csignal>
 
 namespace so3_quadrotor {
 class Nodelet : public nodelet::Nodelet {
@@ -14,9 +20,14 @@ class Nodelet : public nodelet::Nodelet {
   Control control_;
   Cmd cmd_;
   ros::Publisher odom_pub_, imu_pub_, vis_pub_;
-  ros::Subscriber cmd_sub_;
+  ros::Subscriber cmd_sub_, map_sub_;
   ros::Timer simulation_timer;
   tf::TransformBroadcaster tf_br_;
+
+  // collision detection
+  pcl::KdTreeFLANN<pcl::PointXYZ> kdtree_;
+  bool map_received_ = false;
+  double collision_radius_ = 0.3;  // 碰撞半径
 
   // parameters
   int simulation_rate_ = 1e3;
@@ -48,6 +59,28 @@ class Nodelet : public nodelet::Nodelet {
     cmd_.current_yaw      = cmd_msg->aux.current_yaw;
     cmd_.use_external_yaw = cmd_msg->aux.use_external_yaw;
   }
+
+  void map_callback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
+    if (map_received_) return;  // 只接收一次
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::fromROSMsg(*msg, *cloud);
+    if (cloud->empty()) return;
+    kdtree_.setInputCloud(cloud);
+    map_received_ = true;
+    ROS_INFO("[so3_quadrotor] Global map received, collision detection enabled.");
+  }
+
+  bool checkCollision(const Eigen::Vector3d& pos) {
+    if (!map_received_) return false;
+    pcl::PointXYZ search_point(pos.x(), pos.y(), pos.z());
+    std::vector<int> indices(1);
+    std::vector<float> distances(1);
+    if (kdtree_.nearestKSearch(search_point, 1, indices, distances) > 0) {
+      return distances[0] < collision_radius_ * collision_radius_;
+    }
+    return false;
+  }
+
   void timer_callback(const ros::TimerEvent& event) {
     auto last_control = control_;
     control_ = quadrotorPtr_->getControl(cmd_);
@@ -62,6 +95,15 @@ class Nodelet : public nodelet::Nodelet {
     if (tnow >= next_odom_pub_time) {
       next_odom_pub_time += ros::Duration(1.0/odom_rate_);
       const Eigen::Vector3d&     pos = quadrotorPtr_->getPos();
+
+      // 碰撞检测
+      if (checkCollision(pos)) {
+        ROS_FATAL("\n\n========== COLLISION DETECTED! Drone crashed at (%.2f, %.2f, %.2f) ==========\n",
+                  pos.x(), pos.y(), pos.z());
+        ros::Duration(0.5).sleep();  // 给日志输出一点时间
+        std::raise(SIGINT);  // 发送中断信号，停止所有 ROS 节点
+      }
+
       const Eigen::Vector3d&     vel = quadrotorPtr_->getVel();
       const Eigen::Vector3d&     acc = quadrotorPtr_->getAcc();
       const Eigen::Quaterniond& quat = quadrotorPtr_->getQuat();
@@ -165,6 +207,7 @@ class Nodelet : public nodelet::Nodelet {
     nh.getParam("min_rpm", config.min_rpm);
     nh.getParam("simulation_rate", simulation_rate_);
     nh.getParam("odom_rate", odom_rate_);
+    nh.param("collision_radius", collision_radius_, 0.3);
 
     quadrotorPtr_ = std::make_shared<Quadrotor>(config);
     quadrotorPtr_->setPos(Eigen::Vector3d(init_x, init_y, init_z));
@@ -183,6 +226,7 @@ class Nodelet : public nodelet::Nodelet {
     imu_pub_  = nh.advertise<sensor_msgs::Imu>("imu", 10);
     vis_pub_= nh.advertise<visualization_msgs::MarkerArray>("vis", 10);
     cmd_sub_  = nh.subscribe<quadrotor_msgs::SO3Command>("so3cmd", 10, &Nodelet::cmd_callback, this, ros::TransportHints().tcpNoDelay());
+    map_sub_  = nh.subscribe<sensor_msgs::PointCloud2>("/global_map", 1, &Nodelet::map_callback, this);
     simulation_timer = nh.createTimer(ros::Duration(1.0/simulation_rate_), &Nodelet::timer_callback, this);
 
     odom_msg_.header.frame_id = "world";

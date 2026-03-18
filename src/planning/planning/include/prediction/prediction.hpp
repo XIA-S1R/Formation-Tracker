@@ -62,6 +62,15 @@ struct Predict {
                       const Eigen::Vector3d& target_v,
                       std::vector<Eigen::Vector3d>& target_predcit,
                       const double& max_time = 0.1) {
+    // 检查起点是否在障碍物内（容忍估计误差）
+    bool start_in_obstacle = map.isOccupied(target_p);
+    auto isValidLocal = [&](const Eigen::Vector3d& p, const Eigen::Vector3d& v) -> bool {
+      if (start_in_obstacle && (p - target_p).norm() < 0.5) {
+        return (v.norm() < vmax);  // 起点附近不检查障碍物
+      }
+      return (v.norm() < vmax) && (!map.isOccupied(p));
+    };
+
     auto score = [&](const NodePtr& ptr) -> double {
       return rho_a * ptr->a.norm();
     };
@@ -89,7 +98,7 @@ struct Predict {
         for (input.y() = -3; input.y() <= 3; input.y() += 3) {
           Eigen::Vector3d p = curPtr->p + curPtr->v * dt + input * dt2_2;
           Eigen::Vector3d v = curPtr->v + input * dt;
-          if (!isValid(p, v)) {
+          if (!isValidLocal(p, v)) {
             continue;
           }
           if (stack_top == MAX_MEMORY) {

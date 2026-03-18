@@ -20,24 +20,24 @@
 
     <param name="plan_hz"        value="20"/>
     <param name="K"              value="8"/>
-    <param name="vmax"           value="1.5"/>
-    <param name="amax"           value="3.0"/>
+    <param name="vmax"           value="3.0"/>
+    <param name="amax"           value="6.0"/>
     <param name="rhoT"           value="10.0"/>
-    <param name="rhoP"           value="10000.0"/>
+    <param name="rhoP"           value="1000000.0"/>
     <param name="rhoV"           value="1000.0"/>
     <param name="rhoA"           value="1000.0"/>
     <param name="rhoTracking"    value="$(arg rhoTracking_)"/><!-- 追踪成本的权重 -->
     <param name="rhosVisibility" value="$(arg rhosVisibility_)"/><!-- 可视性成本的权重 -->
     <param name="theta_clearance" value="0.8"/><!-- 距离可视区域边界的安全间隙 -->
     <param name="clearance_d"    value="0.5"/><!-- 距离障碍物的安全间隙 -->
-    <param name="tolerance_d"    value="0.3"/>
+    <param name="tolerance_d"    value="0.5"/>
     <param name="tracking_dist"  value="2.5"/><!-- 希望维持的跟踪距离 -->
     <param name="tracking_dur"   value="3.0"/><!-- 跟踪规划规划未来3s的轨迹 -->
     <param name="tracking_dt"    value="0.2"/><!-- 采样间隔，用于计算代价 -->
     <param name="debug"          value="false"/>
 
     <param name="prediction/rho_a" value="1.0"/><!-- A*搜索中对加速度的惩罚 -->
-    <param name="prediction/vmax"  value="1.5"/>
+    <param name="prediction/vmax"  value="4.0"/>
     <param name="num_drones"       value="$(arg num_drones)" type="int"/>
 
     <!-- Swarm / formation parameters -->
@@ -48,7 +48,7 @@
            value="$(eval 1 if arg('formation_type_') == 'hexagon' else (2 if arg('formation_type_') == 'triangle' else 0))" type="int"/>
     <param name="optimization/use_formation"
            value="$(eval arg('formation_type_') != 'none')" type="bool"/>
-    <param name="optimization/weight_formation"  value="1000.0"/><!-- 编队保持权重 -->
+    <param name="optimization/weight_formation"  value="100000.0"/><!-- 编队保持权重 -->
     <param name="optimization/formation_size"
            value="$(eval 7 if arg('formation_type_') == 'hexagon' else (3 if arg('formation_type_') == 'triangle' else 0))" type="int"/>
 

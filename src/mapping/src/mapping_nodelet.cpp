@@ -140,6 +140,7 @@ class Nodelet : public nodelet::Nodelet {
     gridmap_msg.header.stamp = ros::Time::now();
 
     gridmap_.updateMap(sensor_p, obs_pts);
+    gridmap_.updateESDF();
 
     if (use_mask_) {
       while (target_lock_.test_and_set());

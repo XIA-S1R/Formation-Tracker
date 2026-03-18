@@ -104,13 +104,13 @@ Maps::randomMapGenerate()
   info.nh_private->param("height_min", _h_l, 2.0);
   info.nh_private->param("height_max", _h_h, 10.0);
   info.nh_private->param("obstacle_number", _obs_num, 30);
-  info.nh_private->param("circle_number", circle_num_, 30);
+  info.nh_private->param("circle_number", circle_num_, 10);
   info.nh_private->param("radius_min", radius_l_, 0.5);
   info.nh_private->param("radius_max", radius_h_, 2.0);
   info.nh_private->param("z_min", z_l_, 0.7);
   info.nh_private->param("z_max", z_h_, 3.0);
   info.nh_private->param("theta", theta_, 0.5);
-  info.nh_private->param("min_distance", _min_dist, 0.8);
+  info.nh_private->param("min_distance", _min_dist, 2.0);
 
   // 确保参数合理
   _h_l = _h_l >= 0 ? _h_l : 0;

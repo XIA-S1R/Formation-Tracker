@@ -229,4 +229,160 @@ void OccGridMap::inflate(int inflate_size) {
   inflate_last();
 }
 
+// ---- ESDF implementation ----
+
+template <typename F_get, typename F_set>
+void OccGridMap::fillESDF(F_get f_get, F_set f_set, int start, int end) {
+  int n = end - start + 1;
+  if (n <= 0) return;
+  // Felzenszwalb's 1D squared-distance transform
+  std::vector<int> v_arr(n);
+  std::vector<double> z_arr(n + 1);
+  int k = 0;
+  v_arr[0] = start;
+  z_arr[0] = -1e18;
+  z_arr[1] = 1e18;
+
+  for (int q = start + 1; q <= end; q++) {
+    double s;
+    k++;
+    do {
+      k--;
+      s = ((f_get(q) + (double)q * q) - (f_get(v_arr[k]) + (double)v_arr[k] * v_arr[k])) /
+          (2.0 * q - 2.0 * v_arr[k]);
+    } while (s <= z_arr[k]);
+    k++;
+    v_arr[k] = q;
+    z_arr[k] = s;
+    z_arr[k + 1] = 1e18;
+  }
+
+  k = 0;
+  for (int q = start; q <= end; q++) {
+    while (z_arr[k + 1] < q) k++;
+    double val = (double)(q - v_arr[k]) * (q - v_arr[k]) + f_get(v_arr[k]);
+    f_set(q, val);
+  }
+}
+
+void OccGridMap::updateESDF() {
+  int total = size_x * size_y * size_z;
+  esdf_buffer_.resize(total);
+  esdf_tmp1_.resize(total);
+  esdf_tmp2_.resize(total);
+
+  // Pass 1: along Z
+  for (int rx = 0; rx < size_x; rx++) {
+    for (int ry = 0; ry < size_y; ry++) {
+      fillESDF(
+          [&](int rz) -> double {
+            Eigen::Vector3i id(offset_x + rx, offset_y + ry, offset_z + rz);
+            return (infocc.atId(id) == 1) ? 0.0 : 1e10;
+          },
+          [&](int rz, double val) { esdf_tmp1_[esdfAddr(rx, ry, rz)] = val; },
+          0, size_z - 1);
+    }
+  }
+
+  // Pass 2: along Y
+  for (int rx = 0; rx < size_x; rx++) {
+    for (int rz = 0; rz < size_z; rz++) {
+      fillESDF(
+          [&](int ry) -> double { return esdf_tmp1_[esdfAddr(rx, ry, rz)]; },
+          [&](int ry, double val) { esdf_tmp2_[esdfAddr(rx, ry, rz)] = val; },
+          0, size_y - 1);
+    }
+  }
+
+  // Pass 3: along X → final distance
+  for (int ry = 0; ry < size_y; ry++) {
+    for (int rz = 0; rz < size_z; rz++) {
+      fillESDF(
+          [&](int rx) -> double { return esdf_tmp2_[esdfAddr(rx, ry, rz)]; },
+          [&](int rx, double val) {
+            esdf_buffer_[esdfAddr(rx, ry, rz)] = resolution * std::sqrt(val);
+          },
+          0, size_x - 1);
+    }
+  }
+
+  esdf_valid_ = true;
+}
+
+void OccGridMap::evaluateEDT(const Eigen::Vector3d& pos, double& dist) const {
+  if (!esdf_valid_) { dist = 0; return; }
+
+  // Continuous position to relative float index
+  double fx = (pos.x() / resolution - 0.5) - offset_x;
+  double fy = (pos.y() / resolution - 0.5) - offset_y;
+  double fz = (pos.z() / resolution - 0.5) - offset_z;
+
+  int x0 = (int)std::floor(fx), y0 = (int)std::floor(fy), z0 = (int)std::floor(fz);
+  double dx = fx - x0, dy = fy - y0, dz = fz - z0;
+
+  // Clamp to valid range
+  auto clamp = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+  int x1 = clamp(x0 + 1, 0, size_x - 1); x0 = clamp(x0, 0, size_x - 1);
+  int y1 = clamp(y0 + 1, 0, size_y - 1); y0 = clamp(y0, 0, size_y - 1);
+  int z1 = clamp(z0 + 1, 0, size_z - 1); z0 = clamp(z0, 0, size_z - 1);
+
+  // Trilinear interpolation
+  double d000 = esdf_buffer_[esdfAddr(x0,y0,z0)], d100 = esdf_buffer_[esdfAddr(x1,y0,z0)];
+  double d010 = esdf_buffer_[esdfAddr(x0,y1,z0)], d110 = esdf_buffer_[esdfAddr(x1,y1,z0)];
+  double d001 = esdf_buffer_[esdfAddr(x0,y0,z1)], d101 = esdf_buffer_[esdfAddr(x1,y0,z1)];
+  double d011 = esdf_buffer_[esdfAddr(x0,y1,z1)], d111 = esdf_buffer_[esdfAddr(x1,y1,z1)];
+
+  double v00 = (1-dx)*d000 + dx*d100;
+  double v10 = (1-dx)*d010 + dx*d110;
+  double v01 = (1-dx)*d001 + dx*d101;
+  double v11 = (1-dx)*d011 + dx*d111;
+  double v0 = (1-dy)*v00 + dy*v10;
+  double v1 = (1-dy)*v01 + dy*v11;
+  dist = (1-dz)*v0 + dz*v1;
+}
+
+void OccGridMap::evaluateFirstGrad(const Eigen::Vector3d& pos, Eigen::Vector3d& grad) const {
+  if (!esdf_valid_) { grad.setZero(); return; }
+
+  double fx = (pos.x() / resolution - 0.5) - offset_x;
+  double fy = (pos.y() / resolution - 0.5) - offset_y;
+  double fz = (pos.z() / resolution - 0.5) - offset_z;
+
+  int x0 = (int)std::floor(fx), y0 = (int)std::floor(fy), z0 = (int)std::floor(fz);
+  double dx = fx - x0, dy = fy - y0, dz = fz - z0;
+
+  auto clamp = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+  int x1 = clamp(x0 + 1, 0, size_x - 1); x0 = clamp(x0, 0, size_x - 1);
+  int y1 = clamp(y0 + 1, 0, size_y - 1); y0 = clamp(y0, 0, size_y - 1);
+  int z1 = clamp(z0 + 1, 0, size_z - 1); z0 = clamp(z0, 0, size_z - 1);
+
+  double d000 = esdf_buffer_[esdfAddr(x0,y0,z0)], d100 = esdf_buffer_[esdfAddr(x1,y0,z0)];
+  double d010 = esdf_buffer_[esdfAddr(x0,y1,z0)], d110 = esdf_buffer_[esdfAddr(x1,y1,z0)];
+  double d001 = esdf_buffer_[esdfAddr(x0,y0,z1)], d101 = esdf_buffer_[esdfAddr(x1,y0,z1)];
+  double d011 = esdf_buffer_[esdfAddr(x0,y1,z1)], d111 = esdf_buffer_[esdfAddr(x1,y1,z1)];
+
+  double inv_res = 1.0 / resolution;
+
+  // dF/dx
+  double v00 = (1-dx)*d000 + dx*d100;
+  double v10 = (1-dx)*d010 + dx*d110;
+  double v01 = (1-dx)*d001 + dx*d101;
+  double v11 = (1-dx)*d011 + dx*d111;
+
+  // grad z
+  double e0 = (1-dy)*v00 + dy*v10;
+  double e1 = (1-dy)*v01 + dy*v11;
+  grad[2] = (e1 - e0) * inv_res;
+
+  // grad y
+  grad[1] = ((1-dz)*(v10 - v00) + dz*(v11 - v01)) * inv_res;
+
+  // grad x
+  grad[0]  = (1-dz)*(1-dy)*(d100 - d000);
+  grad[0] += (1-dz)*dy*(d110 - d010);
+  grad[0] += dz*(1-dy)*(d101 - d001);
+  grad[0] += dz*dy*(d111 - d011);
+  grad[0] *= inv_res;
+}
+
 }  // namespace mapping

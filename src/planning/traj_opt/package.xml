@@ -18,5 +18,6 @@
   <depend>traj_utils</depend>
   <depend>path_searching</depend>
   <depend>swarm_graph</depend>
+  <depend>mapping</depend>
 
 </package>

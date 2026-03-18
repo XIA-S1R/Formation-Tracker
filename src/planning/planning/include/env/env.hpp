@@ -717,9 +717,11 @@ class Env {
 
   inline bool short_astar(const Eigen::Vector3d& start_p,
                           const Eigen::Vector3d& end_p,
-                          std::vector<Eigen::Vector3d>& path) {
+                          std::vector<Eigen::Vector3d>& path,
+                          Eigen::Vector3d* actual_end_p = nullptr) {
     Eigen::Vector3i start_idx = mapPtr_->pos2idx(start_p);
     Eigen::Vector3i end_idx = mapPtr_->pos2idx(end_p);
+    Eigen::Vector3d adjusted_end = end_p;
 
     // 如果终点被占用，沿 终点→起点 方向回退找空闲点
     if (mapPtr_->isOccupied(end_idx)) {
@@ -727,8 +729,8 @@ class Env {
       double step = mapPtr_->resolution;
       bool found = false;
       for (double d = step; d < 5.0; d += step) {
-        Eigen::Vector3d adjusted = end_p + dir * d;
-        Eigen::Vector3i adj_idx = mapPtr_->pos2idx(adjusted);
+        adjusted_end = end_p + dir * d;
+        Eigen::Vector3i adj_idx = mapPtr_->pos2idx(adjusted_end);
         if (!mapPtr_->isOccupied(adj_idx)) {
           end_idx = adj_idx;
           found = true;
@@ -739,6 +741,11 @@ class Env {
         std::cout << "[short astar] end occupied, no free point along retreat dir!" << std::endl;
         return false;
       }
+    }
+
+    // 返回实际使用的终点
+    if (actual_end_p) {
+      *actual_end_p = adjusted_end;
     }
 
     if (start_idx == end_idx) {

@@ -334,9 +334,9 @@ struct DistributedPF {
     return ls;
   }
 
-  // === 论文公式(26)：平均共识滤波（所有节点执行，严格对齐论文）===
-  // 【关键修复】仅用邻居的ζ状态计算差值，完全对齐公式
-  inline void consensusFilter(const std::vector<NeighborConsensus>& neighbor_consensus, const LocalStat& local_stat) {
+  // === 论文公式(26)：单次共识滤波更新（所有节点执行）===
+  // 【修复】移除内部循环，改为单次更新，外层由emStep控制迭代
+  inline void consensusFilterOnce(const std::vector<NeighborConsensus>& neighbor_consensus, const LocalStat& local_stat) {
     // 未初始化时，用邻居统计量初始化
     if (!initialized_ && !neighbor_consensus.empty()) {
       for (const auto& nc : neighbor_consensus) {
@@ -358,44 +358,41 @@ struct DistributedPF {
     double adaptive_epsilon = 1.0 / d_max;
     adaptive_epsilon = std::min(adaptive_epsilon, 0.3); // 上限0.3保证稳定
 
-    for (int iter = 0; iter < num_consensus_iters_; ++iter) {
-      for (int c = 0; c < C_; ++c) {
-        // 1. 严格用邻居的共识状态ζ_j计算差值（论文公式26求和项）
-        double alpha_diff = 0.0;
-        Eigen::VectorXd a_diff = Eigen::VectorXd::Zero(nx_);
-        Eigen::MatrixXd b_diff = Eigen::MatrixXd::Zero(nx_, nx_);
+    // 单次共识更新（不再内部循环）
+    for (int c = 0; c < C_; ++c) {
+      // 1. 严格用邻居的共识状态ζ_j计算差值（论文公式26求和项）
+      double alpha_diff = 0.0;
+      Eigen::VectorXd a_diff = Eigen::VectorXd::Zero(nx_);
+      Eigen::MatrixXd b_diff = Eigen::MatrixXd::Zero(nx_, nx_);
 
-        int valid_neighbor = 0;
-        for (const auto& nc : neighbor_consensus) {
-          if (!nc.has_obs) continue;
-          alpha_diff += nc.zeta_alpha(c) - zeta_alpha_(c);
-          a_diff += nc.zeta_a[c] - zeta_a_[c];
-          b_diff += nc.zeta_b[c] - zeta_b_[c];
-          valid_neighbor++;
-        }
-
-        // 2. 本地统计量处理：无观测节点完全跟随邻居，不贡献本地信息
-        double local_alpha = 0.0;
-        Eigen::VectorXd local_a = Eigen::VectorXd::Zero(nx_);
-        Eigen::MatrixXd local_b = Eigen::MatrixXd::Zero(nx_, nx_);
-
-        if (local_stat.has_obs) {
-          // 有观测节点：贡献本地统计量u
-          local_alpha = local_stat.alpha(c);
-          local_a = local_stat.a[c];
-          local_b = local_stat.b[c];
-        } else {
-          // 无观测节点：本地项=当前ζ，(u-ζ)=0，完全跟随邻居
-          local_alpha = zeta_alpha_(c);
-          local_a = zeta_a_[c];
-          local_b = zeta_b_[c];
-        }
-
-        // 3. 论文公式(26)迭代更新共识状态ζ
-        zeta_alpha_(c) += adaptive_epsilon * (alpha_diff + (local_alpha - zeta_alpha_(c)));
-        zeta_a_[c] += adaptive_epsilon * (a_diff + (local_a - zeta_a_[c]));
-        zeta_b_[c] += adaptive_epsilon * (b_diff + (local_b - zeta_b_[c]));
+      for (const auto& nc : neighbor_consensus) {
+        if (!nc.has_obs) continue;
+        alpha_diff += nc.zeta_alpha(c) - zeta_alpha_(c);
+        a_diff += nc.zeta_a[c] - zeta_a_[c];
+        b_diff += nc.zeta_b[c] - zeta_b_[c];
       }
+
+      // 2. 本地统计量处理：无观测节点完全跟随邻居，不贡献本地信息
+      double local_alpha = 0.0;
+      Eigen::VectorXd local_a = Eigen::VectorXd::Zero(nx_);
+      Eigen::MatrixXd local_b = Eigen::MatrixXd::Zero(nx_, nx_);
+
+      if (local_stat.has_obs) {
+        // 有观测节点：贡献本地统计量u
+        local_alpha = local_stat.alpha(c);
+        local_a = local_stat.a[c];
+        local_b = local_stat.b[c];
+      } else {
+        // 无观测节点：本地项=当前ζ，(u-ζ)=0，完全跟随邻居
+        local_alpha = zeta_alpha_(c);
+        local_a = zeta_a_[c];
+        local_b = zeta_b_[c];
+      }
+
+      // 3. 论文公式(26)单次更新共识状态ζ
+      zeta_alpha_(c) += adaptive_epsilon * (alpha_diff + (local_alpha - zeta_alpha_(c)));
+      zeta_a_[c] += adaptive_epsilon * (a_diff + (local_a - zeta_a_[c]));
+      zeta_b_[c] += adaptive_epsilon * (b_diff + (local_b - zeta_b_[c]));
     }
   }
 
@@ -421,16 +418,18 @@ struct DistributedPF {
     if (pi_sum > 1e-300) gmm_pi_ /= pi_sum;
   }
 
-  // === 论文Section V：单步EM迭代（适配ROS异步系统，单时间步执行1次）===
-  // 【关键修复】移除单回调内的循环，改为单时间步1次迭代，避免过期数据
+  // === 论文Section V：EM迭代（每帧多次迭代，每次迭代重新计算本地统计量）===
+  // 【修复】正确的EM迭代：每次迭代都用新GMM重新计算本地统计量
   inline void emStep(int drone_id, const std::vector<NeighborConsensus>& neighbor_consensus, LocalStat& local_stat) {
-    // 1. 执行共识滤波，收敛全局统计量ζ
-    consensusFilter(neighbor_consensus, local_stat);
-    // 2. 执行M步，更新GMM
-    globalMStep();
-    // 3. 有观测节点：用新的GMM重新计算本地统计量，为下一次迭代做准备
-    if (local_stat.has_obs) {
-      local_stat = computeLocalStatsOnly(drone_id, true);
+    for (int iter = 0; iter < num_em_iters_; ++iter) {
+      // 1. 用当前GMM参数计算本地统计量（E步）
+      local_stat = computeLocalStatsOnly(drone_id, local_stat.has_obs);
+
+      // 2. 单次共识滤波更新
+      consensusFilterOnce(neighbor_consensus, local_stat);
+
+      // 3. M步更新GMM参数
+      globalMStep();
     }
   }
 

@@ -3,6 +3,8 @@
 
 #include <Eigen/Core>
 #include <vector>
+#include <cmath>
+#include <limits>
 
 namespace mapping {
 
@@ -277,6 +279,33 @@ struct OccGridMap {
   void inflate_xy();
   void inflate_last();
   void inflate(int inflate_size);
+
+  // ---- ESDF (Euclidean Signed Distance Field) ----
+ private:
+  std::vector<double> esdf_buffer_;       // flat buffer [size_x * size_y * size_z]
+  std::vector<double> esdf_tmp1_;
+  std::vector<double> esdf_tmp2_;
+  bool esdf_valid_ = false;
+
+  inline int esdfAddr(int rx, int ry, int rz) const {
+    return (rz * size_y + ry) * size_x + rx;
+  }
+
+  // 1D Felzenszwalb distance transform on a row
+  template <typename F_get, typename F_set>
+  void fillESDF(F_get f_get, F_set f_set, int start, int end);
+
+ public:
+  // Recompute ESDF over the entire local map (call after updateMap)
+  void updateESDF();
+
+  // Query distance at world position (trilinear interpolation)
+  void evaluateEDT(const Eigen::Vector3d& pos, double& dist) const;
+
+  // Query gradient of distance field (trilinear interpolation)
+  void evaluateFirstGrad(const Eigen::Vector3d& pos, Eigen::Vector3d& grad) const;
+
+  inline bool esdfReady() const { return esdf_valid_; }
 };
 
 }  // namespace mapping

@@ -6,23 +6,26 @@ set(CMAKE_BUILD_TYPE "Release")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall")
 
 find_package(Eigen3 REQUIRED)
+find_package(PCL REQUIRED)
 find_package(catkin REQUIRED COMPONENTS
   quadrotor_msgs
   roscpp
   nodelet
   tf
+  pcl_conversions
 )
 
 catkin_package(
   INCLUDE_DIRS include ${EIGEN3_INCLUDE_DIR}
-  CATKIN_DEPENDS quadrotor_msgs roscpp nodelet tf
-  DEPENDS EIGEN3
+  CATKIN_DEPENDS quadrotor_msgs roscpp nodelet tf pcl_conversions
+  DEPENDS EIGEN3 PCL
 )
 
 include_directories(
   include
   ${EIGEN3_INCLUDE_DIR}
   ${catkin_INCLUDE_DIRS}
+  ${PCL_INCLUDE_DIRS}
 )
 
 add_library(${PROJECT_NAME}_nodelet
@@ -31,6 +34,7 @@ add_library(${PROJECT_NAME}_nodelet
 
 target_link_libraries(${PROJECT_NAME}_nodelet
   ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
 )
 
 add_dependencies(${PROJECT_NAME}_nodelet
