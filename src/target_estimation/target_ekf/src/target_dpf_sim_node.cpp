@@ -100,7 +100,7 @@ ros::Time last_global_obs_time_;
 Eigen::Vector3d committed_search_dir_ = Eigen::Vector3d::Zero();
 Eigen::Vector3d committed_target_pos_ = Eigen::Vector3d::Zero(); // 当前推进目标
 ros::Time last_hotspot_extract_time_ = ros::Time(0);
-double hotspot_extract_interval_ = 5.0; // 重新提取间隔(秒)
+double hotspot_extract_interval_ = 2.0; // 重新提取间隔(秒)
 bool has_committed_direction_ = false;
 
 // 无效区域GMM存储（并集共识）
