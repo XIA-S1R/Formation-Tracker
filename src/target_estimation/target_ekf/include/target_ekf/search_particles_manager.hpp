@@ -59,7 +59,7 @@ public:
       my_label_(static_cast<SearchIntent>(drone_id % 3)),  // 根据ID分配标签
       is_label_master_(drone_id < 3),                       // 前3架是掌管者
       frames_since_init_(0),
-      search_dt_(1.0 / 20.0),  // 搜索模式更新周期，默认20Hz
+      search_dt_(0.2),  // 搜索模式更新周期，5Hz
       search_vmax_(2),        // 最大速度 m/s (默认值)
       search_vmin_(0.5),        // 最小速度 m/s
       search_amax_(4),        // 最大加速度 m/s² (默认值)
@@ -547,9 +547,505 @@ public:
              drone_id_, getLabelName(label), is_master);
   }
 
+  // 新搜索方案：粒子动力学更新
+  // 水平速度方向加扰动，速度大小从[0.5*vmax, vmax]均匀采样，步进dt
+  void searchParticlesDynamicsUpdate(Eigen::MatrixXd& particles, int N) {
+    const double sigma_theta = 30.0 * M_PI / 180.0;
+    const double dt = search_dt_;
+    std::normal_distribution<double> theta_dist(0.0, sigma_theta);
+    std::uniform_real_distribution<double> speed_dist(0.5 * search_vmax_, search_vmax_);
+
+    for (int i = 0; i < N; ++i) {
+      double vx = particles(3, i);
+      double vy = particles(4, i);
+      double theta_old = std::atan2(vy, vx);
+      double theta_new = theta_old + theta_dist(rng_);
+      double v_new = speed_dist(rng_);
+      particles(3, i) = v_new * std::cos(theta_new);
+      particles(4, i) = v_new * std::sin(theta_new);
+      particles(0, i) += particles(3, i) * dt;
+      particles(1, i) += particles(4, i) * dt;
+    }
+  }
+
+  // === 3D无效区域GMM结构体 ===
+  struct InvalidGMM3D {
+    int C = 0;
+    Eigen::VectorXd weights;
+    std::vector<Eigen::Vector3d> means;
+    std::vector<Eigen::Matrix3d> covs;
+  };
+
+  // === 粒子分类：找出负观测无效粒子和障碍无效粒子的索引 ===
+  // neg_obs_indices: 在FOV内且视线无遮挡的粒子（能看到但没目标）
+  // obstacle_indices: 在局部地图障碍内的粒子
+  struct ParticleClassification {
+    std::vector<int> neg_obs_indices;
+    std::vector<int> obstacle_indices;
+  };
+
+  // is_occupied: 外部传入的占据检查函数
+  ParticleClassification classifyInvalidParticles(
+      const Eigen::MatrixXd& particles, int N,
+      const Eigen::Vector3d& cam_p, const Eigen::Quaterniond& cam_q,
+      std::function<bool(const Eigen::Vector3d&)> is_occupied) {
+    ParticleClassification result;
+    Eigen::Matrix3d R_cam_inv = cam_q.toRotationMatrix().transpose();
+
+    for (int i = 0; i < N; ++i) {
+      Eigen::Vector3d p = particles.col(i).head(3);
+
+      // 障碍检查
+      if (is_occupied(p)) {
+        result.obstacle_indices.push_back(i);
+        continue; // 障碍内的粒子不再做FOV检查
+      }
+
+      // FOV + 视线检查
+      Eigen::Vector3d p_in_cam = R_cam_inv * (p - cam_p);
+      if (p_in_cam.z() > 0.1 && p_in_cam.z() < cam_max_range_) {
+        double u = p_in_cam.x() * cam_fx_ / p_in_cam.z() + cam_cx_;
+        double v = p_in_cam.y() * cam_fy_ / p_in_cam.z() + cam_cy_;
+        if (u >= 0 && u <= cam_width_ && v >= 0 && v <= cam_height_) {
+          // 在FOV内，检查视线
+          if (los_check_fn_ && los_check_fn_(cam_p, p)) {
+            result.neg_obs_indices.push_back(i);
+          }
+        }
+      }
+    }
+    return result;
+  }
+
+  // === 对选定粒子的3D位置拟合GMM（简单EM）===
+  InvalidGMM3D fitGMM3D(const Eigen::MatrixXd& particles,
+                        const std::vector<int>& indices,
+                        int C, int max_iters = 15) {
+    InvalidGMM3D gmm;
+    int N = indices.size();
+    if (N < C || N < 3) {
+      gmm.C = 0;
+      return gmm;
+    }
+    gmm.C = C;
+    gmm.weights.setConstant(C, 1.0 / C);
+    gmm.means.resize(C);
+    gmm.covs.resize(C);
+
+    // 初始化：均匀间隔选取粒子作为初始均值
+    for (int c = 0; c < C; ++c) {
+      int idx = indices[c * N / C];
+      gmm.means[c] = particles.col(idx).head(3);
+      gmm.covs[c] = Eigen::Matrix3d::Identity() * 0.5;
+    }
+
+    // EM迭代
+    Eigen::MatrixXd resp(N, C); // 责任度矩阵
+    for (int iter = 0; iter < max_iters; ++iter) {
+      // E步
+      for (int n = 0; n < N; ++n) {
+        Eigen::Vector3d p = particles.col(indices[n]).head(3);
+        double total = 0.0;
+        for (int c = 0; c < C; ++c) {
+          Eigen::Vector3d diff = p - gmm.means[c];
+          double det = gmm.covs[c].determinant();
+          if (det < 1e-30) det = 1e-30;
+          Eigen::Matrix3d inv = gmm.covs[c].inverse();
+          double exponent = -0.5 * diff.transpose() * inv * diff;
+          double nc = 1.0 / std::sqrt(std::pow(2.0 * M_PI, 3) * det);
+          resp(n, c) = gmm.weights(c) * nc * std::exp(exponent);
+          total += resp(n, c);
+        }
+        if (total > 1e-300) resp.row(n) /= total;
+        else resp.row(n).setConstant(1.0 / C);
+      }
+      // M步
+      for (int c = 0; c < C; ++c) {
+        double Nc = resp.col(c).sum();
+        if (Nc < 1e-10) continue;
+        gmm.weights(c) = Nc / N;
+        gmm.means[c].setZero();
+        for (int n = 0; n < N; ++n) {
+          gmm.means[c] += resp(n, c) * particles.col(indices[n]).head(3);
+        }
+        gmm.means[c] /= Nc;
+        gmm.covs[c].setZero();
+        for (int n = 0; n < N; ++n) {
+          Eigen::Vector3d diff = particles.col(indices[n]).head(3) - gmm.means[c];
+          gmm.covs[c] += resp(n, c) * diff * diff.transpose();
+        }
+        gmm.covs[c] /= Nc;
+        gmm.covs[c] += Eigen::Matrix3d::Identity() * 1e-4; // 正定保证
+      }
+    }
+    // 归一化权重
+    double wsum = gmm.weights.sum();
+    if (wsum > 1e-300) gmm.weights /= wsum;
+    return gmm;
+  }
+
+  // === 用无效区域GMM裁剪粒子权重 ===
+  // 对每个粒子，计算其3D位置在无效GMM下的概率密度，按比例衰减权重
+  // p_threshold: 密度超过此值时权重完全归零
+  void pruneParticlesByInvalidGMM(Eigen::MatrixXd& particles,
+                                   Eigen::VectorXd& weights, int N,
+                                   const InvalidGMM3D& neg_obs_gmm,
+                                   const InvalidGMM3D& obstacle_gmm,
+                                   double p_threshold = -1.0) {
+    // 合并两个无效GMM的所有分量
+    std::vector<Eigen::Vector3d> all_mu;
+    std::vector<Eigen::Matrix3d> all_cov_inv;
+    std::vector<double> all_norm;
+    std::vector<double> all_w;
+
+    auto addComponents = [&](const InvalidGMM3D& gmm) {
+      for (int c = 0; c < gmm.C; ++c) {
+        double det = gmm.covs[c].determinant();
+        if (det < 1e-30) continue;
+        all_mu.push_back(gmm.means[c]);
+        all_cov_inv.push_back(gmm.covs[c].inverse());
+        all_norm.push_back(1.0 / std::sqrt(std::pow(2.0 * M_PI, 3) * det));
+        all_w.push_back(gmm.weights(c));
+      }
+    };
+    addComponents(neg_obs_gmm);
+    addComponents(obstacle_gmm);
+
+    if (all_mu.empty()) return;
+
+    // 自动计算阈值：取所有分量峰值密度的中位数作为参考
+    if (p_threshold <= 0) {
+      std::vector<double> peaks;
+      for (size_t c = 0; c < all_mu.size(); ++c) {
+        peaks.push_back(all_w[c] * all_norm[c]); // 分量中心处的密度
+      }
+      std::sort(peaks.begin(), peaks.end());
+      p_threshold = peaks[peaks.size() / 2] * 0.5; // 峰值中位数的一半
+      if (p_threshold < 1e-10) p_threshold = 1e-10;
+    }
+
+    // 对每个粒子计算无效密度并衰减权重
+    for (int i = 0; i < N; ++i) {
+      Eigen::Vector3d pos = particles.col(i).head(3);
+      double p_invalid = 0.0;
+      for (size_t c = 0; c < all_mu.size(); ++c) {
+        Eigen::Vector3d diff = pos - all_mu[c];
+        double exponent = -0.5 * diff.transpose() * all_cov_inv[c] * diff;
+        p_invalid += all_w[c] * all_norm[c] * std::exp(exponent);
+      }
+      double ratio = p_invalid / p_threshold;
+      double factor = std::max(0.0, 1.0 - ratio);
+      weights(i) *= factor;
+    }
+
+    // 归一化权重
+    double wsum = weights.sum();
+    if (wsum > 1e-300) {
+      weights /= wsum;
+    } else {
+      weights.setConstant(N, 1.0 / N);
+    }
+  }
+
+  // === 6D全粒子共识 ===
+
+  // 6D本地统计量
+  struct LocalStat6D {
+    int drone_id;
+    int C;
+    Eigen::VectorXd alpha;              // [C]
+    std::vector<Eigen::VectorXd> a;     // C x [6]
+    std::vector<Eigen::MatrixXd> b;     // C x [6x6]
+    bool has_obs;
+    ros::Time timestamp;
+  };
+
+  // 6D邻居共识状态
+  struct NeighborConsensus6D {
+    Eigen::VectorXd zeta_alpha;
+    std::vector<Eigen::VectorXd> zeta_a;
+    std::vector<Eigen::MatrixXd> zeta_b;
+    bool has_obs;
+    ros::Time timestamp;
+  };
+
+  // 初始化6D搜索GMM（进入搜索模式时调用）
+  void initSearchGMM6D(const Eigen::MatrixXd& particles,
+                       const Eigen::VectorXd& weights, int N, int C) {
+    search_C_ = C;
+    search_gmm_pi_.setConstant(C, 1.0 / C);
+    search_gmm_mu_.resize(C);
+    search_gmm_S_.resize(C);
+    // 用加权均值初始化
+    Eigen::VectorXd mean6 = Eigen::VectorXd::Zero(nx6_);
+    for (int i = 0; i < N; ++i) mean6 += weights(i) * particles.col(i).head(nx6_);
+    for (int c = 0; c < C; ++c) {
+      search_gmm_mu_[c] = mean6;
+      // 加随机扰动区分各分量
+      std::normal_distribution<double> dist(0.0, 0.3);
+      for (int j = 0; j < nx6_; ++j) search_gmm_mu_[c](j) += dist(rng_);
+      search_gmm_S_[c] = Eigen::MatrixXd::Identity(nx6_, nx6_) * 0.5;
+    }
+    // 初始化共识状态
+    search_zeta_alpha_ = search_gmm_pi_ * N;
+    search_zeta_a_.resize(C);
+    search_zeta_b_.resize(C);
+    for (int c = 0; c < C; ++c) {
+      search_zeta_a_[c] = search_gmm_mu_[c] * search_zeta_alpha_(c);
+      search_zeta_b_[c] = search_gmm_S_[c] * search_zeta_alpha_(c);
+    }
+    search_gmm_initialized_ = true;
+  }
+
+  // E步：计算6D本地统计量
+  LocalStat6D computeLocalStats6D(const Eigen::MatrixXd& particles,
+                                   const Eigen::VectorXd& weights,
+                                   int N, int drone_id, bool has_obs) {
+    LocalStat6D ls;
+    ls.drone_id = drone_id;
+    ls.C = search_C_;
+    ls.has_obs = has_obs;
+    ls.timestamp = ros::Time::now();
+    ls.alpha.setZero(search_C_);
+    ls.a.resize(search_C_);
+    ls.b.resize(search_C_);
+    for (int c = 0; c < search_C_; ++c) {
+      ls.a[c].setZero(nx6_);
+      ls.b[c].setZero(nx6_, nx6_);
+    }
+    // 预计算GMM逆和行列式
+    std::vector<Eigen::MatrixXd> S_inv(search_C_);
+    std::vector<double> S_det(search_C_);
+    for (int c = 0; c < search_C_; ++c) {
+      S_inv[c] = search_gmm_S_[c].inverse();
+      S_det[c] = search_gmm_S_[c].determinant();
+      if (S_det[c] < 1e-300) S_det[c] = 1e-300;
+    }
+    for (int n = 0; n < N; ++n) {
+      Eigen::VectorXd x6 = particles.col(n).head(nx6_);
+      double w_n = weights(n);
+      Eigen::VectorXd resp(search_C_);
+      double resp_sum = 0.0;
+      for (int c = 0; c < search_C_; ++c) {
+        Eigen::VectorXd diff = x6 - search_gmm_mu_[c];
+        double exponent = -0.5 * diff.transpose() * S_inv[c] * diff;
+        double nc = 1.0 / std::sqrt(std::pow(2.0 * M_PI, nx6_) * S_det[c]);
+        resp(c) = search_gmm_pi_(c) * nc * std::exp(exponent);
+        resp_sum += resp(c);
+      }
+      if (resp_sum > 1e-300) resp /= resp_sum;
+      else resp.setConstant(1.0 / search_C_);
+      for (int c = 0; c < search_C_; ++c) {
+        double alpha_nc = w_n * resp(c);
+        ls.alpha(c) += alpha_nc;
+        ls.a[c] += alpha_nc * x6;
+        Eigen::VectorXd diff_c = x6 - search_gmm_mu_[c];
+        ls.b[c] += alpha_nc * diff_c * diff_c.transpose();
+      }
+    }
+    return ls;
+  }
+
+  // 共识滤波单次更新
+  void consensusFilterOnce6D(const std::vector<NeighborConsensus6D>& neighbors,
+                              const LocalStat6D& local_stat) {
+    int d_max = neighbors.size() + 1;
+    double eps = std::min(1.0 / d_max, 0.3);
+    for (int c = 0; c < search_C_; ++c) {
+      double alpha_diff = 0.0;
+      Eigen::VectorXd a_diff = Eigen::VectorXd::Zero(nx6_);
+      Eigen::MatrixXd b_diff = Eigen::MatrixXd::Zero(nx6_, nx6_);
+      for (const auto& nc : neighbors) {
+        if ((int)nc.zeta_alpha.size() != search_C_) continue;
+        alpha_diff += nc.zeta_alpha(c) - search_zeta_alpha_(c);
+        a_diff += nc.zeta_a[c] - search_zeta_a_[c];
+        b_diff += nc.zeta_b[c] - search_zeta_b_[c];
+      }
+      double local_alpha = local_stat.alpha(c);
+      Eigen::VectorXd local_a = local_stat.a[c];
+      Eigen::MatrixXd local_b = local_stat.b[c];
+      search_zeta_alpha_(c) += eps * (alpha_diff + (local_alpha - search_zeta_alpha_(c)));
+      search_zeta_a_[c] += eps * (a_diff + (local_a - search_zeta_a_[c]));
+      search_zeta_b_[c] += eps * (b_diff + (local_b - search_zeta_b_[c]));
+    }
+  }
+
+  // M步：从共识状态更新6D GMM
+  void globalMStep6D() {
+    double alpha_sum = search_zeta_alpha_.sum();
+    if (alpha_sum < 1e-300) return;
+    for (int c = 0; c < search_C_; ++c) {
+      if (search_zeta_alpha_(c) < 1e-300) continue;
+      search_gmm_pi_(c) = search_zeta_alpha_(c) / alpha_sum;
+      search_gmm_mu_[c] = search_zeta_a_[c] / search_zeta_alpha_(c);
+      search_gmm_S_[c] = search_zeta_b_[c] / search_zeta_alpha_(c);
+      search_gmm_S_[c] += Eigen::MatrixXd::Identity(nx6_, nx6_) * 1e-4;
+    }
+    double pi_sum = search_gmm_pi_.sum();
+    if (pi_sum > 1e-300) search_gmm_pi_ /= pi_sum;
+  }
+
+  // 单帧EM步骤（E + 共识 + M）
+  LocalStat6D emStep6D(const Eigen::MatrixXd& particles,
+                        const Eigen::VectorXd& weights, int N,
+                        int drone_id, bool has_obs,
+                        const std::vector<NeighborConsensus6D>& neighbors) {
+    if (!search_gmm_initialized_) return LocalStat6D();
+    LocalStat6D ls = computeLocalStats6D(particles, weights, N, drone_id, has_obs);
+    consensusFilterOnce6D(neighbors, ls);
+    globalMStep6D();
+    return ls;
+  }
+
+  // 获取6D共识状态（用于发布给邻居）
+  int getSearchC() const { return search_C_; }
+  const Eigen::VectorXd& getSearchZetaAlpha() const { return search_zeta_alpha_; }
+  const std::vector<Eigen::VectorXd>& getSearchZetaA() const { return search_zeta_a_; }
+  const std::vector<Eigen::MatrixXd>& getSearchZetaB() const { return search_zeta_b_; }
+  bool isSearchGMMInitialized() const { return search_gmm_initialized_; }
+
+  // === 从6D搜索共识GMM采样新粒子（替换旧粒子的前6维）===
+  // 高权重GMM分量采样更多粒子，低权重区域粒子自然被淘汰
+  void sampleParticlesFromSearchGMM(Eigen::MatrixXd& particles,
+                                     Eigen::VectorXd& weights, int N) {
+    if (!search_gmm_initialized_) return;
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    std::normal_distribution<double> normal(0.0, 1.0);
+
+    for (int i = 0; i < N; ++i) {
+      // 按混合权重选择GMM分量
+      double u = uniform(rng_);
+      double cum = 0.0;
+      int c_sel = search_C_ - 1;
+      for (int c = 0; c < search_C_; ++c) {
+        cum += search_gmm_pi_(c);
+        if (u <= cum) { c_sel = c; break; }
+      }
+      // 从选中分量采样6D状态
+      Eigen::LLT<Eigen::MatrixXd> llt(search_gmm_S_[c_sel]);
+      Eigen::MatrixXd L = llt.matrixL();
+      Eigen::VectorXd noise(nx6_);
+      for (int j = 0; j < nx6_; ++j) noise(j) = normal(rng_);
+      Eigen::VectorXd x6 = search_gmm_mu_[c_sel] + L * noise;
+      // 写入粒子的前6维（pos+vel），保留后3维（rpy）
+      particles.col(i).head(nx6_) = x6;
+    }
+    weights.setConstant(N, 1.0 / N);
+  }
+
+  // === 从6D共识GMM中提取K个热点位置 ===
+  // 按权重排序取top-K分量，返回位置和速度
+  struct SearchHotspot {
+    Eigen::Vector3d pos;
+    Eigen::Vector3d vel;
+    double weight;
+  };
+
+  std::vector<SearchHotspot> extractHotspots(
+      int K, const std::vector<Eigen::Vector3d>& drone_positions = {}) const {
+    if (!search_gmm_initialized_ || search_C_ == 0) return {};
+
+    // === 加权最远点采样，排斥无人机当前位置 ===
+    // min_dist初始化为到最近无人机的距离（而非无穷大）
+    // 这样无人机附近的分量天然得分低，热点会远离已搜索区域
+    std::vector<double> min_dist(search_C_, 1e9);
+    for (int i = 0; i < search_C_; ++i) {
+      Eigen::Vector3d pos_i = search_gmm_mu_[i].head(3);
+      for (const auto& dp : drone_positions) {
+        double d = (pos_i - dp).norm();
+        min_dist[i] = std::min(min_dist[i], d);
+      }
+    }
+
+    std::vector<bool> selected(search_C_, false);
+    std::vector<int> seed_indices;
+
+    // 第一个种子：score = weight * min_dist_to_drones
+    {
+      int best = -1;
+      double best_score = -1.0;
+      for (int i = 0; i < search_C_; ++i) {
+        double score = search_gmm_pi_(i) * min_dist[i];
+        if (score > best_score) { best_score = score; best = i; }
+      }
+      if (best >= 0) {
+        seed_indices.push_back(best);
+        selected[best] = true;
+      }
+    }
+
+    while ((int)seed_indices.size() < K && (int)seed_indices.size() < search_C_) {
+      // 更新min_dist（考虑最新种子）
+      int last_seed = seed_indices.back();
+      Eigen::Vector3d last_pos = search_gmm_mu_[last_seed].head(3);
+      for (int i = 0; i < search_C_; ++i) {
+        if (selected[i]) continue;
+        double d = (search_gmm_mu_[i].head(3) - last_pos).norm();
+        min_dist[i] = std::min(min_dist[i], d);
+      }
+      // 选 score = weight * min_dist 最大的
+      int best = -1;
+      double best_score = -1.0;
+      for (int i = 0; i < search_C_; ++i) {
+        if (selected[i]) continue;
+        double score = search_gmm_pi_(i) * min_dist[i];
+        if (score > best_score) { best_score = score; best = i; }
+      }
+      if (best < 0) break;
+      seed_indices.push_back(best);
+      selected[best] = true;
+    }
+
+    int num_seeds = (int)seed_indices.size();
+    if (num_seeds == 0) return {};
+
+    // === 第2步：把所有分量分配到最近的种子，加权合并 ===
+    std::vector<double> total_w(num_seeds, 0.0);
+    std::vector<Eigen::VectorXd> weighted_sum(num_seeds);
+    for (int k = 0; k < num_seeds; ++k) {
+      weighted_sum[k] = Eigen::VectorXd::Zero(nx6_);
+    }
+    for (int i = 0; i < search_C_; ++i) {
+      Eigen::Vector3d pos_i = search_gmm_mu_[i].head(3);
+      double best_d = 1e9;
+      int best_k = 0;
+      for (int k = 0; k < num_seeds; ++k) {
+        double d = (pos_i - search_gmm_mu_[seed_indices[k]].head(3)).norm();
+        if (d < best_d) { best_d = d; best_k = k; }
+      }
+      double w = search_gmm_pi_(i);
+      weighted_sum[best_k] += w * search_gmm_mu_[i];
+      total_w[best_k] += w;
+    }
+
+    // === 第3步：生成热点，按权重降序 ===
+    std::vector<SearchHotspot> hotspots;
+    for (int k = 0; k < num_seeds; ++k) {
+      SearchHotspot h;
+      if (total_w[k] > 1e-300) {
+        Eigen::VectorXd mean6 = weighted_sum[k] / total_w[k];
+        h.pos = mean6.head(3);
+        h.vel = mean6.tail(3);
+      } else {
+        h.pos = search_gmm_mu_[seed_indices[k]].head(3);
+        h.vel = search_gmm_mu_[seed_indices[k]].tail(3);
+      }
+      h.weight = total_w[k];
+      hotspots.push_back(h);
+    }
+    std::sort(hotspots.begin(), hotspots.end(),
+              [](const SearchHotspot& a, const SearchHotspot& b) {
+                return a.weight > b.weight;
+              });
+    return hotspots;
+  }
+
+  double getSearchVmax() const { return search_vmax_; }
+
   /*// Setter methods
   void setDroneId(int drone_id) { drone_id_ = drone_id; }
   void setSearchDt(double dt) { search_dt_ = dt; }
+  double getSearchVmax() const { return search_vmax_; }
   void setSearchVMax(double vmax) { search_vmax_ = vmax; }
   void setSearchVMin(double vmin) { search_vmin_ = vmin; }
   void setIntentKeepProb(double prob) { intent_keep_prob_ = prob; }
@@ -1107,6 +1603,18 @@ private:
 
   // 视线检查回调函数
   std::function<bool(const Eigen::Vector3d&, const Eigen::Vector3d&)> los_check_fn_;
+
+  // === 6D全粒子共识GMM状态 (pos+vel) ===
+  static constexpr int nx6_ = 6;
+  int search_C_ = 6;  // 搜索模式GMM分量数，初始化时设为2*num_drones
+  Eigen::VectorXd search_gmm_pi_;
+  std::vector<Eigen::VectorXd> search_gmm_mu_;
+  std::vector<Eigen::MatrixXd> search_gmm_S_;
+  // 共识状态 zeta
+  Eigen::VectorXd search_zeta_alpha_;
+  std::vector<Eigen::VectorXd> search_zeta_a_;
+  std::vector<Eigen::MatrixXd> search_zeta_b_;
+  bool search_gmm_initialized_ = false;
 };
 
 // ========== 以下为旧的标签化共识滤波实现（已弃用，保留供参考）==========

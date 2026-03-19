@@ -418,6 +418,42 @@ struct DistributedPF {
     if (pi_sum > 1e-300) gmm_pi_ /= pi_sum;
   }
 
+  // === 动态调整GMM分量数（搜索模式切换时使用）===
+  inline void resizeComponents(int new_C) {
+    if (new_C == C_) return;
+    int old_C = C_;
+    C_ = new_C;
+    // GMM参数
+    Eigen::VectorXd old_pi = gmm_pi_;
+    gmm_pi_.setConstant(C_, 1.0 / C_);
+    gmm_mu_.resize(C_);
+    gmm_S_.resize(C_);
+    for (int c = 0; c < C_; ++c) {
+      if (c < old_C) {
+        // 保留旧分量
+      } else {
+        // 新分量用当前粒子均值初始化
+        gmm_mu_[c] = Eigen::VectorXd::Zero(nx_);
+        for (int i = 0; i < N_; ++i) gmm_mu_[c] += weights_(i) * particles_.col(i);
+        gmm_S_[c] = Q_ * 2.0;
+      }
+    }
+    // 共识状态
+    zeta_alpha_.setZero(C_);
+    zeta_a_.resize(C_);
+    zeta_b_.resize(C_);
+    for (int c = 0; c < C_; ++c) {
+      if (c < old_C) {
+        // 保留旧的zeta
+      } else {
+        zeta_a_[c] = gmm_mu_[c] * (1.0 / C_);
+        zeta_b_[c] = gmm_S_[c] * (1.0 / C_);
+      }
+      zeta_alpha_(c) = 1.0 / C_;
+    }
+    ROS_INFO("DPF resizeComponents: %d -> %d", old_C, C_);
+  }
+
   // === 论文Section V：单帧EM步骤 ===
   // 每帧只做1次共识更新，多轮收敛依赖多帧间的真实通信
   inline void emStep(int drone_id, const std::vector<NeighborConsensus>& neighbor_consensus, LocalStat& local_stat) {

@@ -27,6 +27,7 @@ add_message_files(
   LocalStats.msg
   LabeledConsensusState.msg
   SearchLabelInfo.msg
+  InvalidRegionGMM.msg
 )
 
 generate_messages(

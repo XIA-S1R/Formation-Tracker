@@ -461,16 +461,11 @@ class Nodelet : public nodelet::Nodelet {
       wait_hover_ = false;
     } else {//追踪逻辑
       if (search_mode_active_) {
-        // 搜索模式：使用从掌管者接收的带偏置目标点
-        // search_target_with_offset_ 在 search_label_info_callback 中更新
-        if (search_target_with_offset_.norm() > 0.1) {
-          target_p = search_target_with_offset_;
-        }
+        // 搜索模式：target_p 已经是dpf节点发布的热点位置，直接使用
         target_p.z() = std::max(2.0, odom_p.z());  // 保持安全高度
 
-        ROS_INFO_THROTTLE(1.0, "[planner drone%d] SEARCH MODE: target=(%.2f,%.2f,%.2f), yaw=%.1f deg",
-                          trajOptPtr_->drone_id_, target_p.x(), target_p.y(), target_p.z(),
-                          search_desired_yaw_ * 180.0 / M_PI);
+        ROS_INFO_THROTTLE(1.0, "[planner drone%d] SEARCH MODE: target=(%.2f,%.2f,%.2f)",
+                          trajOptPtr_->drone_id_, target_p.x(), target_p.y(), target_p.z());
       } else {
         target_p.z() += 0.3;// 追踪目标定在目标上方1m处
 
