@@ -247,83 +247,43 @@ Maps::randomMapGenerate()
   
   // 计算x轴后1/3区域的长度
   double right_third_length = right_end - right_start;
-  
-  /*// 在x方向的后1/3区域添加大障碍物
-  double big_obstacle_width = right_third_length * 0.4; // 缩短宽度，占后1/3区域的40%
-  double big_obstacle_length = 10.0;
-  double big_obstacle_height = 8.0;
-  
-  // 计算大障碍物的位置，确保整个障碍在后1/3区域内
-  double big_obstacle_x_min = right_start;
-  double big_obstacle_x_max = right_start + right_third_length * 0.45; // 为矩形障碍留出空间
-  double big_obstacle_y_min = map_min_y + big_obstacle_length / 2.0;
-  double big_obstacle_y_max = map_max_y - big_obstacle_length / 2.0;
-  
-  // 确保大障碍物的尺寸合理
-  double actual_big_width = std::min(big_obstacle_width, big_obstacle_x_max - big_obstacle_x_min);
-  double actual_big_length = std::min(big_obstacle_length, big_obstacle_y_max - big_obstacle_y_min);
-  
-  // 计算大障碍物的中心位置
-  double big_obstacle_x = (big_obstacle_x_min + big_obstacle_x_max) / 2.0;
-  double big_obstacle_y = 0.0;
-  double big_obstacle_z = 0.0;
-  
-  generateBox(big_obstacle_x, big_obstacle_y, big_obstacle_z, 
-              actual_big_width, actual_big_length, big_obstacle_height, 
-              _resolution, pt_random);*/
-              // 在x方向的后1/3区域添加大障碍物（带裂缝版本）
-  double big_obstacle_width = right_third_length * 0.4; // 缩短宽度，占后1/3区域的40%
-  double big_obstacle_length = 10.0;
-  double big_obstacle_height = 8.0;
 
-  // 计算大障碍物的位置，确保整个障碍在后1/3区域内
-  double big_obstacle_x_min = right_start;
-  double big_obstacle_x_max = right_start + right_third_length * 0.45; // 为矩形障碍留出空间
-  double big_obstacle_y_min = map_min_y + big_obstacle_length / 2.0;
-  double big_obstacle_y_max = map_max_y - big_obstacle_length / 2.0;
+  // === 薄墙遮挡区：用多排薄墙代替大块障碍物 ===
+  // 薄墙只有1-2个分辨率厚度，传感器能完整建图，不会出现unknown盲区
+  double wall_thickness = 2.0 * _resolution;  // 薄墙厚度：2个栅格
+  double wall_length = 10.0;                  // 墙的y方向长度
+  double wall_height = 6.0;                   // 墙高
+  int num_walls = 3;                          // 薄墙排数
+  double wall_spacing = 4.0;                  // 墙间距(x方向)
+  double wall_y_offset = 3.0;                 // 相邻墙的y方向交错偏移
 
-  // 确保大障碍物的尺寸合理
-  double actual_big_width = std::min(big_obstacle_width, big_obstacle_x_max - big_obstacle_x_min);
-  double actual_big_length = std::min(big_obstacle_length, big_obstacle_y_max - big_obstacle_y_min);
+  double wall_area_start = right_start + 2.0; // 薄墙区起始x
 
-  // 将大障碍物分成3个部分，中间留出裂缝
-  int num_parts = 3;  // 分成3个部分
-  double crack_width = actual_big_width * 0.2; // 裂缝宽度为总宽度的5%
-  double part_width = (actual_big_width - 2 * crack_width) / num_parts; // 每个部分的宽度
+  for (int i = 0; i < num_walls; i++) {
+    double wx = wall_area_start + i * wall_spacing;
+    // 交错排列：奇数排向y正方向偏移
+    double wy = (i % 2 == 0) ? 0.0 : wall_y_offset;
 
-  // 计算大障碍物的中心位置
-  double big_obstacle_x = (big_obstacle_x_min + big_obstacle_x_max) / 2.0;
-  double big_obstacle_y = 0.0;
-  double big_obstacle_z = 0.0;
-
-  // 生成带裂缝的大障碍物
-  for (int i = 0; i < num_parts; i++) {
-      double part_x = big_obstacle_x_min + i * (part_width + crack_width) + (part_width + crack_width) / 2.0;
-      double part_y = 0.0;
-
-      generateBox(part_x, part_y, big_obstacle_z,
-                  part_width, actual_big_length, big_obstacle_height,
-                  _resolution, pt_random);
+    generateBox(wx, wy, 0.0,
+                wall_thickness, wall_length, wall_height,
+                _resolution, pt_random);
   }
 
-  // 计算带裂缝大障碍物的实际右边界（最后一个part的右边）
-  double last_part_x = big_obstacle_x_min + (num_parts - 1) * (part_width + crack_width) + (part_width + crack_width) / 2.0;
-  double big_obstacle_right = last_part_x + part_width / 2.0;
+  // 计算薄墙区的右边界
+  double wall_area_right = wall_area_start + (num_walls - 1) * wall_spacing + wall_thickness / 2.0;
 
-  // 在大障碍物之后添加几列沿x轴方向的长矩形障碍
+  // 在薄墙区之后添加几列沿x轴方向的柱子障碍
   int num_columns = 5;
-  double column_width = right_third_length * 0.4;
+  double column_width = 1.0;                  // 柱子也做薄
   double column_length = 1.0;
-  double column_height = 8.0;
+  double column_height = 6.0;
   double column_spacing = 5.0;
-  double column_gap = 20; // 与大障碍物的间距，拉远到20米
-  
-  // 计算矩形障碍的起始x位置（在大障碍物之后，确保在后1/3区域内）
-  double column_x_min = big_obstacle_right + column_gap;
+  double column_gap = 8.0;                    // 与薄墙区的间距
+
+  double column_x_min = wall_area_right + column_gap;
   double column_x_max = right_end;
   double column_start_x = column_x_min + column_width / 2.0;
-  
-  // 确保矩形障碍的位置在后1/3区域内
+
   if (column_start_x + column_width / 2.0 > column_x_max) {
     column_start_x = column_x_max - column_width / 2.0;
   }
