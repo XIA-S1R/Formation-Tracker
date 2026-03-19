@@ -14,6 +14,7 @@
 #include <unordered_set>
 #include <cmath>
 #include <mutex>
+#include <atomic>
 #include <target_ekf/target_ekf.hpp>
 #include <target_ekf/target_dpf.hpp>
 #include <target_ekf/LocalStats.h>
@@ -78,7 +79,10 @@ double obs_timeout_ = 0.2; // 观测超时时间0.2s
 int drone_id_ = 0;
 int num_drones_ = 3;
 int dpf_rate_ = 20;
+int consensus_rate_ = 100;  // 共识迭代频率，两次观测间可进行多轮真实通信
 std::shared_ptr<DistributedPF> dpfPtr_;
+std::mutex dpf_mutex_;  // 保护 dpfPtr_ 的并发访问
+std::atomic<bool> has_recent_obs_{false};  // 观测timer通知共识timer有新观测
 ros::Time last_update_stamp_;
 int dpf_reset_suppress_count_ = 0;
 
@@ -662,7 +666,41 @@ void yolo_callback(const nav_msgs::OdometryConstPtr& target_msg) {
   has_latest_obs_ = true;
 }
 
-// === 【核心】固定频率Timer回调：执行DPF完整流程，解决回调饥饿 ===
+// === 【共识Timer回调】高频共识迭代（100Hz），两次观测间多轮真实通信 ===
+void consensus_timer_callback(const ros::TimerEvent& event) {
+  if (!dpfPtr_->initialized_ || search_mode_active_) return;
+
+  std::lock_guard<std::mutex> dpf_lock(dpf_mutex_);
+
+  // E步：用当前GMM参数计算本地统计量
+  bool obs_flag = has_recent_obs_.load();
+  LocalStat local_stat = dpfPtr_->computeLocalStatsOnly(drone_id_, obs_flag);
+
+  // 收集邻居最新的共识状态ζ
+  std::vector<NeighborConsensus> neighbor_consensus;
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    ros::Time current_time = ros::Time::now();
+    double time_threshold = 0.3;
+    for (auto& kv : received_consensus_) {
+      double time_diff = (current_time - kv.second.timestamp).toSec();
+      if (time_diff < time_threshold) {
+        neighbor_consensus.push_back(kv.second);
+      }
+    }
+    if (neighbor_consensus.empty() && !received_consensus_.empty()) {
+      neighbor_consensus.push_back(received_consensus_.begin()->second);
+    }
+  }
+
+  // 共识更新 + M步
+  dpfPtr_->emStep(drone_id_, neighbor_consensus, local_stat);
+
+  // 发布最新的ζ给邻居
+  local_stats_pub_.publish(toMsg(local_stat, *dpfPtr_));
+}
+
+// === 【核心】固定频率Timer回调：执行DPF观测相关流程（20Hz）===
 // 无论有无观测，都会触发，保证无观测节点也能参与共识、发布数据
 void dpf_core_timer_callback(const ros::TimerEvent& event) {
   // 检查是否有无人机位姿
@@ -716,6 +754,8 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     // 用完重置观测标志，避免重复使用
     has_latest_obs_ = false;
   }
+  // 加锁保护 dpfPtr_ 的并发访问（与 consensus_timer_callback 互斥）
+  std::lock_guard<std::mutex> dpf_lock(dpf_mutex_);
   // 初始化/重置逻辑
   double update_dt = (ros::Time::now() - last_update_stamp_).toSec();
   bool need_reset = (!dpfPtr_->initialized_ || update_dt > 1.0);
@@ -861,19 +901,21 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     // =========================
     // --- 论文步骤1：从GMM采样新粒子（Importance sampling step）---
     dpfPtr_->sampleParticlesFromGMM();
-    
+
     // --- 论文步骤2：状态预测 ---
     dpfPtr_->predict();
-    
+
     // --- 论文步骤3：权重更新（仅有观测节点执行）---
     if (has_obs) {
       dpfPtr_->updateWeights(obs_pos, obs_rpy);
+      has_recent_obs_.store(true);
+    } else {
+      has_recent_obs_.store(false);
     }
-    
-    // --- 论文步骤4：E步，计算本地统计量（所有节点执行，无观测节点也计算真实统计量）---
-    LocalStat local_stat = dpfPtr_->computeLocalStatsOnly(drone_id_, has_obs);
-    
-    // --- 论文步骤5：收集邻居共识状态并检测是否需要切换到搜索模式 ---
+
+    // --- 论文步骤4-6 由 consensus_timer_callback 高频执行 ---
+
+    // --- 收集邻居共识状态，检测是否需要切换到搜索模式 ---
     std::vector<NeighborConsensus> neighbor_consensus;
     std::vector<int> neighbor_ids;
     {
@@ -892,8 +934,15 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
         neighbor_consensus.push_back(received_consensus_.begin()->second);
         neighbor_ids.push_back(received_consensus_.begin()->first);
       }
-      // 清理过期数据
-      received_consensus_.clear();
+      // 清理过期数据（只删超时的，不全清）
+      for (auto it = received_consensus_.begin(); it != received_consensus_.end(); ) {
+        double age = (current_time - it->second.timestamp).toSec();
+        if (age > time_threshold) {
+          it = received_consensus_.erase(it);
+        } else {
+          ++it;
+        }
+      }
     }
     
     // 检查是否所有无人机都失去了观测（包括当前无人机和邻居）
@@ -962,19 +1011,9 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       // 有任意无人机重新观测到目标
       consecutive_no_obs_count_ = 0;
     }
-    
-    // --- 论文步骤6：单步EM迭代（共识滤波+M步）---
-    dpfPtr_->emStep(drone_id_, neighbor_consensus, local_stat);
-    ROS_DEBUG("[dpf%d][EM] completed 1 step, fused %zu neighbors", drone_id_, neighbor_consensus.size());
-    
-    // --- 论文步骤7：系统重采样（仅有观测节点执行）---
-    //if (has_obs) {
-      //dpfPtr_->systematicResample();
-    //}
-    
-    // --- 发布最新的共识状态ζ（给邻居下一帧使用）---
-    local_stats_pub_.publish(toMsg(local_stat, *dpfPtr_));
-    
+
+    // --- EM迭代由 consensus_timer_callback 高频执行 ---
+
     // --- 数值有效性检查 ---
     if (!dpfPtr_->isValid()) {
       ROS_ERROR("[dpf%d] update invalid! NaN/Inf detected, resetting.", drone_id_);
@@ -1208,6 +1247,7 @@ int main(int argc, char** argv) {
   int num_components = 4;
   int num_em_iters = 10;
   nh.getParam("dpf_rate", dpf_rate_);
+  nh.param("consensus_rate", consensus_rate_, 100);
   nh.getParam("num_particles", num_particles);
   nh.getParam("num_components", num_components);
   nh.getParam("num_em_iters", num_em_iters);
@@ -1255,8 +1295,9 @@ int main(int argc, char** argv) {
             boost::bind(&neighbor_odom_callback, _1, i)));
     ROS_INFO("[dpf%d] Subscribing to neighbor %d: stats, labeled_consensus, odom (%s)", drone_id_, i, odom_topic.c_str());
   }
-  // 【核心】固定频率Timer执行DPF核心逻辑
+  // 【核心】观测Timer（20Hz）+ 共识Timer（100Hz）
   ros::Timer dpf_core_timer = nh.createTimer(ros::Duration(1.0 / dpf_rate_), &dpf_core_timer_callback);
+  ros::Timer consensus_timer = nh.createTimer(ros::Duration(1.0 / consensus_rate_), &consensus_timer_callback);
   ros::MultiThreadedSpinner spinner(4); // 多线程Spinner，避免回调阻塞
   spinner.spin();
   return 0;

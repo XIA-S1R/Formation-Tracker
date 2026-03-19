@@ -259,14 +259,47 @@ Maps::randomMapGenerate()
 
   double wall_area_start = right_start + 2.0; // 薄墙区起始x
 
+  // 窗口参数
+  double win_width  = 2.0;   // 窗口y方向宽度
+  double win_height = 1.5;   // 窗口z方向高度
+  double win_z_base = 1.5;   // 窗口底部离地高度
+  int    num_windows = 2;    // 每面墙的窗口数
+  double win_spacing = 3.0;  // 窗口间距(y方向，中心到中心)
+
   for (int i = 0; i < num_walls; i++) {
     double wx = wall_area_start + i * wall_spacing;
-    // 交错排列：奇数排向y正方向偏移
     double wy = (i % 2 == 0) ? 0.0 : wall_y_offset;
 
-    generateBox(wx, wy, 0.0,
-                wall_thickness, wall_length, wall_height,
-                _resolution, pt_random);
+    // 直接生成带窗口的薄墙点云
+    int widNum = ceil(wall_thickness / _resolution);
+    int lenNum = ceil(wall_length / _resolution);
+    int heiNum = ceil(wall_height / _resolution);
+
+    for (int r = -widNum / 2; r < widNum / 2; r++) {
+      for (int s = -lenNum / 2; s < lenNum / 2; s++) {
+        for (int t = 0; t < heiNum; t++) {
+          double py = wy + s * _resolution;
+          double pz = t * _resolution;
+
+          // 检查是否落在某个窗口内
+          bool in_window = false;
+          for (int w = 0; w < num_windows; w++) {
+            double win_cy = wy + (w - (num_windows - 1) / 2.0) * win_spacing;
+            if (py > win_cy - win_width / 2.0 && py < win_cy + win_width / 2.0 &&
+                pz > win_z_base && pz < win_z_base + win_height) {
+              in_window = true;
+              break;
+            }
+          }
+          if (in_window) continue;
+
+          pt_random.x = wx + r * _resolution;
+          pt_random.y = py;
+          pt_random.z = pz;
+          info.cloud->points.push_back(pt_random);
+        }
+      }
+    }
   }
 
   // 计算薄墙区的右边界

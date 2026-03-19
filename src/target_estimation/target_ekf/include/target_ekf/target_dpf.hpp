@@ -84,7 +84,7 @@ struct DistributedPF {
   Eigen::Vector3d pos_filtered_;
   Eigen::Vector3d vel_filtered_;
   Eigen::Vector3d rpy_filtered_;
-  double filter_alpha_ = 0.95;
+  double filter_alpha_ = 0.3;
 
   // === 构造函数：严格按论文参数初始化 ===
   DistributedPF(double dt, int num_particles = 300, int num_components = 4, int num_em_iters = 10)
@@ -104,19 +104,19 @@ struct DistributedPF {
     A_(1, 4) = dt_;
     A_(2, 5) = dt_;
 
-    // 过程噪声Q (论文Section V仿真参数，9维状态)
+    // 过程噪声Q (9维状态)
     Q_.setZero(nx_, nx_);
     double t2 = dt_ * dt_;
     // 位置噪声
     Q_(0, 0) = 0.05 * t2;  Q_(1, 1) = 0.05 * t2;  Q_(2, 2) = 0.02 * t2;
-    // 速度噪声
-    Q_(3, 3) = 0.01 * t2;  Q_(4, 4) = 0.01 * t2;  Q_(5, 5) = 0.005 * t2;
+    // 速度噪声（增大，允许粒子速度快速变化以跟踪加减速）
+    Q_(3, 3) = 1 * t2;  Q_(4, 4) = 1 * t2;  Q_(5, 5) = 0.4 * t2;
     // 姿态噪声
     Q_(6, 6) = 0.05 * t2;  Q_(7, 7) = 0.05 * t2;  Q_(8, 8) = 0.005 * t2;
 
-    // 观测噪声R (论文Section V仿真参数，6维观测)
+    // 观测噪声R (6维观测，减小位置噪声以更信任观测)
     R_.setIdentity(nz_, nz_);
-    R_(0, 0) = 0.05;  R_(1, 1) = 0.05;  R_(2, 2) = 0.05;
+    R_(0, 0) = 0.005;  R_(1, 1) = 0.005;  R_(2, 2) = 0.005;
     R_(3, 3) = 0.005; R_(4, 4) = 0.005; R_(5, 5) = 0.005;
 
     // 粒子和权重初始化
@@ -418,19 +418,17 @@ struct DistributedPF {
     if (pi_sum > 1e-300) gmm_pi_ /= pi_sum;
   }
 
-  // === 论文Section V：EM迭代（每帧多次迭代，每次迭代重新计算本地统计量）===
-  // 【修复】正确的EM迭代：每次迭代都用新GMM重新计算本地统计量
+  // === 论文Section V：单帧EM步骤 ===
+  // 每帧只做1次共识更新，多轮收敛依赖多帧间的真实通信
   inline void emStep(int drone_id, const std::vector<NeighborConsensus>& neighbor_consensus, LocalStat& local_stat) {
-    for (int iter = 0; iter < num_em_iters_; ++iter) {
-      // 1. 用当前GMM参数计算本地统计量（E步）
-      local_stat = computeLocalStatsOnly(drone_id, local_stat.has_obs);
+    // 1. E步：用当前GMM参数计算本地统计量
+    local_stat = computeLocalStatsOnly(drone_id, local_stat.has_obs);
 
-      // 2. 单次共识滤波更新
-      consensusFilterOnce(neighbor_consensus, local_stat);
+    // 2. 单次共识滤波更新（使用邻居最新的ζ）
+    consensusFilterOnce(neighbor_consensus, local_stat);
 
-      // 3. M步更新GMM参数
-      globalMStep();
-    }
+    // 3. M步：更新GMM参数
+    globalMStep();
   }
 
   // === 论文Algorithm 1：从全局GMM采样新粒子（9维完整状态，保留位置-速度协方差）===
