@@ -42,13 +42,18 @@
    ```
 
 5. **控制目标无人机**
-   在 RViz 中使用 "2D Nav Goal" 工具设置目标无人机的目的地，目标无人机将移动到指定位置。
-
+   a.在 RViz 中使用 "2D Nav Goal" 工具设置目标无人机的目的地，目标无人机将移动到指定位置。
+   b.使用python脚本，让目标无人机自动进行回廊摆脱机动
+   ```bash
+   cd src/planning/planning/scripts
+   chmod +x auto_evasion.py
+   python3 auto_evasion.py
+   ```
 6. **监控无人机群**
-   观察 7 架追踪无人机形成六边形编队并跟随目标无人机。
+   观察 3 架追踪无人机形成三角形编队并跟随目标无人机，在目标不可观的时候自动搜寻目标。
 
 ### 注意事项
-- 无人机的初始位置在 `tracking_sim.launch` 文件中定义。
+- 无人机的初始位置在 `tracking_sim_triangle.launch` 文件中定义。
 - 确保所有参数在启动文件和配置文件中正确设置。
 
 更多详情请参考项目文档。
