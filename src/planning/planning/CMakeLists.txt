@@ -55,3 +55,11 @@ add_executable(test_node src/test_node.cpp)
 target_link_libraries(test_node
   ${catkin_LIBRARIES}
 )
+
+catkin_install_python(PROGRAMS
+  scripts/auto_evasion.py
+  scripts/full_evasion.py
+  scripts/analyze_tracking_bag.py
+  scripts/run_full_evasion_batch.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)

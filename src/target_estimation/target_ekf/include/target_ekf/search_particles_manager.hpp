@@ -4,6 +4,9 @@
 #include <random>
 #include <functional>
 #include <memory>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <ros/time.h>
 #include <ros/node_handle.h>
 #include <map>
@@ -1033,6 +1036,195 @@ public:
       h.weight = total_w[k];
       hotspots.push_back(h);
     }
+    std::sort(hotspots.begin(), hotspots.end(),
+              [](const SearchHotspot& a, const SearchHotspot& b) {
+                return a.weight > b.weight;
+              });
+    return hotspots;
+  }
+
+  // === 基于当前粒子云提取前沿热点 ===
+  // 目标：优先选择远离无人机且不在高无效密度区域内的热点
+  std::vector<SearchHotspot> extractFrontierHotspotsFromParticles(
+      const Eigen::MatrixXd& particles,
+      const Eigen::VectorXd& weights,
+      int N, int K,
+      const std::vector<Eigen::Vector3d>& drone_positions,
+      const InvalidGMM3D& neg_obs_gmm,
+      const InvalidGMM3D& obstacle_gmm,
+      double min_drone_dist = 2.0,
+      double seed_radius = 1.5,
+      double invalid_reject_ratio = 1.0) const {
+    std::vector<SearchHotspot> hotspots;
+    if (N <= 0 || K <= 0 || particles.cols() <= 0 || weights.size() <= 0) {
+      return hotspots;
+    }
+
+    const int n = std::min<int>(N, std::min<int>(particles.cols(), weights.size()));
+    const double min_dist = std::max(0.0, min_drone_dist);
+    const double radius = std::max(0.1, seed_radius);
+    const double reject_ratio = std::max(1e-6, invalid_reject_ratio);
+
+    // 组装无效GMM分量（与 pruneParticlesByInvalidGMM 一致的密度定义）
+    std::vector<Eigen::Vector3d> all_mu;
+    std::vector<Eigen::Matrix3d> all_cov_inv;
+    std::vector<double> all_norm;
+    std::vector<double> all_w;
+    auto add_components = [&](const InvalidGMM3D& gmm) {
+      for (int c = 0; c < gmm.C; ++c) {
+        double det = gmm.covs[c].determinant();
+        if (det < 1e-30) continue;
+        all_mu.push_back(gmm.means[c]);
+        all_cov_inv.push_back(gmm.covs[c].inverse());
+        all_norm.push_back(1.0 / std::sqrt(std::pow(2.0 * M_PI, 3) * det));
+        all_w.push_back(gmm.weights(c));
+      }
+    };
+    add_components(neg_obs_gmm);
+    add_components(obstacle_gmm);
+
+    double p_threshold = 1e-10;
+    const bool use_invalid_filter = !all_mu.empty();
+    if (use_invalid_filter) {
+      std::vector<double> peaks;
+      peaks.reserve(all_mu.size());
+      for (size_t c = 0; c < all_mu.size(); ++c) {
+        peaks.push_back(all_w[c] * all_norm[c]);
+      }
+      std::sort(peaks.begin(), peaks.end());
+      p_threshold = peaks[peaks.size() / 2] * 0.5;
+      if (p_threshold < 1e-10) p_threshold = 1e-10;
+    }
+
+    struct Candidate {
+      int idx = -1;
+      double score = 0.0;
+      double min_drone_d = 0.0;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(n);
+
+    for (int i = 0; i < n; ++i) {
+      const double w = std::max(0.0, weights(i));
+      if (w < 1e-12) continue;
+
+      const Eigen::Vector3d pos = particles.col(i).head(3);
+      if (use_invalid_filter) {
+        double p_invalid = 0.0;
+        for (size_t c = 0; c < all_mu.size(); ++c) {
+          Eigen::Vector3d diff = pos - all_mu[c];
+          double exponent = -0.5 * diff.transpose() * all_cov_inv[c] * diff;
+          p_invalid += all_w[c] * all_norm[c] * std::exp(exponent);
+        }
+        double ratio = p_invalid / p_threshold;
+        if (ratio >= reject_ratio) {
+          continue;
+        }
+      }
+
+      double nearest_drone_dist = std::numeric_limits<double>::infinity();
+      if (drone_positions.empty()) {
+        nearest_drone_dist = min_dist;
+      } else {
+        for (const auto& dp : drone_positions) {
+          nearest_drone_dist = std::min(nearest_drone_dist, (pos - dp).norm());
+        }
+      }
+
+      // 前沿评分：基础权重 + 远离无人机加成
+      double frontier_bonus = std::max(0.0, nearest_drone_dist - min_dist);
+      double score = w * (1.0 + frontier_bonus);
+      candidates.push_back({i, score, nearest_drone_dist});
+    }
+
+    if (candidates.empty()) {
+      return hotspots;
+    }
+
+    const int max_seed_num = std::min<int>(K, candidates.size());
+    std::vector<int> seed_candidates;
+    std::vector<bool> selected(candidates.size(), false);
+    seed_candidates.reserve(max_seed_num);
+
+    // Seed 1: 前沿评分最大
+    int first_seed = -1;
+    double first_score = -1.0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      if (candidates[i].score > first_score) {
+        first_score = candidates[i].score;
+        first_seed = i;
+      }
+    }
+    if (first_seed < 0) {
+      return hotspots;
+    }
+    seed_candidates.push_back(first_seed);
+    selected[first_seed] = true;
+
+    // Seed 2..K: 加权最远点采样
+    while ((int)seed_candidates.size() < max_seed_num) {
+      int best_idx = -1;
+      double best_score = -1.0;
+      for (size_t i = 0; i < candidates.size(); ++i) {
+        if (selected[i]) continue;
+        const Eigen::Vector3d p = particles.col(candidates[i].idx).head(3);
+        double dmin = std::numeric_limits<double>::infinity();
+        for (int seed_i : seed_candidates) {
+          const Eigen::Vector3d ps = particles.col(candidates[seed_i].idx).head(3);
+          dmin = std::min(dmin, (p - ps).norm());
+        }
+        double score = candidates[i].score * std::max(0.1, dmin);
+        if (score > best_score) {
+          best_score = score;
+          best_idx = i;
+        }
+      }
+      if (best_idx < 0) break;
+      seed_candidates.push_back(best_idx);
+      selected[best_idx] = true;
+    }
+
+    // 每个seed只在局部邻域做加权均值，避免被全局分量拉回中心
+    hotspots.reserve(seed_candidates.size());
+    const double inv_sigma2 = 1.0 / (radius * radius);
+    for (int seed_i : seed_candidates) {
+      const int seed_particle_idx = candidates[seed_i].idx;
+      const Eigen::Vector3d seed_pos = particles.col(seed_particle_idx).head(3);
+
+      Eigen::Vector3d sum_pos = Eigen::Vector3d::Zero();
+      Eigen::Vector3d sum_vel = Eigen::Vector3d::Zero();
+      double sum_w = 0.0;
+
+      for (const auto& c : candidates) {
+        const Eigen::Vector3d p = particles.col(c.idx).head(3);
+        const double d = (p - seed_pos).norm();
+        if (d > radius) continue;
+
+        const Eigen::Vector3d v = particles.col(c.idx).segment(3, 3);
+        const double base_w = std::max(0.0, weights(c.idx));
+        const double kernel = std::exp(-0.5 * d * d * inv_sigma2);
+        const double frontier_term = 1.0 + std::max(0.0, c.min_drone_d - min_dist);
+        const double local_w = base_w * kernel * frontier_term;
+        if (local_w < 1e-12) continue;
+
+        sum_pos += local_w * p;
+        sum_vel += local_w * v;
+        sum_w += local_w;
+      }
+
+      SearchHotspot h;
+      if (sum_w > 1e-10) {
+        h.pos = sum_pos / sum_w;
+        h.vel = sum_vel / sum_w;
+        h.weight = sum_w;
+      } else {
+        h.pos = seed_pos;
+        h.vel = particles.col(seed_particle_idx).segment(3, 3);
+        h.weight = candidates[seed_i].score;
+      }
+      hotspots.push_back(h);
+    }
+
     std::sort(hotspots.begin(), hotspots.end(),
               [](const SearchHotspot& a, const SearchHotspot& b) {
                 return a.weight > b.weight;

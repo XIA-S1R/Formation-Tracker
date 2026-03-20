@@ -93,7 +93,6 @@ int dpf_reset_suppress_count_ = 0;
 // 搜索模式相关
 int miss_detection_num_ = 5; // 连续多少帧都没有观测后进入搜索模式
 int consecutive_no_obs_count_ = 0; // 连续无观测计数
-int neg_obs_num_=0; // 负观测计数器
 bool search_mode_active_ = false; // 是否处于搜索模式
 ros::Time last_global_obs_time_;
 
@@ -104,11 +103,19 @@ ros::Time last_hotspot_extract_time_ = ros::Time(0);
 double hotspot_extract_interval_ = 2.0; // 重新提取间隔(秒)
 bool has_committed_direction_ = false;
 double search_advance_vmax_ = 2.0; // 搜索模式推进速度，优先使用当前无人机 planning/vmax
+double neg_obs_ttl_sec_ = 8.0;               // 负观测无效区域记忆时长
+double hotspot_min_drone_dist_ = 2.0;        // 热点与最近无人机最小期望距离
+double hotspot_seed_radius_ = 1.5;           // 热点局部融合半径
+double hotspot_invalid_reject_ratio_ = 1.0;  // 无效密度拒绝阈值（相对prune阈值）
 
 // 无效区域GMM存储（并集共识）
 using InvalidGMM3D = SearchParticlesManager::InvalidGMM3D;
 std::mutex invalid_gmm_mutex_;
-std::map<int, InvalidGMM3D> received_neg_obs_gmms_;   // 邻居的负观测GMM（每帧清空）
+struct TimedInvalidGMM3D {
+  InvalidGMM3D gmm;
+  ros::Time stamp;
+};
+std::map<int, TimedInvalidGMM3D> received_neg_obs_gmms_;  // 邻居负观测GMM（TTL缓存）
 std::map<int, InvalidGMM3D> received_obstacle_gmms_;   // 邻居的障碍GMM（持久留存）
 InvalidGMM3D global_neg_obs_gmm_;    // 全局负观测GMM（当前帧有效）
 InvalidGMM3D global_obstacle_gmm_;   // 全局障碍GMM（一直留存）
@@ -503,7 +510,10 @@ void invalid_gmm_callback(const target_ekf::InvalidRegionGMM::ConstPtr& msg) {
   std::lock_guard<std::mutex> lock(invalid_gmm_mutex_);
   InvalidGMM3D gmm = fromInvalidGMMMsg(msg);
   if (msg->type == 0) {
-    received_neg_obs_gmms_[msg->drone_id] = gmm;
+    TimedInvalidGMM3D timed;
+    timed.gmm = gmm;
+    timed.stamp = msg->header.stamp.isZero() ? ros::Time::now() : msg->header.stamp;
+    received_neg_obs_gmms_[msg->drone_id] = timed;
   } else {
     received_obstacle_gmms_[msg->drone_id] = gmm;
   }
@@ -1084,13 +1094,19 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     // 并集共识
     {
       std::lock_guard<std::mutex> lock(invalid_gmm_mutex_);
-      // 负观测GMM：当前帧有效，先清空再合并
-      global_neg_obs_gmm_ = unionGMMs(local_neg_obs_gmm, received_neg_obs_gmms_);
-      neg_obs_num_ += 1;
-      if (neg_obs_num_ > 5){
-      received_neg_obs_gmms_.clear(); 
-      neg_obs_num_ = 0;
-      }// 每一定帧清空
+      // 负观测GMM：TTL缓存内有效，超时自动清理
+      std::map<int, InvalidGMM3D> fresh_neg_obs_gmms;
+      const ros::Time now = ros::Time::now();
+      for (auto it = received_neg_obs_gmms_.begin(); it != received_neg_obs_gmms_.end();) {
+        const double age = (now - it->second.stamp).toSec();
+        if (age <= neg_obs_ttl_sec_) {
+          fresh_neg_obs_gmms[it->first] = it->second.gmm;
+          ++it;
+        } else {
+          it = received_neg_obs_gmms_.erase(it);
+        }
+      }
+      global_neg_obs_gmm_ = unionGMMs(local_neg_obs_gmm, fresh_neg_obs_gmms);
 
       // 障碍GMM：持久留存，更新本机的，保留历史邻居的
       received_obstacle_gmms_[drone_id_] = local_obstacle_gmm;
@@ -1113,18 +1129,43 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     // 收集所有无人机位置
     std::vector<std::pair<int, Eigen::Vector3d>> drone_positions;
     {
-      std::lock_guard<std::mutex> lock(neighbor_odom_mutex_);
+      std::lock_guard<std::mutex> lock_self(odom_mutex_);
       drone_positions.push_back({drone_id_, latest_odom_pos_});
+    }
+    {
+      std::lock_guard<std::mutex> lock_neighbor(neighbor_odom_mutex_);
       for (auto& kv : neighbor_positions_) {
         drone_positions.push_back(kv);
       }
     }
 
     if (need_extract) {
-      // 提取热点，传入无人机位置做排斥
+      // 提取热点（优先基于当前粒子云前沿提取），传入无人机位置做排斥
       std::vector<Eigen::Vector3d> dp_vec;
       for (auto& kv : drone_positions) dp_vec.push_back(kv.second);
-      auto hotspots = search_particles_manager_->extractHotspots(num_drones_, dp_vec);
+      auto hotspots = search_particles_manager_->extractFrontierHotspotsFromParticles(
+          dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_,
+          num_drones_, dp_vec, global_neg_obs_gmm_, global_obstacle_gmm_,
+          hotspot_min_drone_dist_, hotspot_seed_radius_, hotspot_invalid_reject_ratio_);
+      if (hotspots.empty()) {
+        hotspots = search_particles_manager_->extractHotspots(num_drones_, dp_vec);
+        ROS_WARN_THROTTLE(1.0, "[dpf%d] Frontier hotspots empty, fallback to GMM hotspots",
+                          drone_id_);
+      }
+
+      // 发布候选热点用于调试可视化
+      geometry_msgs::PoseArray hotspot_msg;
+      hotspot_msg.header.stamp = ros::Time::now();
+      hotspot_msg.header.frame_id = "world";
+      for (const auto& h : hotspots) {
+        geometry_msgs::Pose p;
+        p.position.x = h.pos.x();
+        p.position.y = h.pos.y();
+        p.position.z = h.pos.z();
+        p.orientation.w = 1.0;
+        hotspot_msg.poses.push_back(p);
+      }
+      search_targets_pub_.publish(hotspot_msg);
 
       if (!hotspots.empty()) {
         int nd = drone_positions.size();
@@ -1552,7 +1593,12 @@ int main(int argc, char** argv) {
   nh.getParam("max_obs_depth", max_obs_depth_);
   // 搜索模式参数
   nh.getParam("miss_detection_num", miss_detection_num_);
-  nh.getParam("neg_obs_num", neg_obs_num_);
+  nh.param("neg_obs_ttl_sec", neg_obs_ttl_sec_, 8.0);
+  nh.param("hotspot_min_drone_dist", hotspot_min_drone_dist_, 2.0);
+  nh.param("hotspot_seed_radius", hotspot_seed_radius_, 1.5);
+  nh.param("hotspot_invalid_reject_ratio", hotspot_invalid_reject_ratio_, 1.0);
+  ROS_INFO("[dpf%d] Search frontier params: neg_obs_ttl=%.1fs, min_drone_dist=%.2fm, seed_radius=%.2fm, invalid_reject_ratio=%.2f",
+           drone_id_, neg_obs_ttl_sec_, hotspot_min_drone_dist_, hotspot_seed_radius_, hotspot_invalid_reject_ratio_);
   // DPF参数
   int num_particles = 300;
   int num_components = 4;

@@ -138,8 +138,11 @@
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
-      <param name="neg_obs_num" value="5"/>
-      <param name="miss_detection_num" value="5"/>
+      <param name="miss_detection_num" value="2"/>
+      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="hotspot_min_drone_dist" value="2.0"/>
+      <param name="hotspot_seed_radius" value="1.5"/>
+      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
       <remap from="~target_odom" to="target_ekf_odom"/>
@@ -185,8 +188,11 @@
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
-      <param name="neg_obs_num" value="5"/>
-      <param name="miss_detection_num" value="5"/>
+      <param name="miss_detection_num" value="2"/>
+      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="hotspot_min_drone_dist" value="2.0"/>
+      <param name="hotspot_seed_radius" value="1.5"/>
+      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
       <remap from="~target_odom" to="target_ekf_odom"/>
@@ -232,8 +238,11 @@
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
-      <param name="neg_obs_num" value="5"/>
-      <param name="miss_detection_num" value="5"/>
+      <param name="miss_detection_num" value="2"/>
+      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="hotspot_min_drone_dist" value="2.0"/>
+      <param name="hotspot_seed_radius" value="1.5"/>
+      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
       <remap from="~target_odom" to="target_ekf_odom"/>
