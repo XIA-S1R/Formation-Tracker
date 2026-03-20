@@ -95,6 +95,44 @@ def run_cmd(cmd, cwd, log_path):
         return subprocess.run(['/bin/bash', '-lc', cmd], cwd=str(cwd), stdout=f, stderr=subprocess.STDOUT).returncode
 
 
+def run_trigger_cmd(cmd, cwd, log_path, max_run_sec=1.5):
+    """
+    Trigger command may be a continuous publisher (e.g. pub_triger.sh).
+    Run it for at most max_run_sec, then stop and treat timeout-stop as success.
+    """
+    with open(log_path, 'w') as f:
+        proc = subprocess.Popen(
+            ['/bin/bash', '-lc', cmd],
+            cwd=str(cwd),
+            stdout=f,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+        )
+        try:
+            return proc.wait(timeout=max(0.1, float(max_run_sec)))
+        except subprocess.TimeoutExpired:
+            # Expected for continuous trigger publishers; stop and continue.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+            return 0
+
+
 def read_metrics_json(path):
     with open(path, 'r') as f:
         data = json.load(f)
@@ -174,6 +212,7 @@ def main():
 
     parser.add_argument('--launch-cmd', default='roslaunch simulation tracking_sim_triangle.launch')
     parser.add_argument('--trigger-cmd', default='./sh_utils/pub_triger.sh')
+    parser.add_argument('--trigger-max-seconds', type=float, default=1.5)
     parser.add_argument('--evasion-cmd', default='python3 src/planning/planning/scripts/full_evasion.py')
     parser.add_argument('--rviz-cmd', default='rviz -d $(rospack find simulation)/config/tracking_sim.rviz')
     parser.add_argument('--with-rviz', action='store_true')
@@ -238,7 +277,12 @@ def main():
             time.sleep(max(0.0, args.warmup))
 
             print(f'[{run_tag}] trigger...')
-            trig_rc = run_cmd(args.trigger_cmd, repo_root, trigger_log)
+            trig_rc = run_trigger_cmd(
+                args.trigger_cmd,
+                repo_root,
+                trigger_log,
+                max_run_sec=args.trigger_max_seconds,
+            )
             if trig_rc != 0:
                 raise RuntimeError('trigger command failed')
 
