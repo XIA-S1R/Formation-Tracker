@@ -566,6 +566,10 @@ class Nodelet : public nodelet::Nodelet {
     bool generate_new_traj_success = prePtr_->predict(target_p, target_v, target_predcit);// 预测采用简单的匀速模型A*拓展（可以考虑在其中添加丢失观测只靠预测时的不确定度）
     // ros::Time t_stop = ros::Time::now();
     // std::cout << "predict costs: " << (t_stop - t_start).toSec() * 1e3 << "ms" << std::endl;
+    if (generate_new_traj_success && target_predcit.empty()) {
+      ROS_WARN("[drone %d] prediction returned empty path, skip this cycle", trajOptPtr_->drone_id_);
+      generate_new_traj_success = false;
+    }
     if (generate_new_traj_success) {
       Eigen::Vector3d observable_p = target_predcit.back();
       visPtr_->visualize_path(target_predcit, "car_predict");
@@ -619,9 +623,16 @@ class Nodelet : public nodelet::Nodelet {
     if (generate_new_traj_success) {
       // 统一使用 short_astar 搜索到目标位置（终点调整已在 short_astar 内部处理）
       ROS_DEBUG("[drone %d] starting path search", trajOptPtr_->drone_id_);
-      Eigen::Vector3d actual_target;
+      Eigen::Vector3d actual_target = target_p;
       generate_new_traj_success = envPtr_->short_astar(p_start, target_p, path, &actual_target);;
       ROS_DEBUG("[drone %d] path search done: %d", trajOptPtr_->drone_id_, generate_new_traj_success);
+
+      if (generate_new_traj_success && path.empty()) {
+        // 防御式兜底：short_astar 成功但返回空路径时，至少保留终点，避免后续 back() 崩溃
+        path.push_back(actual_target);
+        ROS_WARN("[drone %d] short_astar returned empty path, fallback to single-point path",
+                 trajOptPtr_->drone_id_);
+      }
 
       // 如果目标位置被调整过，预测轨迹也要相应偏移
       if (generate_new_traj_success && (actual_target - target_p).norm() > 0.01) {

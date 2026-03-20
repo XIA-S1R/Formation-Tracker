@@ -63,7 +63,10 @@ def analyze_bag(
 ):
     drone_positions = {}  # drone_id -> (x,y,z)
     drone_speeds = defaultdict(list)
+    drone_speeds_tracking = defaultdict(list)
+    drone_speeds_search = defaultdict(list)
     drone_last_replan_state = {}
+    replan_failed_hovering_count = 0
     emergency_stop_count = 0
 
     # search_state timeline
@@ -73,6 +76,8 @@ def analyze_bag(
     # odom-driven evaluation timeline
     eval_times = []
     formation_err_samples = []
+    formation_err_samples_tracking = []
+    formation_err_samples_search = []
     min_pair_dist_samples = []
     collision_count = 0
     collision_active = False
@@ -95,8 +100,15 @@ def analyze_bag(
                     continue
                 p = msg.pose.pose.position
                 v = msg.twist.twist.linear
+                speed = vec_norm3(v.x, v.y, v.z)
                 drone_positions[drone_id] = (p.x, p.y, p.z)
-                drone_speeds[drone_id].append(vec_norm3(v.x, v.y, v.z))
+                drone_speeds[drone_id].append(speed)
+                # 速度按本机模式拆分
+                if drone_id in search_state_now:
+                    if search_state_now[drone_id]:
+                        drone_speeds_search[drone_id].append(speed)
+                    else:
+                        drone_speeds_tracking[drone_id].append(speed)
 
                 # use every odom update as eval tick when all drones are available
                 eval_times.append(ts)
@@ -115,6 +127,13 @@ def analyze_bag(
                         errs = [(d - formation_side_length) ** 2 for d in dists]
                         formation_err = math.sqrt(sum(errs) / len(errs))
                         formation_err_samples.append(formation_err)
+                        # 队形误差按全队模式拆分（全员search_state==true 判定为搜索模式）
+                        if ids and all(i in search_state_now for i in ids):
+                            all_search_now = all(search_state_now[i] for i in ids)
+                            if all_search_now:
+                                formation_err_samples_search.append(formation_err)
+                            else:
+                                formation_err_samples_tracking.append(formation_err)
 
                         # collision event with hysteresis
                         if (not collision_active) and min_d <= collision_distance:
@@ -141,6 +160,8 @@ def analyze_bag(
                     continue
                 st = int(msg.state)
                 prev = drone_last_replan_state.get(drone_id, None)
+                if st == 1 and prev != 1:
+                    replan_failed_hovering_count += 1
                 if st == 2 and prev != 2:
                     emergency_stop_count += 1
                 drone_last_replan_state[drone_id] = st
@@ -236,14 +257,32 @@ def analyze_bag(
 
     # speed stats
     speed_metrics = {}
+    speed_metrics_tracking = {}
+    speed_metrics_search = {}
     all_speed_samples = []
+    all_speed_samples_tracking = []
+    all_speed_samples_search = []
     for drone_id in sorted(drone_speeds.keys()):
         s = drone_speeds[drone_id]
+        s_tracking = drone_speeds_tracking[drone_id]
+        s_search = drone_speeds_search[drone_id]
         all_speed_samples.extend(s)
+        all_speed_samples_tracking.extend(s_tracking)
+        all_speed_samples_search.extend(s_search)
         speed_metrics[str(drone_id)] = {
             'mean': mean_or_zero(s),
             'p95': percentile(s, 0.95),
             'max': max(s) if s else 0.0,
+        }
+        speed_metrics_tracking[str(drone_id)] = {
+            'mean': mean_or_zero(s_tracking),
+            'p95': percentile(s_tracking, 0.95),
+            'max': max(s_tracking) if s_tracking else 0.0,
+        }
+        speed_metrics_search[str(drone_id)] = {
+            'mean': mean_or_zero(s_search),
+            'p95': percentile(s_search, 0.95),
+            'max': max(s_search) if s_search else 0.0,
         }
 
     result = {
@@ -260,13 +299,28 @@ def analyze_bag(
         'formation_error_mean': mean_or_zero(formation_err_samples),
         'formation_error_p95': percentile(formation_err_samples, 0.95),
         'formation_error_max': max(formation_err_samples) if formation_err_samples else 0.0,
+        'formation_error_mean_tracking': mean_or_zero(formation_err_samples_tracking),
+        'formation_error_p95_tracking': percentile(formation_err_samples_tracking, 0.95),
+        'formation_error_max_tracking': max(formation_err_samples_tracking) if formation_err_samples_tracking else 0.0,
+        'formation_error_mean_search': mean_or_zero(formation_err_samples_search),
+        'formation_error_p95_search': percentile(formation_err_samples_search, 0.95),
+        'formation_error_max_search': max(formation_err_samples_search) if formation_err_samples_search else 0.0,
         'collision_count': collision_count,
         'min_inter_drone_distance': min(min_pair_dist_samples) if min_pair_dist_samples else 0.0,
+        'replan_failed_hovering_count': replan_failed_hovering_count,
         'emergency_stop_count': emergency_stop_count,
         'speed_mean_all': mean_or_zero(all_speed_samples),
         'speed_p95_all': percentile(all_speed_samples, 0.95),
         'speed_max_all': max(all_speed_samples) if all_speed_samples else 0.0,
+        'speed_mean_tracking': mean_or_zero(all_speed_samples_tracking),
+        'speed_p95_tracking': percentile(all_speed_samples_tracking, 0.95),
+        'speed_max_tracking': max(all_speed_samples_tracking) if all_speed_samples_tracking else 0.0,
+        'speed_mean_search': mean_or_zero(all_speed_samples_search),
+        'speed_p95_search': percentile(all_speed_samples_search, 0.95),
+        'speed_max_search': max(all_speed_samples_search) if all_speed_samples_search else 0.0,
         'speed_by_drone': speed_metrics,
+        'speed_by_drone_tracking': speed_metrics_tracking,
+        'speed_by_drone_search': speed_metrics_search,
     }
     return result
 
@@ -289,12 +343,25 @@ def write_summary_csv(rows, out_csv):
         'formation_error_mean',
         'formation_error_p95',
         'formation_error_max',
+        'formation_error_mean_tracking',
+        'formation_error_p95_tracking',
+        'formation_error_max_tracking',
+        'formation_error_mean_search',
+        'formation_error_p95_search',
+        'formation_error_max_search',
         'collision_count',
         'min_inter_drone_distance',
+        'replan_failed_hovering_count',
         'emergency_stop_count',
         'speed_mean_all',
         'speed_p95_all',
         'speed_max_all',
+        'speed_mean_tracking',
+        'speed_p95_tracking',
+        'speed_max_tracking',
+        'speed_mean_search',
+        'speed_p95_search',
+        'speed_max_search',
     ]
     with open(out_csv, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

@@ -719,6 +719,7 @@ class Env {
                           const Eigen::Vector3d& end_p,
                           std::vector<Eigen::Vector3d>& path,
                           Eigen::Vector3d* actual_end_p = nullptr) {
+    path.clear();
     Eigen::Vector3i start_idx = mapPtr_->pos2idx(start_p);
     Eigen::Vector3i end_idx = mapPtr_->pos2idx(end_p);
     Eigen::Vector3d adjusted_end = end_p;
@@ -844,10 +845,13 @@ class Env {
       }
     }
     if (ret) {
-      for (NodePtr ptr = curPtr->parent; ptr->parent != nullptr; ptr = ptr->parent) {
-        path.push_back(mapPtr_->idx2pos(ptr->idx));
+      // 回溯时包含终点，确保成功返回时 path 非空（相邻栅格时尤其关键）
+      std::vector<Eigen::Vector3d> rev_path;
+      for (NodePtr ptr = curPtr; ptr != nullptr && ptr->parent != nullptr; ptr = ptr->parent) {
+        rev_path.push_back(mapPtr_->idx2pos(ptr->idx));
       }
-      std::reverse(path.begin(), path.end());
+      std::reverse(rev_path.begin(), rev_path.end());
+      path.swap(rev_path);
     }
     visited_nodes_.clear();
     return ret;
