@@ -578,9 +578,14 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
   if (cfgHs_.size() == 1) {
     cfgHs_.push_back(cfgHs_[0]);
   }
-  // extractVs only for P initialization (not for hard constraint)
-  extractVs(cfgHs_, cfgVs_);
-  N_ = 2 * cfgHs_.size();
+  // 软约束：N_ 由路径弧长决定，不依赖走廊数量
+  {
+    constexpr double seg_len = 2.0;
+    constexpr int N_min = 4;
+    constexpr int N_max = 20;
+    double dist = (finState.col(0) - iniState.col(0)).norm();
+    N_ = std::max(N_min, std::min(N_max, (int)std::ceil(dist / seg_len)));
+  }
   sum_T_ = tracking_dur_;
 
   ROS_INFO("[drone %d traj_opt] corridors=%zu, N=%d, sum_T=%.2f, time_per_piece=%.3f",
@@ -677,9 +682,21 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
   if (cfgHs_.size() == 1) {
     cfgHs_.push_back(cfgHs_[0]);
   }
-  // extractVs only for P initialization (not for hard constraint)
-  extractVs(cfgHs_, cfgVs_);
-  N_ = 2 * cfgHs_.size();
+  // 软约束：N_ 由路径弧长决定，不依赖走廊数量
+  {
+    constexpr double seg_len = 2.0;  // 每段目标长度(m)
+    constexpr int N_min = 4;
+    constexpr int N_max = 20;
+    if (path.size() >= 2) {
+      double total_len = 0.0;
+      for (size_t j = 1; j < path.size(); ++j)
+        total_len += (path[j] - path[j-1]).norm();
+      N_ = std::max(N_min, std::min(N_max, (int)std::ceil(total_len / seg_len)));
+    } else {
+      double dist = (finState.col(0) - iniState.col(0)).norm();
+      N_ = std::max(N_min, std::min(N_max, (int)std::ceil(dist / seg_len)));
+    }
+  }
   sum_T_ = tracking_dur_;
 
   ROS_INFO("[drone %d traj_opt] corridors=%zu, N=%d, sum_T=%.2f, time_per_piece=%.3f",
@@ -944,7 +961,6 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度走�
     s1 = 0.0;//s1为采样点在当前端轨迹的时间
     innerLoop = K_ + 1;
 
-    const auto& hPoly = cfgHs_[i / 2];
     for (int j = 0; j < innerLoop; ++j) {//j为每段轨迹内的采样点索引
       s2 = s1 * s1;
       s3 = s2 * s1;
@@ -967,6 +983,7 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度走�
 
       // === corridor / obstacle penalty (switched by use_soft_constraint_) ===
       if (use_soft_constraint_) {
+        // 软约束：ESDF梯度，不涉及走廊
         if (grad_cost_obstacle(pos, grad_tmp, cost_tmp)) {
           gradViolaPc = beta0 * grad_tmp.transpose();
           gradViolaPt = alpha * grad_tmp.transpose() * vel;
@@ -976,6 +993,8 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度走�
           debug_cost_corridor_ += omg * step * cost_tmp;
         }
       } else {
+        // 硬约束：走廊半平面惩罚
+        const auto& hPoly = cfgHs_[i / 2];
         if (grad_cost_p_corridor(pos, hPoly, grad_tmp, cost_tmp)) {
           gradViolaPc = beta0 * grad_tmp.transpose();
           gradViolaPt = alpha * grad_tmp.transpose() * vel;

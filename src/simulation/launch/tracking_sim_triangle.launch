@@ -74,8 +74,8 @@
       <remap from="~triger"          to="/move_base_simple/goal"/>
       <param name="plan_hz"          value="20"/>
       <param name="K"                value="8"/>
-      <param name="vmax"             value="3"/>
-      <param name="amax"             value="6"/>
+      <param name="vmax"             value="2"/>
+      <param name="amax"             value="4"/>
       <param name="rhoT"             value="100.0"/>
       <param name="rhoP"             value="10000.0"/>
       <param name="rhoV"             value="1000.0"/>
@@ -129,6 +129,7 @@
     <node name="drone0_target_dpf" pkg="target_ekf"
           type="target_dpf_sim_node" output="screen">
       <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
+      <param name="max_obs_depth" value="8.0"/>
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="0"/>
       <param name="num_drones" value="3"/>
@@ -137,6 +138,8 @@
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
+      <param name="neg_obs_num" value="5"/>
+      <param name="miss_detection_num" value="5"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
       <remap from="~target_odom" to="target_ekf_odom"/>
@@ -173,6 +176,7 @@
     <node name="drone1_target_dpf" pkg="target_ekf"
           type="target_dpf_sim_node" output="screen">
       <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
+      <param name="max_obs_depth" value="8.0"/>
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="1"/>
       <param name="num_drones" value="3"/>
@@ -181,6 +185,8 @@
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
+      <param name="neg_obs_num" value="5"/>
+      <param name="miss_detection_num" value="5"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
       <remap from="~target_odom" to="target_ekf_odom"/>
@@ -217,6 +223,7 @@
     <node name="drone2_target_dpf" pkg="target_ekf"
           type="target_dpf_sim_node" output="screen">
       <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
+      <param name="max_obs_depth" value="8.0"/>
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="2"/>
       <param name="num_drones" value="3"/>
@@ -225,6 +232,8 @@
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
+      <param name="neg_obs_num" value="5"/>
+      <param name="miss_detection_num" value="5"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
       <remap from="~target_odom" to="target_ekf_odom"/>

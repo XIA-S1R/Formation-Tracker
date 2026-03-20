@@ -63,7 +63,7 @@ Eigen::Vector3d cam2body_p_;
 double fx_, fy_, cx_, cy_, width_, height_;
 double pitch_thr_ = 30;
 bool check_fov_ = false;
-double max_obs_depth_ = 15.0;  // 相机最大观测深度(m)
+double max_obs_depth_ = 8.0;  // 相机最大观测深度(m)
 
 // 无人机自身位姿（odom回调更新）
 std::mutex odom_mutex_;
@@ -91,8 +91,9 @@ ros::Time last_update_stamp_;
 int dpf_reset_suppress_count_ = 0;
 
 // 搜索模式相关
-int miss_detection_num_ = 0; // 连续多少帧都没有观测后进入搜索模式
+int miss_detection_num_ = 5; // 连续多少帧都没有观测后进入搜索模式
 int consecutive_no_obs_count_ = 0; // 连续无观测计数
+int neg_obs_num_=0; // 负观测计数器
 bool search_mode_active_ = false; // 是否处于搜索模式
 ros::Time last_global_obs_time_;
 
@@ -102,6 +103,7 @@ Eigen::Vector3d committed_target_pos_ = Eigen::Vector3d::Zero(); // 当前推进
 ros::Time last_hotspot_extract_time_ = ros::Time(0);
 double hotspot_extract_interval_ = 2.0; // 重新提取间隔(秒)
 bool has_committed_direction_ = false;
+double search_advance_vmax_ = 2.0; // 搜索模式推进速度，优先使用当前无人机 planning/vmax
 
 // 无效区域GMM存储（并集共识）
 using InvalidGMM3D = SearchParticlesManager::InvalidGMM3D;
@@ -1084,7 +1086,11 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       std::lock_guard<std::mutex> lock(invalid_gmm_mutex_);
       // 负观测GMM：当前帧有效，先清空再合并
       global_neg_obs_gmm_ = unionGMMs(local_neg_obs_gmm, received_neg_obs_gmms_);
-      received_neg_obs_gmms_.clear(); // 每帧清空
+      neg_obs_num_ += 1;
+      if (neg_obs_num_ > 5){
+      received_neg_obs_gmms_.clear(); 
+      neg_obs_num_ = 0;
+      }// 每一定帧清空
 
       // 障碍GMM：持久留存，更新本机的，保留历史邻居的
       received_obstacle_gmms_[drone_id_] = local_obstacle_gmm;
@@ -1161,13 +1167,13 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       }
     } else if (has_committed_direction_) {
       // 沿承诺方向持续推进目标：每帧向前推 vmax * dt
-      double vmax = search_particles_manager_->getSearchVmax();
+      double vmax = search_advance_vmax_;
       committed_target_pos_ += committed_search_dir_ * vmax * 0.2; // 5Hz, dt=0.2s
     }
 
     // 发布搜索目标
     if (has_committed_direction_) {
-      double vmax = search_particles_manager_->getSearchVmax();
+      double vmax = search_advance_vmax_;
       nav_msgs::Odometry target_odom;
       target_odom.header.stamp = ros::Time::now();
       target_odom.header.frame_id = "world";
@@ -1546,6 +1552,7 @@ int main(int argc, char** argv) {
   nh.getParam("max_obs_depth", max_obs_depth_);
   // 搜索模式参数
   nh.getParam("miss_detection_num", miss_detection_num_);
+  nh.getParam("neg_obs_num", neg_obs_num_);
   // DPF参数
   int num_particles = 300;
   int num_components = 4;
@@ -1559,6 +1566,25 @@ int main(int argc, char** argv) {
   
   // 创建搜索粒子管理器
   search_particles_manager_ = std::make_unique<SearchParticlesManager>(drone_id_, num_components, &nh);
+
+  // 搜索推进速度：优先使用当前无人机 planning/vmax；找不到时回退到原搜索速度参数
+  std::string ns = ros::this_node::getNamespace();
+  if (ns.empty()) {
+    ns = "/";
+  }
+  if (ns.back() != '/') {
+    ns += "/";
+  }
+  const std::string planning_vmax_param = ns + "planning/vmax";
+  if (!ros::param::get(planning_vmax_param, search_advance_vmax_)) {
+    search_advance_vmax_ = search_particles_manager_->getSearchVmax();
+    ROS_WARN("[dpf%d] Param %s not found, fallback search_advance_vmax=%.2f",
+             drone_id_, planning_vmax_param.c_str(), search_advance_vmax_);
+  } else {
+    ROS_INFO("[dpf%d] search_advance_vmax=%.2f from %s",
+             drone_id_, search_advance_vmax_, planning_vmax_param.c_str());
+  }
+
   // ✅ 设置视线检查函数
   search_particles_manager_->setLineOfSightCheckFn(
   [](const Eigen::Vector3d& start, const Eigen::Vector3d& end) {

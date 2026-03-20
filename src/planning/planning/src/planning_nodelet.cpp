@@ -461,7 +461,21 @@ class Nodelet : public nodelet::Nodelet {
       wait_hover_ = false;
     } else {//追踪逻辑
       if (search_mode_active_) {
-        // 搜索模式：target_p 已经是dpf节点发布的热点位置，直接使用
+        // 搜索模式：target_p 已经是 dpf 节点发布的热点位置，偏航在朝向热点基础上连续摇头扫描
+        Eigen::Vector3d dir = target_p - odom_p;
+        dir.z() = 0.0;
+        double base_yaw = search_desired_yaw_;
+        if (dir.head<2>().norm() > 1e-2) {
+          base_yaw = std::atan2(dir.y(), dir.x());
+        }
+
+        // 连续正弦扫角，避免离散跳变导致抖动
+        const double scan_angle_range = M_PI / 6.0;  // ±30 deg
+        const double scan_freq_hz = 0.35;            // 约 2.86s 一个完整摇头周期
+        const double t = ros::Time::now().toSec();
+        const double yaw_offset = scan_angle_range * std::sin(2.0 * M_PI * scan_freq_hz * t);
+        search_desired_yaw_ = base_yaw + yaw_offset;
+        search_desired_yaw_ = std::atan2(std::sin(search_desired_yaw_), std::cos(search_desired_yaw_));
         target_p.z() = std::max(2.0, odom_p.z());  // 保持安全高度
 
         ROS_INFO_THROTTLE(1.0, "[planner drone%d] SEARCH MODE: target=(%.2f,%.2f,%.2f)",
@@ -494,9 +508,10 @@ class Nodelet : public nodelet::Nodelet {
       }
       Eigen::Vector3d project_yaw = odom_q.toRotationMatrix().col(0);  // NOTE ZYX
       double now_yaw = std::atan2(project_yaw.y(), project_yaw.x());
+      double yaw_err = std::atan2(std::sin(desired_yaw - now_yaw), std::cos(desired_yaw - now_yaw));
       if (std::fabs((target_p - odom_p).norm() - tracking_dist_) < tolerance_d_ &&
           odom_v.norm() < 0.1 && target_v.norm() < 0.2 &&
-          std::fabs(desired_yaw - now_yaw) < 0.5) {// 如果接近目标、速度够小、朝向正确，就保持悬停
+          std::fabs(yaw_err) < 0.5) {// 如果接近目标、速度够小、朝向正确，就保持悬停
         if (!wait_hover_) {
           pub_hover_p(odom_p, ros::Time::now());
           wait_hover_ = true;
@@ -668,33 +683,23 @@ class Nodelet : public nodelet::Nodelet {
       //   way_pts.insert(way_pts.begin(), p_start);
       //   envPtr_->pts2path(way_pts, path);
       // }
-      // NOTE corridor generating
+      // NOTE corridor generating (only needed for hard constraint mode)
       std::vector<Eigen::MatrixXd> hPolys;
       std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> keyPts;
 
-      // ros::Time t_front3 = ros::Time::now();
-      ROS_DEBUG("[drone %d] starting generateSFC", trajOptPtr_->drone_id_);
-      envPtr_->generateSFC(path, 2.0, hPolys, keyPts);
-      ROS_DEBUG("[drone %d] generateSFC done", trajOptPtr_->drone_id_);
-      // ros::Time t_end3 = ros::Time::now();
-      // double t_corridor = (t_end3 - t_front3).toSec() * 1e3;
-
-      envPtr_->visCorridor(hPolys);
-      visPtr_->visualize_pairline(keyPts, "keyPts");//生成了安全走廊hPolys（每个元素表示每段走廊的多边形数据），每段走廊的代表线段keyPts
+      if (!trajOptPtr_->use_soft_constraint_) {
+        ROS_DEBUG("[drone %d] starting generateSFC", trajOptPtr_->drone_id_);
+        envPtr_->generateSFC(path, 2.0, hPolys, keyPts);
+        ROS_DEBUG("[drone %d] generateSFC done", trajOptPtr_->drone_id_);
+        envPtr_->visCorridor(hPolys);
+        visPtr_->visualize_pairline(keyPts, "keyPts");
+      }
 
       // NOTE trajectory optimization
       Eigen::MatrixXd finState;
       finState.setZero(3, 3);
-      finState.col(0) = path.back();  // 用路径终点（pts2path 处理后的安全点）
+      finState.col(0) = path.back();
       finState.col(1) = target_v;
-      // 原逻辑（已注释）:
-      // if (land_triger_received_) {
-      //   finState.col(0) = target_predcit.back();
-      //   generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, traj);
-      // } else {
-      //   finState.col(0) = path.back();
-      //   generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, traj);
-      // }
       ROS_DEBUG("[drone %d] starting traj optimization", trajOptPtr_->drone_id_);
       if (trajOptPtr_->use_soft_constraint_) {
         generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, path, traj);
@@ -725,14 +730,18 @@ class Nodelet : public nodelet::Nodelet {
       replanStateMsg_.state = 0;
       replanState_pub_.publish(replanStateMsg_);
       Eigen::Vector3d dp = raw_target_p + target_v * 0.03 - iniState.col(0);
-      // NOTE : if the drone is going to unknown areas, watch that direction
-      // Eigen::Vector3d un_known_p = traj.getPos(1.0);
-      // if (gridmapPtr_->isUnKnown(un_known_p)) {
-      //   dp = un_known_p - odom_p;
-      // }
-      double yaw = std::atan2(dp.y(), dp.x());
+      double yaw = 0.0;
       if (land_triger_received_) {
         yaw = 2 * std::atan2(target_q.z(), target_q.w());
+      } else if (search_mode_active_) {
+        yaw = search_desired_yaw_;
+      } else {
+        // NOTE : if the drone is going to unknown areas, watch that direction
+        // Eigen::Vector3d un_known_p = traj.getPos(1.0);
+        // if (gridmapPtr_->isUnKnown(un_known_p)) {
+        //   dp = un_known_p - odom_p;
+        // }
+        yaw = std::atan2(dp.y(), dp.x());
       }
       pub_traj(traj, yaw, replan_stamp);
       traj_poly_ = traj;
