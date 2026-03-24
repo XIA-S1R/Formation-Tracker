@@ -57,9 +57,9 @@ def parse_drone_id_from_topic(topic):
 def analyze_bag(
     bag_path,
     formation_side_length=2.0,
-    collision_distance=0.35,
-    collision_release_distance=0.45,
-    reacq_timeout_sec=15.0,
+    collision_distance=0.0,
+    collision_release_distance=0.0,
+    reacq_timeout_sec=10.0,
 ):
     drone_positions = {}  # drone_id -> (x,y,z)
     drone_speeds = defaultdict(list)
@@ -285,17 +285,27 @@ def analyze_bag(
             'max': max(s_search) if s_search else 0.0,
         }
 
+    target_loss_durations_sec = [float(x) for x in view_loss_duration_list]
+    target_loss_total_duration_sec = float(sum(target_loss_durations_sec))
+    target_loss_max_duration_sec = float(max(target_loss_durations_sec)) if target_loss_durations_sec else 0.0
+    task_success = (collision_count == 0 and target_loss_max_duration_sec <= float(reacq_timeout_sec))
+
     result = {
         'bag_path': bag_path,
         'duration_sec': duration,
         'num_drones_observed': len(drone_speeds),
         'visibility_rate': visibility_rate,
         'view_loss_count': view_loss_count,
+        'target_loss_durations_sec': target_loss_durations_sec,
+        'target_loss_total_duration_sec': target_loss_total_duration_sec,
+        'target_loss_max_duration_sec': target_loss_max_duration_sec,
         'reacq_count': len(reacq_time_list),
         'reacq_time_mean_sec': mean_or_zero(reacq_time_list),
         'reacq_time_p95_sec': percentile(reacq_time_list, 0.95),
         'reacq_time_max_sec': max(reacq_time_list) if reacq_time_list else 0.0,
         'reacq_failure_count': reacq_failure_count,
+        'task_success': task_success,
+        'task_success_loss_timeout_sec': float(reacq_timeout_sec),
         'formation_error_mean': mean_or_zero(formation_err_samples),
         'formation_error_p95': percentile(formation_err_samples, 0.95),
         'formation_error_max': max(formation_err_samples) if formation_err_samples else 0.0,
@@ -335,11 +345,14 @@ def write_summary_csv(rows, out_csv):
         'num_drones_observed',
         'visibility_rate',
         'view_loss_count',
+        'target_loss_total_duration_sec',
+        'target_loss_max_duration_sec',
         'reacq_count',
         'reacq_time_mean_sec',
         'reacq_time_p95_sec',
         'reacq_time_max_sec',
         'reacq_failure_count',
+        'task_success',
         'formation_error_mean',
         'formation_error_p95',
         'formation_error_max',
@@ -375,9 +388,9 @@ def main():
     parser = argparse.ArgumentParser(description='Analyze tracking experiment rosbag.')
     parser.add_argument('bags', nargs='+', help='Bag file paths')
     parser.add_argument('--formation-side-length', type=float, default=2.0)
-    parser.add_argument('--collision-distance', type=float, default=0.35)
-    parser.add_argument('--collision-release-distance', type=float, default=0.45)
-    parser.add_argument('--reacq-timeout-sec', type=float, default=15.0)
+    parser.add_argument('--collision-distance', type=float, default=0.0)
+    parser.add_argument('--collision-release-distance', type=float, default=0.0)
+    parser.add_argument('--reacq-timeout-sec', type=float, default=10.0)
     parser.add_argument('--out-json', default='', help='Output JSON file path')
     parser.add_argument('--out-csv', default='', help='Output CSV file path')
     args = parser.parse_args()

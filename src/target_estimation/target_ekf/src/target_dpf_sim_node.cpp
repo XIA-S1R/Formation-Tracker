@@ -470,6 +470,46 @@ void stats_callback(const target_ekf::LocalStats::ConstPtr& msg) {
   received_consensus_[msg->drone_id] = nc;
 }
 
+// === 未初始化时借用邻机共识状态进行初始化 ===
+bool tryBootstrapFromNeighborConsensus(Eigen::Vector3d& seed_pos,
+                                       Eigen::Vector3d& seed_rpy,
+                                       int& src_drone_id) {
+  std::lock_guard<std::mutex> lock(stats_mutex_);
+  const ros::Time now = ros::Time::now();
+  const double max_consensus_age = 0.5;
+
+  double best_alpha = -1.0;
+  bool found = false;
+
+  for (const auto& kv : received_consensus_) {
+    const int neighbor_id = kv.first;
+    const auto& nc = kv.second;
+    const double age = (now - nc.timestamp).toSec();
+    if (age > max_consensus_age || !nc.has_obs) continue;
+
+    const int C = static_cast<int>(nc.zeta_alpha.size());
+    for (int c = 0; c < C; ++c) {
+      if (c >= static_cast<int>(nc.zeta_a.size())) continue;
+      if (nc.zeta_a[c].size() < 9) continue;
+      const double alpha = nc.zeta_alpha(c);
+      if (alpha <= 1e-6 || alpha <= best_alpha) continue;
+
+      Eigen::VectorXd state = nc.zeta_a[c] / alpha;
+      if (!state.array().isFinite().all()) continue;
+
+      seed_pos = state.head<3>();
+      seed_rpy = state.segment<3>(6);
+      seed_rpy.x() = wrapAngle(seed_rpy.x());
+      seed_rpy.y() = wrapAngle(seed_rpy.y());
+      seed_rpy.z() = wrapAngle(seed_rpy.z());
+      src_drone_id = neighbor_id;
+      best_alpha = alpha;
+      found = true;
+    }
+  }
+  return found;
+}
+
 // === 无效区域GMM消息转换 ===
 target_ekf::InvalidRegionGMM toInvalidGMMMsg(const InvalidGMM3D& gmm, int drone_id, int type) {
   target_ekf::InvalidRegionGMM msg;
@@ -957,7 +997,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
           if (p_in_body.z() > 0.1 && p_in_body.z() < max_obs_depth_) {
             double x = p_in_body.x() * fx_ / p_in_body.z() + cx_;
             double y = p_in_body.y() * fy_ / p_in_body.z() + cy_;
-            if (x >= 0 && x <= height_ && y >=0 && y <= width_) {
+            if (x >= 0 && x <= width_ && y >= 0 && y <= height_) {
               // 视距检查
               if (isLineOfSightClear(cam_p, latest_obs_pos_)) {
                 has_obs = true;
@@ -993,6 +1033,22 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       last_update_stamp_ = ros::Time::now();
       return;
     } else {
+      // 本机无观测且尚未初始化：尝试借用邻机共识状态进行初始化
+      if (!dpfPtr_->initialized_) {
+        Eigen::Vector3d seed_pos, seed_rpy;
+        int src_drone_id = -1;
+        if (tryBootstrapFromNeighborConsensus(seed_pos, seed_rpy, src_drone_id)) {
+          dpfPtr_->reset(seed_pos, seed_rpy);
+          dpf_reset_suppress_count_ = 3;
+          has_recent_obs_.store(false);
+          ROS_WARN("[dpf%d] bootstrap init from neighbor%d consensus: pos=(%.2f,%.2f,%.2f), rpy=(%.2f,%.2f,%.2f)",
+                   drone_id_, src_drone_id,
+                   seed_pos.x(), seed_pos.y(), seed_pos.z(),
+                   seed_rpy.x(), seed_rpy.y(), seed_rpy.z());
+          last_update_stamp_ = ros::Time::now();
+          return;
+        }
+      }
       ROS_DEBUG_THROTTLE(1.0, "[dpf%d] no obs, skip reset (initialized=%d)", 
         drone_id_, dpfPtr_->initialized_);
       if (!dpfPtr_->initialized_) return;

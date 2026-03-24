@@ -152,11 +152,14 @@ def write_summary_csv(rows, out_csv):
         'num_drones_observed',
         'visibility_rate',
         'view_loss_count',
+        'target_loss_total_duration_sec',
+        'target_loss_max_duration_sec',
         'reacq_count',
         'reacq_time_mean_sec',
         'reacq_time_p95_sec',
         'reacq_time_max_sec',
         'reacq_failure_count',
+        'task_success',
         'formation_error_mean',
         'formation_error_p95',
         'formation_error_max',
@@ -218,9 +221,9 @@ def main():
     parser.add_argument('--with-rviz', action='store_true')
 
     parser.add_argument('--formation-side-length', type=float, default=2.0)
-    parser.add_argument('--collision-distance', type=float, default=0.35)
-    parser.add_argument('--collision-release-distance', type=float, default=0.45)
-    parser.add_argument('--reacq-timeout-sec', type=float, default=15.0)
+    parser.add_argument('--collision-distance', type=float, default=0.0)
+    parser.add_argument('--collision-release-distance', type=float, default=0.0)
+    parser.add_argument('--reacq-timeout-sec', type=float, default=10.0)
 
     parser.add_argument('--output-dir', default='')
     args = parser.parse_args()
@@ -316,7 +319,7 @@ def main():
             metrics['run_id'] = run_idx
             metrics['status'] = 'ok'
             all_rows.append(metrics)
-            print(f'[{run_tag}] done, visibility={metrics.get("visibility_rate", 0.0):.3f}, collisions={metrics.get("collision_count", 0)}')
+            print(f'[{run_tag}] done, visibility={metrics.get("visibility_rate", 0.0):.3f}, collisions={metrics.get("collision_count", 0)}, task_success={metrics.get("task_success", False)}')
 
         except Exception as e:
             run_row['status'] = f'failed: {e}'
@@ -333,6 +336,12 @@ def main():
     with open(summary_json, 'w') as f:
         json.dump(all_rows, f, indent=2)
     write_summary_csv(all_rows, summary_csv)
+
+    success_rows = [r for r in all_rows if 'task_success' in r]
+    if success_rows:
+        success_count = sum(1 for r in success_rows if bool(r.get('task_success', False)))
+        success_rate = success_count / float(len(success_rows))
+        print(f'Task success rate: {success_count}/{len(success_rows)} = {success_rate:.3f}')
 
     print(f'All done. Summary JSON: {summary_json}')
     print(f'All done. Summary CSV : {summary_csv}')

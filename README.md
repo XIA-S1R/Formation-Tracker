@@ -57,3 +57,42 @@
 - 确保所有参数在启动文件和配置文件中正确设置。
 
 更多详情请参考项目文档。
+
+
+7. **批量实验**
+运行批量实验，在指定目录生成bag
+```bash
+python3 src/planning/planning/scripts/run_full_evasion_batch.py \
+  --runs 10 \
+  --run-duration 70 \
+  --reacq-timeout-sec 10 \
+  --output-dir experiment_results/evasion_batch_10runs \
+  --with-rviz
+```
+可选参数还有
+```bash
+--runs，默认 5
+--run-duration，默认 60.0（秒）
+--warmup，默认 8.0（秒）
+--cooldown，默认 2.0（秒）
+--drone-count，默认 3
+--launch-cmd，默认 roslaunch simulation tracking_sim_triangle.launch
+--trigger-cmd，默认 ./sh_utils/pub_triger.sh
+--trigger-max-seconds，默认 1.5
+--evasion-cmd，默认 python3 src/planning/planning/scripts/full_evasion.py
+--rviz-cmd，默认 rviz -d $(rospack find simulation)/config/tracking_sim.rviz
+--with-rviz（开关，默认关闭）
+--formation-side-length，默认 2.0
+--collision-distance，默认 0.35
+--collision-release-distance，默认 0.45
+--reacq-timeout-sec，默认 10.0
+--output-dir，默认空（自动生成到 experiment_results/full_evasion_batch_时间戳）
+```
+
+python3 src/planning/planning/scripts/run_full_evasion_batch.py \
+--runs 10 \
+--run-duration 30 \
+--warmup 3.0 \
+--reacq-timeout-sec 10 \
+--evasion-cmd "python3 src/planning/planning/scripts/free_run.py" \
+--with-rviz
