@@ -100,7 +100,11 @@ ros::Time last_global_obs_time_;
 Eigen::Vector3d committed_search_dir_ = Eigen::Vector3d::Zero();
 Eigen::Vector3d committed_target_pos_ = Eigen::Vector3d::Zero(); // 当前推进目标
 ros::Time last_hotspot_extract_time_ = ros::Time(0);
-double hotspot_extract_interval_ = 2.0; // 重新提取间隔(秒)
+double hotspot_extract_interval_base_sec_ = 2.0;   // 承诺方向基础持续时间(秒)
+double hotspot_extract_interval_growth_sec_ = 0.5; // 每次重提取后递增长度(秒)
+double hotspot_extract_interval_max_sec_ = 8.0;    // 承诺方向持续时间上限(秒)
+double current_hotspot_extract_interval_sec_ = 2.0; // 当前生效的承诺持续时间(秒)
+int committed_direction_refresh_count_ = 0;         // 当前搜索阶段内方向重提取次数
 bool has_committed_direction_ = false;
 double search_advance_vmax_ = 2.0; // 搜索模式推进速度，优先使用当前无人机 planning/vmax
 double neg_obs_ttl_sec_ = 8.0;               // 负观测无效区域记忆时长
@@ -119,6 +123,15 @@ std::map<int, TimedInvalidGMM3D> received_neg_obs_gmms_;  // 邻居负观测GMM�
 std::map<int, InvalidGMM3D> received_obstacle_gmms_;   // 邻居的障碍GMM（持久留存）
 InvalidGMM3D global_neg_obs_gmm_;    // 全局负观测GMM（当前帧有效）
 InvalidGMM3D global_obstacle_gmm_;   // 全局障碍GMM（一直留存）
+
+void resetCommittedDirectionState() {
+  has_committed_direction_ = false;
+  committed_search_dir_.setZero();
+  committed_target_pos_.setZero();
+  last_hotspot_extract_time_ = ros::Time(0);
+  committed_direction_refresh_count_ = 0;
+  current_hotspot_extract_interval_sec_ = hotspot_extract_interval_base_sec_;
+}
 
 // 6D搜索共识邻居数据
 using NeighborConsensus6D = SearchParticlesManager::NeighborConsensus6D;
@@ -1069,7 +1082,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       dpf_reset_suppress_count_ = 3;
       search_mode_active_ = false;
       consecutive_no_obs_count_ = 0;
-      has_committed_direction_ = false;
+      resetCommittedDirectionState();
       ROS_WARN("[dpf%d] EXITING SEARCH MODE: Target reacquired, resetting from direct observation!", drone_id_);
 
       // 发布 local_stats（has_obs=true），通知邻居此机已重新观测到目标
@@ -1096,7 +1109,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
         if (time_diff < 0.5 && kv.second.has_obs) {
           search_mode_active_ = false;
           consecutive_no_obs_count_ = 0;
-          has_committed_direction_ = false;
+          resetCommittedDirectionState();
           ROS_WARN("[dpf%d] EXITING SEARCH MODE: Neighbor drone %d reacquired target!", drone_id_, kv.first);
           break;
         }
@@ -1179,8 +1192,9 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
         global_neg_obs_gmm_, global_obstacle_gmm_);
 
     // === 方向承诺式搜索：定期提取热点确定方向，中间沿方向推进 ===
-    double time_since_extract = (ros::Time::now() - last_hotspot_extract_time_).toSec();
-    bool need_extract = !has_committed_direction_ || time_since_extract > hotspot_extract_interval_;
+    const ros::Time now = ros::Time::now();
+    double time_since_extract = (now - last_hotspot_extract_time_).toSec();
+    bool need_extract = !has_committed_direction_ || time_since_extract > current_hotspot_extract_interval_sec_;
 
     // 收集所有无人机位置
     std::vector<std::pair<int, Eigen::Vector3d>> drone_positions;
@@ -1254,10 +1268,22 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
             }
             committed_target_pos_ = hotspot_pos; // 初始目标就是热点
             has_committed_direction_ = true;
-            last_hotspot_extract_time_ = ros::Time::now();
-            ROS_WARN("[dpf%d] Committed search dir=(%.2f,%.2f) toward hotspot (%.2f,%.2f,%.2f) w=%.3f",
+            last_hotspot_extract_time_ = now;
+            if (committed_direction_refresh_count_ == 0) {
+              // 首次建立承诺方向：先保持基础时间
+              committed_direction_refresh_count_ = 1;
+            } else {
+              // 后续每次重提取后，递增下一轮承诺持续时间
+              committed_direction_refresh_count_++;
+              current_hotspot_extract_interval_sec_ = std::min(
+                  hotspot_extract_interval_max_sec_,
+                  hotspot_extract_interval_base_sec_ +
+                      hotspot_extract_interval_growth_sec_ * (committed_direction_refresh_count_ - 1));
+            }
+            ROS_WARN("[dpf%d] Committed search dir=(%.2f,%.2f) toward hotspot (%.2f,%.2f,%.2f) w=%.3f, hold=%.1fs (refresh=%d)",
                 drone_id_, committed_search_dir_.x(), committed_search_dir_.y(),
-                hotspot_pos.x(), hotspot_pos.y(), hotspot_pos.z(), hotspots[assign[d]].weight);
+                hotspot_pos.x(), hotspot_pos.y(), hotspot_pos.z(), hotspots[assign[d]].weight,
+                current_hotspot_extract_interval_sec_, committed_direction_refresh_count_);
             break;
           }
         }
@@ -1285,7 +1311,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       ROS_INFO_THROTTLE(1.0, "[dpf%d] Search advancing: pos=(%.2f,%.2f,%.2f) dir=(%.2f,%.2f) t=%.1f/%.1fs",
           drone_id_, committed_target_pos_.x(), committed_target_pos_.y(), committed_target_pos_.z(),
           committed_search_dir_.x(), committed_search_dir_.y(),
-          time_since_extract, hotspot_extract_interval_);
+          time_since_extract, current_hotspot_extract_interval_sec_);
     }
 
     // 发布搜索状态
@@ -1369,6 +1395,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
         // 立即进入搜索模式并进行初始化
         search_mode_active_ = true;
         last_global_obs_time_ = ros::Time::now();
+        resetCommittedDirectionState();
         ROS_WARN("[dpf%d] ENTERING SEARCH MODE: All drones lost target for %d consecutive frames!",
                  drone_id_, consecutive_no_obs_count_);
 
@@ -1653,8 +1680,24 @@ int main(int argc, char** argv) {
   nh.param("hotspot_min_drone_dist", hotspot_min_drone_dist_, 2.0);
   nh.param("hotspot_seed_radius", hotspot_seed_radius_, 1.5);
   nh.param("hotspot_invalid_reject_ratio", hotspot_invalid_reject_ratio_, 1.0);
+  if (!nh.getParam("hotspot_extract_interval_sec", hotspot_extract_interval_base_sec_)) {
+    // 兼容旧参数名
+    nh.param("hotspot_extract_interval", hotspot_extract_interval_base_sec_, hotspot_extract_interval_base_sec_);
+  }
+  nh.param("hotspot_extract_interval_growth_sec", hotspot_extract_interval_growth_sec_, 0.5);
+  nh.param("hotspot_extract_interval_max_sec", hotspot_extract_interval_max_sec_, 8.0);
+  if (hotspot_extract_interval_base_sec_ < 0.2) hotspot_extract_interval_base_sec_ = 0.2;
+  if (hotspot_extract_interval_growth_sec_ < 0.0) hotspot_extract_interval_growth_sec_ = 0.0;
+  if (hotspot_extract_interval_max_sec_ < hotspot_extract_interval_base_sec_) {
+    hotspot_extract_interval_max_sec_ = hotspot_extract_interval_base_sec_;
+  }
+  current_hotspot_extract_interval_sec_ = hotspot_extract_interval_base_sec_;
+
   ROS_INFO("[dpf%d] Search frontier params: neg_obs_ttl=%.1fs, min_drone_dist=%.2fm, seed_radius=%.2fm, invalid_reject_ratio=%.2f",
            drone_id_, neg_obs_ttl_sec_, hotspot_min_drone_dist_, hotspot_seed_radius_, hotspot_invalid_reject_ratio_);
+  ROS_INFO("[dpf%d] Search commitment interval: base=%.2fs, growth=%.2fs, max=%.2fs",
+           drone_id_, hotspot_extract_interval_base_sec_, hotspot_extract_interval_growth_sec_,
+           hotspot_extract_interval_max_sec_);
   // DPF参数
   int num_particles = 300;
   int num_components = 4;

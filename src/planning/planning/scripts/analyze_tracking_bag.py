@@ -10,6 +10,7 @@ import statistics
 from collections import defaultdict
 
 import rosbag
+import sensor_msgs.point_cloud2 as pc2
 
 
 def percentile(values, q):
@@ -39,6 +40,47 @@ def mean_or_zero(values):
     return float(statistics.mean(values)) if values else 0.0
 
 
+def build_voxel_index(points_xyz, voxel_size):
+    index = defaultdict(list)
+    if voxel_size <= 1e-6:
+        return index
+    inv = 1.0 / voxel_size
+    for x, y, z in points_xyz:
+        key = (
+            int(math.floor(x * inv)),
+            int(math.floor(y * inv)),
+            int(math.floor(z * inv)),
+        )
+        index[key].append((x, y, z))
+    return index
+
+
+def query_min_dist_in_radius(pos, voxel_index, voxel_size, radius):
+    if not voxel_index or voxel_size <= 1e-6 or radius <= 0.0:
+        return None
+    inv = 1.0 / voxel_size
+    cx = int(math.floor(pos[0] * inv))
+    cy = int(math.floor(pos[1] * inv))
+    cz = int(math.floor(pos[2] * inv))
+    rn = int(math.ceil(radius * inv))
+    r2 = radius * radius
+    best2 = None
+    for ix in range(cx - rn, cx + rn + 1):
+        for iy in range(cy - rn, cy + rn + 1):
+            for iz in range(cz - rn, cz + rn + 1):
+                pts = voxel_index.get((ix, iy, iz), ())
+                for px, py, pz in pts:
+                    dx = px - pos[0]
+                    dy = py - pos[1]
+                    dz = pz - pos[2]
+                    d2 = dx * dx + dy * dy + dz * dz
+                    if d2 <= r2 and (best2 is None or d2 < best2):
+                        best2 = d2
+    if best2 is None:
+        return None
+    return math.sqrt(best2)
+
+
 def parse_drone_id_from_topic(topic):
     # /drone0/odom
     if topic.startswith('/drone'):
@@ -59,8 +101,17 @@ def analyze_bag(
     formation_side_length=2.0,
     collision_distance=0.0,
     collision_release_distance=0.0,
+    obstacle_collision_distance=0.0,
+    obstacle_collision_release_distance=0.0,
     reacq_timeout_sec=10.0,
 ):
+    collision_distance = max(0.0, float(collision_distance))
+    collision_release_distance = max(collision_distance, float(collision_release_distance))
+    obstacle_collision_distance = max(0.0, float(obstacle_collision_distance))
+    obstacle_collision_release_distance = max(
+        obstacle_collision_distance, float(obstacle_collision_release_distance)
+    )
+
     drone_positions = {}  # drone_id -> (x,y,z)
     drone_speeds = defaultdict(list)
     drone_speeds_tracking = defaultdict(list)
@@ -79,8 +130,17 @@ def analyze_bag(
     formation_err_samples_tracking = []
     formation_err_samples_search = []
     min_pair_dist_samples = []
-    collision_count = 0
-    collision_active = False
+    inter_drone_collision_count = 0
+    inter_drone_collision_active = False
+
+    # obstacle collision from /global_map
+    obstacle_map_points_count = 0
+    obstacle_voxel_index = {}
+    obstacle_voxel_size = 0.0
+    obstacle_query_radius = max(obstacle_collision_release_distance, obstacle_collision_distance)
+    obstacle_collision_count = 0
+    obstacle_collision_active = defaultdict(bool)  # drone_id -> active
+    min_obstacle_dist_samples = []
 
     t_min = None
     t_max = None
@@ -92,6 +152,18 @@ def analyze_bag(
                 t_min = ts
             if t_max is None or ts > t_max:
                 t_max = ts
+
+            # Static obstacle map
+            if topic == '/global_map' and obstacle_query_radius > 0.0 and obstacle_map_points_count == 0:
+                pts = []
+                for x, y, z in pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True):
+                    pts.append((float(x), float(y), float(z)))
+                obstacle_map_points_count = len(pts)
+                if obstacle_map_points_count > 0:
+                    # Spatial hash for fast nearest lookup in a local radius
+                    obstacle_voxel_size = max(0.1, obstacle_query_radius * 0.5)
+                    obstacle_voxel_index = build_voxel_index(pts, obstacle_voxel_size)
+                continue
 
             # Drone odom: /droneX/odom
             if topic.endswith('/odom') and topic.startswith('/drone') and topic.count('/') == 2:
@@ -135,12 +207,32 @@ def analyze_bag(
                             else:
                                 formation_err_samples_tracking.append(formation_err)
 
-                        # collision event with hysteresis
-                        if (not collision_active) and min_d <= collision_distance:
-                            collision_count += 1
-                            collision_active = True
-                        elif collision_active and min_d >= collision_release_distance:
-                            collision_active = False
+                        # inter-drone collision event with hysteresis
+                        if (not inter_drone_collision_active) and min_d <= collision_distance:
+                            inter_drone_collision_count += 1
+                            inter_drone_collision_active = True
+                        elif inter_drone_collision_active and min_d >= collision_release_distance:
+                            inter_drone_collision_active = False
+
+                # obstacle collision event with hysteresis (per drone)
+                if obstacle_query_radius > 0.0 and obstacle_voxel_index:
+                    pos = (p.x, p.y, p.z)
+                    min_obs_d = query_min_dist_in_radius(
+                        pos,
+                        obstacle_voxel_index,
+                        obstacle_voxel_size,
+                        obstacle_query_radius,
+                    )
+                    if min_obs_d is not None:
+                        min_obstacle_dist_samples.append(min_obs_d)
+                        if (not obstacle_collision_active[drone_id]) and min_obs_d <= obstacle_collision_distance:
+                            obstacle_collision_count += 1
+                            obstacle_collision_active[drone_id] = True
+                        elif obstacle_collision_active[drone_id] and min_obs_d >= obstacle_collision_release_distance:
+                            obstacle_collision_active[drone_id] = False
+                    else:
+                        if obstacle_collision_active[drone_id]:
+                            obstacle_collision_active[drone_id] = False
                 continue
 
             # search_state: /droneX/droneX_target_dpf/search_state
@@ -288,6 +380,7 @@ def analyze_bag(
     target_loss_durations_sec = [float(x) for x in view_loss_duration_list]
     target_loss_total_duration_sec = float(sum(target_loss_durations_sec))
     target_loss_max_duration_sec = float(max(target_loss_durations_sec)) if target_loss_durations_sec else 0.0
+    collision_count = inter_drone_collision_count + obstacle_collision_count
     task_success = (collision_count == 0 and target_loss_max_duration_sec <= float(reacq_timeout_sec))
 
     result = {
@@ -316,7 +409,12 @@ def analyze_bag(
         'formation_error_p95_search': percentile(formation_err_samples_search, 0.95),
         'formation_error_max_search': max(formation_err_samples_search) if formation_err_samples_search else 0.0,
         'collision_count': collision_count,
+        'inter_drone_collision_count': inter_drone_collision_count,
+        'obstacle_collision_count': obstacle_collision_count,
         'min_inter_drone_distance': min(min_pair_dist_samples) if min_pair_dist_samples else 0.0,
+        'obstacle_map_available': bool(obstacle_map_points_count > 0),
+        'obstacle_map_points_count': int(obstacle_map_points_count),
+        'min_obstacle_clearance': min(min_obstacle_dist_samples) if min_obstacle_dist_samples else 0.0,
         'replan_failed_hovering_count': replan_failed_hovering_count,
         'emergency_stop_count': emergency_stop_count,
         'speed_mean_all': mean_or_zero(all_speed_samples),
@@ -363,7 +461,12 @@ def write_summary_csv(rows, out_csv):
         'formation_error_p95_search',
         'formation_error_max_search',
         'collision_count',
+        'inter_drone_collision_count',
+        'obstacle_collision_count',
         'min_inter_drone_distance',
+        'obstacle_map_available',
+        'obstacle_map_points_count',
+        'min_obstacle_clearance',
         'replan_failed_hovering_count',
         'emergency_stop_count',
         'speed_mean_all',
@@ -388,8 +491,10 @@ def main():
     parser = argparse.ArgumentParser(description='Analyze tracking experiment rosbag.')
     parser.add_argument('bags', nargs='+', help='Bag file paths')
     parser.add_argument('--formation-side-length', type=float, default=2.0)
-    parser.add_argument('--collision-distance', type=float, default=0.0)
-    parser.add_argument('--collision-release-distance', type=float, default=0.0)
+    parser.add_argument('--collision-distance', type=float, default=0)
+    parser.add_argument('--collision-release-distance', type=float, default=0)
+    parser.add_argument('--obstacle-collision-distance', type=float, default=0.0)
+    parser.add_argument('--obstacle-collision-release-distance', type=float, default=0.0)
     parser.add_argument('--reacq-timeout-sec', type=float, default=10.0)
     parser.add_argument('--out-json', default='', help='Output JSON file path')
     parser.add_argument('--out-csv', default='', help='Output CSV file path')
@@ -402,6 +507,8 @@ def main():
             formation_side_length=args.formation_side_length,
             collision_distance=args.collision_distance,
             collision_release_distance=args.collision_release_distance,
+            obstacle_collision_distance=args.obstacle_collision_distance,
+            obstacle_collision_release_distance=args.obstacle_collision_release_distance,
             reacq_timeout_sec=args.reacq_timeout_sec,
         )
         result['run_id'] = i

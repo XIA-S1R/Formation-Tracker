@@ -170,7 +170,12 @@ def write_summary_csv(rows, out_csv):
         'formation_error_p95_search',
         'formation_error_max_search',
         'collision_count',
+        'inter_drone_collision_count',
+        'obstacle_collision_count',
         'min_inter_drone_distance',
+        'obstacle_map_available',
+        'obstacle_map_points_count',
+        'min_obstacle_clearance',
         'replan_failed_hovering_count',
         'emergency_stop_count',
         'speed_mean_all',
@@ -191,7 +196,7 @@ def write_summary_csv(rows, out_csv):
 
 
 def build_default_topics(drone_count):
-    topics = ['/target/odom']
+    topics = ['/target/odom', '/global_map']
     for i in range(drone_count):
         topics.append(f'/drone{i}/odom')
     for i in range(drone_count):
@@ -208,7 +213,8 @@ def main():
 
     parser = argparse.ArgumentParser(description='Batch run full_evasion tracking experiments and compute metrics.')
     parser.add_argument('--runs', type=int, default=5)
-    parser.add_argument('--run-duration', type=float, default=60.0)
+    parser.add_argument('--run-duration', type=float, default=120.0,
+                        help='Max run seconds as fallback if evasion script does not exit.')
     parser.add_argument('--warmup', type=float, default=8.0)
     parser.add_argument('--cooldown', type=float, default=2.0)
     parser.add_argument('--drone-count', type=int, default=3)
@@ -221,9 +227,13 @@ def main():
     parser.add_argument('--with-rviz', action='store_true')
 
     parser.add_argument('--formation-side-length', type=float, default=2.0)
-    parser.add_argument('--collision-distance', type=float, default=0.0)
-    parser.add_argument('--collision-release-distance', type=float, default=0.0)
+    parser.add_argument('--collision-distance', type=float, default=0.35)
+    parser.add_argument('--collision-release-distance', type=float, default=0.45)
+    parser.add_argument('--obstacle-collision-distance', type=float, default=0.0)
+    parser.add_argument('--obstacle-collision-release-distance', type=float, default=0.0)
     parser.add_argument('--reacq-timeout-sec', type=float, default=10.0)
+    parser.add_argument('--post-reacq-extra-sec', type=float, default=2.0,
+                        help='Extra seconds after reacq-timeout before stopping one run.')
 
     parser.add_argument('--output-dir', default='')
     args = parser.parse_args()
@@ -269,8 +279,9 @@ def main():
             if not wait_for_ros_master(timeout_sec=40):
                 raise RuntimeError('ROS master not ready')
 
-            if not wait_for_topics(topics[:1 + args.drone_count], timeout_sec=50):
-                raise RuntimeError('essential odom topics not ready')
+            essential_topics = ['/target/odom'] + [f'/drone{i}/odom' for i in range(args.drone_count)] + ['/global_map']
+            if not wait_for_topics(essential_topics, timeout_sec=50):
+                raise RuntimeError('essential odom/global_map topics not ready')
 
             topic_str = ' '.join(topics)
             bag_cmd = f'rosbag record -O {bag_path} {topic_str}'
@@ -292,8 +303,30 @@ def main():
             print(f'[{run_tag}] evasion...')
             evasion_proc, evasion_f = start_process(args.evasion_cmd, repo_root, evasion_log)
 
+            # 自动收尾策略：
+            # 1) evasion脚本结束 -> 再等待(reacq_timeout + extra)秒后结束本轮
+            # 2) 若evasion迟迟不结束 -> run-duration作为兜底上限
             t0 = time.time()
-            while time.time() - t0 < args.run_duration:
+            evasion_done_t = None
+            post_wait_sec = max(0.0, args.reacq_timeout_sec + args.post_reacq_extra_sec)
+            while True:
+                now = time.time()
+                elapsed = now - t0
+
+                if evasion_done_t is None and evasion_proc.poll() is not None:
+                    if evasion_proc.returncode != 0:
+                        raise RuntimeError(f'evasion command failed, returncode={evasion_proc.returncode}')
+                    evasion_done_t = now
+                    print(f'[{run_tag}] evasion done, waiting tail {post_wait_sec:.1f}s...')
+
+                if evasion_done_t is not None:
+                    if (now - evasion_done_t) >= post_wait_sec:
+                        break
+                else:
+                    if elapsed >= args.run_duration:
+                        print(f'[{run_tag}] fallback timeout {args.run_duration:.1f}s reached, stop this run.')
+                        break
+
                 time.sleep(0.5)
 
             stop_process(evasion_proc, evasion_f, name='evasion')
@@ -307,6 +340,8 @@ def main():
                 f'--formation-side-length {args.formation_side_length} '
                 f'--collision-distance {args.collision_distance} '
                 f'--collision-release-distance {args.collision_release_distance} '
+                f'--obstacle-collision-distance {args.obstacle_collision_distance} '
+                f'--obstacle-collision-release-distance {args.obstacle_collision_release_distance} '
                 f'--reacq-timeout-sec {args.reacq_timeout_sec} '
                 f'--out-json {run_metrics_json}'
             )

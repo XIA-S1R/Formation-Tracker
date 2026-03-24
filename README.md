@@ -72,7 +72,7 @@ python3 src/planning/planning/scripts/run_full_evasion_batch.py \
 可选参数还有
 ```bash
 --runs，默认 5
---run-duration，默认 60.0（秒）
+--run-duration，默认 120.0（秒）
 --warmup，默认 8.0（秒）
 --cooldown，默认 2.0（秒）
 --drone-count，默认 3
@@ -83,8 +83,10 @@ python3 src/planning/planning/scripts/run_full_evasion_batch.py \
 --rviz-cmd，默认 rviz -d $(rospack find simulation)/config/tracking_sim.rviz
 --with-rviz（开关，默认关闭）
 --formation-side-length，默认 2.0
---collision-distance，默认 0.35
---collision-release-distance，默认 0.45
+--collision-distance，默认 0.35（机间碰撞）
+--collision-release-distance，默认 0.45（机间碰撞释放）
+--obstacle-collision-distance，默认 0.0（障碍碰撞）
+--obstacle-collision-release-distance，默认 0.0（障碍碰撞释放）
 --reacq-timeout-sec，默认 10.0
 --output-dir，默认空（自动生成到 experiment_results/full_evasion_batch_时间戳）
 ```
