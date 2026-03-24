@@ -16,6 +16,7 @@
 #include <Eigen/Core>
 #include <atomic>
 #include <algorithm>
+#include <cmath>
 #include <env/env.hpp>
 #include <prediction/prediction.hpp>
 #include <thread>
@@ -72,6 +73,9 @@ class Nodelet : public nodelet::Nodelet {
   quadrotor_msgs::OccMap3d occmap_msg_;
 
   double tracking_dur_, tracking_dist_, tolerance_d_;
+  double formation_heading_speed_thresh_ = 0.2;
+  double last_formation_heading_ = 0.0;
+  bool last_formation_heading_valid_ = false;
   double vmax_, amax_;
 
   Trajectory traj_poly_;
@@ -483,13 +487,39 @@ class Nodelet : public nodelet::Nodelet {
       } else {
         target_p.z() += 0.3;// 追踪目标定在目标上方1m处
 
-        // 仿照 Swarm-Formation：每架无人机终点 = 目标位置 + 编队偏移（放缩到 tracking_dist_ 圆环上）
-        // 原始编队偏移归一化后乘以 tracking_dist_，使无人机分布在以目标为中心的圆环上
+        // 仿照 Swarm-Formation：每架无人机终点 = 目标位置 + 编队偏移
+        // 先将模板偏移放缩到 tracking_dist_，再按目标速度方向旋转到世界系
         if (trajOptPtr_->use_formation_) {
-          Eigen::Vector3d offset = trajOptPtr_->formation_offset_;
-          double r = offset.head(2).norm();
+          Eigen::Vector3d offset_local = trajOptPtr_->formation_offset_;
+          double r = offset_local.head<2>().norm();
           if (r > 1e-3) {
-            target_p += offset * (tracking_dist_ / r);
+            offset_local *= (tracking_dist_ / r);
+
+            // 速度过小时保持上一次有效朝向，避免编队方向抖动
+            Eigen::Vector2d target_v_xy = target_v.head<2>();
+            double formation_heading = last_formation_heading_;
+            if (target_v_xy.norm() >= formation_heading_speed_thresh_) {
+              formation_heading = std::atan2(target_v_xy.y(), target_v_xy.x());
+              last_formation_heading_ = formation_heading;
+              last_formation_heading_valid_ = true;
+            } else if (!last_formation_heading_valid_) {
+              Eigen::Vector3d fallback_dp = raw_target_p - odom_p;
+              if (fallback_dp.head<2>().norm() > 1e-3) {
+                formation_heading = std::atan2(fallback_dp.y(), fallback_dp.x());
+              } else {
+                formation_heading = 0.0;
+              }
+              last_formation_heading_ = formation_heading;
+              last_formation_heading_valid_ = true;
+            }
+
+            const double c = std::cos(formation_heading);
+            const double s = std::sin(formation_heading);
+            Eigen::Vector3d offset_world;
+            offset_world.x() = c * offset_local.x() - s * offset_local.y();
+            offset_world.y() = s * offset_local.x() + c * offset_local.y();
+            offset_world.z() = offset_local.z();
+            target_p += offset_world;
           }
         }
       }
@@ -1147,6 +1177,7 @@ class Nodelet : public nodelet::Nodelet {
     nh.getParam("tracking_dur", tracking_dur_);
     nh.getParam("tracking_dist", tracking_dist_);
     nh.getParam("tolerance_d", tolerance_d_);
+    nh.param("formation_heading_speed_thresh", formation_heading_speed_thresh_, 0.2);
     nh.getParam("debug", debug_);
     nh.getParam("fake", fake_);
     nh.getParam("vmax", vmax_);

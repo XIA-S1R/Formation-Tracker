@@ -35,6 +35,7 @@
     <param name="tracking_dist"  value="2.5"/><!-- 希望维持的跟踪距离 -->
     <param name="tracking_dur"   value="3.0"/><!-- 跟踪规划规划未来3s的轨迹 -->
     <param name="tracking_dt"    value="0.2"/><!-- 采样间隔，用于计算代价 -->
+    <param name="formation_heading_speed_thresh" value="0.2"/><!-- 目标低速时保持上次编队朝向 -->
     <param name="debug"          value="false"/>
 
     <param name="prediction/rho_a" value="1.0"/><!-- A*搜索中对加速度的惩罚 -->
