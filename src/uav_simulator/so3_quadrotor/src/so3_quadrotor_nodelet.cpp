@@ -12,6 +12,7 @@
 #include <pcl/point_types.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <csignal>
+#include <limits>
 
 namespace so3_quadrotor {
 class Nodelet : public nodelet::Nodelet {
@@ -27,7 +28,7 @@ class Nodelet : public nodelet::Nodelet {
   // collision detection
   pcl::KdTreeFLANN<pcl::PointXYZ> kdtree_;
   bool map_received_ = false;
-  double collision_radius_ = 0.3;  // 碰撞半径
+  double collision_radius_ = 0.0;  // 碰撞半径
 
   // parameters
   int simulation_rate_ = 1e3;
@@ -70,14 +71,19 @@ class Nodelet : public nodelet::Nodelet {
     ROS_INFO("[so3_quadrotor] Global map received, collision detection enabled.");
   }
 
-  bool checkCollision(const Eigen::Vector3d& pos) {
-    if (!map_received_) return false;
+  bool checkCollision(const Eigen::Vector3d& pos, double* nearest_dist = nullptr) {
+    if (!map_received_) {
+      if (nearest_dist) *nearest_dist = std::numeric_limits<double>::infinity();
+      return false;
+    }
     pcl::PointXYZ search_point(pos.x(), pos.y(), pos.z());
     std::vector<int> indices(1);
     std::vector<float> distances(1);
     if (kdtree_.nearestKSearch(search_point, 1, indices, distances) > 0) {
+      if (nearest_dist) *nearest_dist = std::sqrt(std::max(0.0f, distances[0]));
       return distances[0] < collision_radius_ * collision_radius_;
     }
+    if (nearest_dist) *nearest_dist = std::numeric_limits<double>::infinity();
     return false;
   }
 
@@ -95,13 +101,19 @@ class Nodelet : public nodelet::Nodelet {
     if (tnow >= next_odom_pub_time) {
       next_odom_pub_time += ros::Duration(1.0/odom_rate_);
       const Eigen::Vector3d&     pos = quadrotorPtr_->getPos();
+      double nearest_obs_dist = std::numeric_limits<double>::infinity();
 
       // 碰撞检测
-      if (checkCollision(pos)) {
-        ROS_FATAL("\n\n========== COLLISION DETECTED! Drone crashed at (%.2f, %.2f, %.2f) ==========\n",
-                  pos.x(), pos.y(), pos.z());
+      if (checkCollision(pos, &nearest_obs_dist)) {
+        ROS_FATAL("\n\n========== COLLISION DETECTED! Drone crashed at (%.2f, %.2f, %.2f), nearest_obs=%.3fm, collision_radius=%.3fm ==========\n",
+                  pos.x(), pos.y(), pos.z(), nearest_obs_dist, collision_radius_);
         ros::Duration(0.5).sleep();  // 给日志输出一点时间
         std::raise(SIGINT);  // 发送中断信号，停止所有 ROS 节点
+      }
+      if (std::isfinite(nearest_obs_dist) && nearest_obs_dist < collision_radius_ + 0.5) {
+        ROS_WARN_THROTTLE(0.2,
+                          "[so3_quadrotor] near obstacle: nearest=%.3fm, radius=%.3fm, pos=(%.2f, %.2f, %.2f)",
+                          nearest_obs_dist, collision_radius_, pos.x(), pos.y(), pos.z());
       }
 
       const Eigen::Vector3d&     vel = quadrotorPtr_->getVel();
@@ -207,7 +219,7 @@ class Nodelet : public nodelet::Nodelet {
     nh.getParam("min_rpm", config.min_rpm);
     nh.getParam("simulation_rate", simulation_rate_);
     nh.getParam("odom_rate", odom_rate_);
-    nh.param("collision_radius", collision_radius_, 0.3);
+    nh.param("collision_radius", collision_radius_, 0.0);
 
     quadrotorPtr_ = std::make_shared<Quadrotor>(config);
     quadrotorPtr_->setPos(Eigen::Vector3d(init_x, init_y, init_z));

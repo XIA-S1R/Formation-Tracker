@@ -227,8 +227,8 @@ def main():
     parser.add_argument('--with-rviz', action='store_true')
 
     parser.add_argument('--formation-side-length', type=float, default=2.0)
-    parser.add_argument('--collision-distance', type=float, default=0.35)
-    parser.add_argument('--collision-release-distance', type=float, default=0.45)
+    parser.add_argument('--collision-distance', type=float, default=0.0)
+    parser.add_argument('--collision-release-distance', type=float, default=0.0)
     parser.add_argument('--obstacle-collision-distance', type=float, default=0.0)
     parser.add_argument('--obstacle-collision-release-distance', type=float, default=0.0)
     parser.add_argument('--reacq-timeout-sec', type=float, default=10.0)

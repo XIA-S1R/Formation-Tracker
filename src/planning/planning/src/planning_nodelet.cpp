@@ -17,6 +17,8 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <mutex>
+#include <string>
 #include <env/env.hpp>
 #include <prediction/prediction.hpp>
 #include <thread>
@@ -74,6 +76,12 @@ class Nodelet : public nodelet::Nodelet {
 
   double tracking_dur_, tracking_dist_, tolerance_d_;
   double formation_heading_speed_thresh_ = 0.2;
+  double hard_replan_hz_ = 5.0;
+  double hard_replan_interval_ = 0.2;
+  bool obs_clip_enable_ = true;
+  double obs_clip_range_ = 10.0;
+  double obs_clip_margin_ = 0.5;
+  ros::Time last_hard_replan_stamp_ = ros::Time(0);
   double last_formation_heading_ = 0.0;
   bool last_formation_heading_valid_ = false;
   double vmax_, amax_;
@@ -83,6 +91,12 @@ class Nodelet : public nodelet::Nodelet {
   int traj_id_ = 0;
   bool wait_hover_ = true;
   bool force_hover_ = true;
+  bool has_published_motion_traj_ = false;
+  int execute_last_traj_streak_ = 0;
+  ros::Time execute_last_traj_first_stamp_ = ros::Time(0);
+  std::string last_validcheck_fail_reason_ = "none";
+  double last_validcheck_fail_t_ = -1.0;
+  Eigen::Vector3d last_validcheck_fail_p_ = Eigen::Vector3d::Zero();
 
   nav_msgs::Odometry odom_msg_, target_msg_;
   Eigen::Vector3d last_target_p_ = Eigen::Vector3d::Zero();
@@ -98,7 +112,87 @@ class Nodelet : public nodelet::Nodelet {
   std::atomic_bool land_triger_received_ = ATOMIC_VAR_INIT(false);
 
   std::vector<SwarmTrajData> swarm_trajs_;
+  std::mutex swarm_trajs_mutex_;
   ros::Subscriber broadcast_traj_sub_;
+
+  bool clipPathToObservationRange(std::vector<Eigen::Vector3d>& path,
+                                  const Eigen::Vector3d& sensor_p) const {
+    if (!obs_clip_enable_ || path.size() <= 1) {
+      return false;
+    }
+
+    const double clip_r = std::max(0.5, obs_clip_range_ - obs_clip_margin_);
+    const double clip_r2 = clip_r * clip_r;
+    auto is_inside = [&](const Eigen::Vector3d& p) {
+      return (p - sensor_p).squaredNorm() <= clip_r2;
+    };
+
+    std::vector<Eigen::Vector3d> clipped;
+    clipped.reserve(path.size());
+    clipped.push_back(path.front());
+
+    bool clipped_any = false;
+    for (size_t i = 1; i < path.size(); ++i) {
+      const Eigen::Vector3d& p0 = path[i - 1];
+      const Eigen::Vector3d& p1 = path[i];
+      const bool p0_in = is_inside(p0);
+      const bool p1_in = is_inside(p1);
+
+      if (p1_in) {
+        clipped.push_back(p1);
+        continue;
+      }
+
+      clipped_any = true;
+      if (p0_in) {
+        Eigen::Vector3d d = p1 - p0;
+        double a = d.dot(d);
+        if (a > 1e-9) {
+          Eigen::Vector3d f = p0 - sensor_p;
+          double b = 2.0 * f.dot(d);
+          double c = f.dot(f) - clip_r2;
+          double disc = b * b - 4.0 * a * c;
+          if (disc >= 0.0) {
+            double sqrt_disc = std::sqrt(disc);
+            double t1 = (-b - sqrt_disc) / (2.0 * a);
+            double t2 = (-b + sqrt_disc) / (2.0 * a);
+            double t = 1.0;
+            bool has_t = false;
+            if (t1 >= 0.0 && t1 <= 1.0) {
+              t = t1;
+              has_t = true;
+            }
+            if (t2 >= 0.0 && t2 <= 1.0 && (!has_t || t2 > t)) {
+              t = t2;
+              has_t = true;
+            }
+            if (has_t) {
+              Eigen::Vector3d hit = p0 + t * d;
+              if ((hit - clipped.back()).norm() > 1e-3) {
+                clipped.push_back(hit);
+              }
+            }
+          }
+        }
+      }
+      break;
+    }
+
+    if (!clipped_any) {
+      return false;
+    }
+
+    if (clipped.size() < 2) {
+      Eigen::Vector3d dir = path.back() - clipped.front();
+      if (dir.norm() < 1e-6) {
+        dir = Eigen::Vector3d::UnitX();
+      }
+      clipped.push_back(sensor_p + clip_r * dir.normalized());
+    }
+
+    path.swap(clipped);
+    return true;
+  }
 
   void pub_hover_p(const Eigen::Vector3d& hover_p, const ros::Time& stamp) {
     quadrotor_msgs::PolyTraj traj_msg;
@@ -189,47 +283,45 @@ class Nodelet : public nodelet::Nodelet {
     // NOTE yaw
     traj_msg.yaw = yaw;
     traj_msg.drone_id = trajOptPtr_->drone_id_;
+    has_published_motion_traj_ = true;
     traj_pub_.publish(traj_msg);
-    broadcast_traj_pub_.publish(traj_msg);
+    // Only swarm trackers (drone_id >= 0) participate in broadcast trajectory exchange.
+    if (trajOptPtr_->drone_id_ >= 0) {
+      broadcast_traj_pub_.publish(traj_msg);
+    }
   }
 
   void RecvBroadcastPolyTrajCallback(const quadrotor_msgs::PolyTrajConstPtr& msg) {
     if (msg->drone_id < 0) {
-      ROS_ERROR("drone_id < 0 is not allowed in a swarm system!");
+      ROS_WARN_THROTTLE(1.0, "[drone %d] drop traj: invalid drone_id=%d",
+                        trajOptPtr_->drone_id_, msg->drone_id);
       return;
     }
     if (msg->order != 5) {
-      ROS_ERROR("Only support trajectory order equals 5 now!");
+      ROS_WARN_THROTTLE(1.0, "[drone %d] drop traj from drone %d: order=%d (!=5)",
+                        trajOptPtr_->drone_id_, msg->drone_id, msg->order);
       return;
     }
     if (msg->duration.size() * (msg->order + 1) != msg->coef_x.size()) {
-      ROS_ERROR("WRONG trajectory parameters.");
+      ROS_WARN_THROTTLE(1.0, "[drone %d] drop traj from drone %d: malformed coeff size",
+                        trajOptPtr_->drone_id_, msg->drone_id);
       return;
     }
     // 仿真中规划耗时 + 消息延迟可达数百ms，放宽到 2.0s
     double stamp_diff = (ros::Time::now() - msg->start_time).toSec();
     if (stamp_diff > 2.0 || stamp_diff < -2.0) {
-      ROS_WARN("Time stamp diff: Local - Remote Agent %d = %fs (dropped)",
-               msg->drone_id, stamp_diff);
+      ROS_WARN_THROTTLE(1.0, "[drone %d] drop traj from drone %d: stamp_diff=%.3fs",
+                        trajOptPtr_->drone_id_, msg->drone_id, stamp_diff);
       return;
     }
 
     const size_t recv_id = (size_t)msg->drone_id;
     if ((int)recv_id == trajOptPtr_->drone_id_) return;  // Assume TrajOpt has drone_id_
 
-    /* Fill up the buffer */
-    if (swarm_trajs_.size() <= recv_id) {
-      for (size_t i = swarm_trajs_.size(); i <= recv_id; i++) {
-        SwarmTrajData blank;
-        blank.drone_id = -1;
-        swarm_trajs_.push_back(blank);
-      }
-    }
-
-    /* Store data */
-    swarm_trajs_[recv_id].drone_id = recv_id;
-    swarm_trajs_[recv_id].traj_id = msg->traj_id;
-    swarm_trajs_[recv_id].start_time = msg->start_time.toSec();
+    SwarmTrajData incoming;
+    incoming.drone_id = recv_id;
+    incoming.traj_id = msg->traj_id;
+    incoming.start_time = msg->start_time.toSec();
 
     int piece_nums = msg->duration.size();
     std::vector<double> dura(piece_nums);
@@ -247,10 +339,22 @@ class Nodelet : public nodelet::Nodelet {
     }
 
     Trajectory trajectory(dura, cMats);
-    swarm_trajs_[recv_id].traj = trajectory;
+    incoming.traj = trajectory;
+    incoming.duration = trajectory.getTotalDuration();
+    incoming.start_pos = trajectory.getPos(0.0);
 
-    swarm_trajs_[recv_id].duration = trajectory.getTotalDuration();
-    swarm_trajs_[recv_id].start_pos = trajectory.getPos(0.0);
+    /* Fill up and store data */
+    std::lock_guard<std::mutex> lk(swarm_trajs_mutex_);
+    if (swarm_trajs_.size() <= recv_id) {
+      for (size_t i = swarm_trajs_.size(); i <= recv_id; i++) {
+        SwarmTrajData blank;
+        blank.drone_id = -1;
+        swarm_trajs_.push_back(blank);
+      }
+    }
+    swarm_trajs_[recv_id] = incoming;
+    ROS_INFO_THROTTLE(1.0, "[drone %d] recv traj from drone %zu, traj_id=%d, dur=%.2f",
+                      trajOptPtr_->drone_id_, recv_id, incoming.traj_id, incoming.duration);
 
     /* Check Collision */
     // Add collision check if needed
@@ -407,11 +511,24 @@ class Nodelet : public nodelet::Nodelet {
     // 与 Swarm-Formation 的 SEQUENTIAL_START 状态逻辑一致，保证第一次规划时 swarm_trajs_ 非空
     if (trajOptPtr_->use_formation_ && trajOptPtr_->drone_id_ >= 1) {
       int prev_id = trajOptPtr_->drone_id_ - 1;
-      bool have_prev = ((int)swarm_trajs_.size() > prev_id &&
-                        swarm_trajs_[prev_id].drone_id == prev_id);
+      bool have_prev = false;
+      int slot_drone_id = -999;
+      int slot_traj_id = -999;
+      size_t buf_size = 0;
+      {
+        std::lock_guard<std::mutex> lk(swarm_trajs_mutex_);
+        buf_size = swarm_trajs_.size();
+        if ((int)swarm_trajs_.size() > prev_id) {
+          slot_drone_id = swarm_trajs_[prev_id].drone_id;
+          slot_traj_id = swarm_trajs_[prev_id].traj_id;
+        }
+        have_prev = ((int)swarm_trajs_.size() > prev_id &&
+                     swarm_trajs_[prev_id].drone_id == prev_id);
+      }
       if (!have_prev) {
-        ROS_INFO_THROTTLE(1.0, "[drone %d] waiting for drone %d trajectory...",
-                          trajOptPtr_->drone_id_, prev_id);
+        ROS_WARN_THROTTLE(1.0,
+                          "[drone %d] waiting for drone %d trajectory... (buf=%zu, slot_drone_id=%d, slot_traj_id=%d)",
+                          trajOptPtr_->drone_id_, prev_id, buf_size, slot_drone_id, slot_traj_id);
         return;
       }
     }
@@ -447,6 +564,9 @@ class Nodelet : public nodelet::Nodelet {
 
     // NOTE force-hover: waiting for the speed of drone small enough
     if (force_hover_ && odom_v.norm() > 0.1) {
+      ROS_WARN_THROTTLE(0.5,
+                        "[drone %d] force_hover gate: waiting for speed to drop (|v|=%.2f), skip planning this cycle",
+                        trajOptPtr_->drone_id_, odom_v.norm());
       return;
     }
 
@@ -495,23 +615,29 @@ class Nodelet : public nodelet::Nodelet {
           if (r > 1e-3) {
             offset_local *= (tracking_dist_ / r);
 
-            // 速度过小时保持上一次有效朝向，避免编队方向抖动
+            // 编队朝向必须由目标状态统一决定（不能依赖本机 odom），
+            // 否则不同无人机会得到不同朝向导致队形扭曲/重叠。
             Eigen::Vector2d target_v_xy = target_v.head<2>();
             double formation_heading = last_formation_heading_;
+            bool have_target_yaw = false;
+            double target_yaw = 0.0;
+            if (target_q.norm() > 1e-6) {
+              Eigen::Quaterniond qn = target_q.normalized();
+              target_yaw = std::atan2(2.0 * (qn.w() * qn.z() + qn.x() * qn.y()),
+                                      1.0 - 2.0 * (qn.y() * qn.y() + qn.z() * qn.z()));
+              have_target_yaw = std::isfinite(target_yaw);
+            }
+
             if (target_v_xy.norm() >= formation_heading_speed_thresh_) {
               formation_heading = std::atan2(target_v_xy.y(), target_v_xy.x());
-              last_formation_heading_ = formation_heading;
-              last_formation_heading_valid_ = true;
+            } else if (have_target_yaw) {
+              formation_heading = target_yaw;
             } else if (!last_formation_heading_valid_) {
-              Eigen::Vector3d fallback_dp = raw_target_p - odom_p;
-              if (fallback_dp.head<2>().norm() > 1e-3) {
-                formation_heading = std::atan2(fallback_dp.y(), fallback_dp.x());
-              } else {
-                formation_heading = 0.0;
-              }
-              last_formation_heading_ = formation_heading;
-              last_formation_heading_valid_ = true;
+              formation_heading = 0.0;
             }
+            formation_heading = std::atan2(std::sin(formation_heading), std::cos(formation_heading));
+            last_formation_heading_ = formation_heading;
+            last_formation_heading_valid_ = true;
 
             const double c = std::cos(formation_heading);
             const double s = std::sin(formation_heading);
@@ -539,7 +665,12 @@ class Nodelet : public nodelet::Nodelet {
       Eigen::Vector3d project_yaw = odom_q.toRotationMatrix().col(0);  // NOTE ZYX
       double now_yaw = std::atan2(project_yaw.y(), project_yaw.x());
       double yaw_err = std::atan2(std::sin(desired_yaw - now_yaw), std::cos(desired_yaw - now_yaw));
-      if (std::fabs((target_p - odom_p).norm() - tracking_dist_) < tolerance_d_ &&
+      const double dist_to_target = (target_p - odom_p).norm();
+      const bool reach_tracking_goal = trajOptPtr_->use_formation_
+                                           ? (dist_to_target < tolerance_d_)
+                                           : (std::fabs(dist_to_target - tracking_dist_) < tolerance_d_);
+      if (has_published_motion_traj_ &&
+          reach_tracking_goal &&
           odom_v.norm() < 0.1 && target_v.norm() < 0.2 &&
           std::fabs(yaw_err) < 0.5) {// 如果接近目标、速度够小、朝向正确，就保持悬停
         if (!wait_hover_) {
@@ -571,7 +702,8 @@ class Nodelet : public nodelet::Nodelet {
     // Check map freshness - allow up to 200ms delay for lidar mapping
     double map_age = (ros::Time::now() - map_msg_.header.stamp).toSec();
     if (map_age > 0.2) {
-      ROS_WARN("[drone %d planner] Map is stale: %.3f seconds", trajOptPtr_->drone_id_, map_age);
+      ROS_WARN("[drone %d planner] Map is stale: %.3f seconds, set force_hover (|odom_v|=%.2f)",
+               trajOptPtr_->drone_id_, map_age, odom_v.norm());
       force_hover_ = true;
       replanStateMsg_.state = 4;
       replanState_pub_.publish(replanStateMsg_);
@@ -581,13 +713,45 @@ class Nodelet : public nodelet::Nodelet {
     prePtr_->setMap(*gridmapPtr_);
 
     // Set swarm trajectories for collision avoidance
-    trajOptPtr_->setSwarmTrajs(swarm_trajs_);
+    {
+      std::lock_guard<std::mutex> lk(swarm_trajs_mutex_);
+      trajOptPtr_->setSwarmTrajs(swarm_trajs_);
+    }
 
     // visualize the ray from drone to target
     if (envPtr_->checkRayValid(odom_p, target_p)) {
       visPtr_->visualize_arrow(odom_p, target_p, "ray", visualization::yellow);// 无遮挡标记黄色
     } else {
       visPtr_->visualize_arrow(odom_p, target_p, "ray", visualization::red);// 有遮挡标记红色
+    }
+
+    // 20Hz 主循环中，默认只做合法性检查；
+    // 仅在“当前轨迹失效”或“到达硬重规划节拍”时才执行真正重规划。
+    const ros::Time now = ros::Time::now();
+    const bool has_traj_for_check = has_published_motion_traj_ && !force_hover_;
+    bool need_replan_due_invalid = false;
+    if (has_traj_for_check && !validcheck(traj_poly_, replan_stamp_)) {
+      need_replan_due_invalid = true;
+      ROS_WARN_THROTTLE(0.2,
+                        "[drone %d] current traj invalid, trigger immediate replan (reason=%s, t=%.2f, p=[%.2f %.2f %.2f])",
+                        trajOptPtr_->drone_id_, last_validcheck_fail_reason_.c_str(),
+                        last_validcheck_fail_t_, last_validcheck_fail_p_.x(),
+                        last_validcheck_fail_p_.y(), last_validcheck_fail_p_.z());
+    }
+
+    const bool need_periodic_hard_replan =
+        (!has_published_motion_traj_) ||
+        ((now - last_hard_replan_stamp_).toSec() >= hard_replan_interval_);
+
+    if (!need_replan_due_invalid && !need_periodic_hard_replan) {
+      ROS_DEBUG_THROTTLE(1.0, "[drone %d] check-only cycle (skip heavy replan)",
+                         trajOptPtr_->drone_id_);
+      return;
+    }
+
+    if (!need_replan_due_invalid) {
+      // 周期性硬重规划按固定频率节拍触发，避免每个20Hz周期都做重规划。
+      last_hard_replan_stamp_ = now;
     }
 
     // NOTE prediction 追踪者需要对目标未来状态进行预测
@@ -610,7 +774,7 @@ class Nodelet : public nodelet::Nodelet {
       visPtr_->visualize_path(observable_margin, "observable_margin");//observable_margin是以预测轨迹的最后一个点为圆心，追踪距离为半径的圆，用于可视化追踪者的期望位置范围
     }
 
-    // NOTE replan state 追踪者没有决定是否需要重规划的步骤，默认定时器回调函数每次都重规划，确保跟踪稳定性
+    // NOTE replan state
     Eigen::MatrixXd iniState;
     iniState.setZero(3, 3);
     ros::Time replan_stamp = ros::Time::now() + ros::Duration(0.03);
@@ -651,7 +815,7 @@ class Nodelet : public nodelet::Nodelet {
     // double t_path = 0;
 
     if (generate_new_traj_success) {
-      // 统一使用 short_astar 搜索到目标位置（终点调整已在 short_astar 内部处理）
+      // 前端：short_astar 到当前偏置目标点，再与预测路径拼接。
       ROS_DEBUG("[drone %d] starting path search", trajOptPtr_->drone_id_);
       Eigen::Vector3d actual_target = target_p;
       generate_new_traj_success = envPtr_->short_astar(p_start, target_p, path, &actual_target);;
@@ -664,7 +828,7 @@ class Nodelet : public nodelet::Nodelet {
                  trajOptPtr_->drone_id_);
       }
 
-      // 如果目标位置被调整过，预测轨迹也要相应偏移
+      // 如果 short_astar 终点被调整，预测轨迹同步平移，保证拼接连续。
       if (generate_new_traj_success && (actual_target - target_p).norm() > 0.01) {
         Eigen::Vector3d offset = actual_target - target_p;
         for (auto& p : target_predcit) {
@@ -687,23 +851,26 @@ class Nodelet : public nodelet::Nodelet {
     Trajectory traj;
     if (generate_new_traj_success) {
       visPtr_->visualize_path(path, "astar");
-      // 对预测轨迹做点间避障搜索
-      // 注意：pts2path 会清空 path，所以需要先保存 short_astar 的路径
-      std::vector<Eigen::Vector3d> astar_path = path;  // 保存前半段
-
+      // 拼接预测路径：astar_path + predict_path（去掉重复连接点）。
+      std::vector<Eigen::Vector3d> astar_path = path;
       std::vector<Eigen::Vector3d> predict_waypts;
-      predict_waypts.push_back(astar_path.back());  // 从 short_astar 终点开始
+      predict_waypts.push_back(astar_path.back());
       for (const auto& p : target_predcit) {
         predict_waypts.push_back(p);
       }
-
       std::vector<Eigen::Vector3d> predict_path;
-      envPtr_->pts2path(predict_waypts, predict_path);  // 预测轨迹的避障路径
-
-      // 合并：astar_path + predict_path（去掉重复的连接点）
+      envPtr_->pts2path(predict_waypts, predict_path);
       path = astar_path;
-      for (size_t i = 1; i < predict_path.size(); ++i) {
-        path.push_back(predict_path[i]);
+      if (!predict_path.empty()) {
+        for (size_t i = 1; i < predict_path.size(); ++i) {
+          path.push_back(predict_path[i]);
+        }
+      }
+      const size_t raw_path_size = path.size();
+      if (clipPathToObservationRange(path, odom_p)) {
+        ROS_INFO_THROTTLE(1.0,
+                          "[drone %d] clip path to obs range: %zu -> %zu (range=%.2f, margin=%.2f)",
+                          trajOptPtr_->drone_id_, raw_path_size, path.size(), obs_clip_range_, obs_clip_margin_);
       }
       // 原可见区域逻辑（已注释）:
       // if (land_triger_received_) {
@@ -767,6 +934,8 @@ class Nodelet : public nodelet::Nodelet {
     if (valid) {
       force_hover_ = false;
       trajOptPtr_->emergency_recovery_ = false;
+      execute_last_traj_streak_ = 0;
+      execute_last_traj_first_stamp_ = ros::Time(0);
       ROS_WARN("[drone %d planner] REPLAN SUCCESS", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 0;
       replanState_pub_.publish(replanStateMsg_);
@@ -787,6 +956,7 @@ class Nodelet : public nodelet::Nodelet {
       pub_traj(traj, yaw, replan_stamp);
       traj_poly_ = traj;
       replan_stamp_ = replan_stamp;
+      last_hard_replan_stamp_ = ros::Time::now();
     } else if (force_hover_) {
       ROS_ERROR("[drone %d planner] REPLAN FAILED, HOVERING...", trajOptPtr_->drone_id_);
       replanStateMsg_.state = 1;
@@ -794,7 +964,11 @@ class Nodelet : public nodelet::Nodelet {
       return;
     } else if (!validcheck(traj_poly_, replan_stamp_)) {
       force_hover_ = true;
-      ROS_FATAL("[drone %d planner] EMERGENCY STOP!!!", trajOptPtr_->drone_id_);
+      ROS_FATAL("[drone %d planner] EMERGENCY STOP!!! old traj invalid (reason=%s, t=%.2f, p=[%.2f %.2f %.2f], execute_last_streak=%d)",
+                trajOptPtr_->drone_id_, last_validcheck_fail_reason_.c_str(),
+                last_validcheck_fail_t_, last_validcheck_fail_p_.x(),
+                last_validcheck_fail_p_.y(), last_validcheck_fail_p_.z(),
+                execute_last_traj_streak_);
       replanStateMsg_.state = 2;
       replanState_pub_.publish(replanStateMsg_);
       trajOptPtr_->emergency_recovery_ = true;
@@ -806,7 +980,11 @@ class Nodelet : public nodelet::Nodelet {
       // Verify old trajectory with latest map
       if (!validcheck(traj_poly_, replan_stamp_)) {
         force_hover_ = true;
-        ROS_FATAL("[drone %d planner] EMERGENCY STOP - OLD TRAJ INVALID WITH LATEST MAP!!!", trajOptPtr_->drone_id_);
+        ROS_FATAL("[drone %d planner] EMERGENCY STOP - OLD TRAJ INVALID WITH LATEST MAP!!! (reason=%s, t=%.2f, p=[%.2f %.2f %.2f], execute_last_streak=%d)",
+                  trajOptPtr_->drone_id_, last_validcheck_fail_reason_.c_str(),
+                  last_validcheck_fail_t_, last_validcheck_fail_p_.x(),
+                  last_validcheck_fail_p_.y(), last_validcheck_fail_p_.z(),
+                  execute_last_traj_streak_);
         replanStateMsg_.state = 2;
         replanState_pub_.publish(replanStateMsg_);
         trajOptPtr_->emergency_recovery_ = true;
@@ -814,7 +992,20 @@ class Nodelet : public nodelet::Nodelet {
         return;
       }
 
+      if (execute_last_traj_streak_ == 0) {
+        execute_last_traj_first_stamp_ = ros::Time::now();
+      }
+      execute_last_traj_streak_++;
+      double streak_dur = (ros::Time::now() - execute_last_traj_first_stamp_).toSec();
+      double old_traj_t = (ros::Time::now() - replan_stamp_).toSec();
+      old_traj_t = old_traj_t > 0.0 ? old_traj_t : 0.0;
+      double old_traj_rest = std::max(0.0, traj_poly_.getTotalDuration() - old_traj_t);
+
       ROS_ERROR("[drone %d planner] REPLAN FAILED, EXECUTE LAST TRAJ...", trajOptPtr_->drone_id_);
+      ROS_ERROR_THROTTLE(0.2,
+                         "[drone %d planner] execute-last stats: streak=%d, streak_dur=%.2fs, old_traj_rest=%.2fs, map_age=%.3fs",
+                         trajOptPtr_->drone_id_, execute_last_traj_streak_, streak_dur,
+                         old_traj_rest, map_age);
       replanStateMsg_.state = 3;
       replanState_pub_.publish(replanStateMsg_);
       trajOptPtr_->emergency_recovery_ = true;
@@ -885,7 +1076,8 @@ class Nodelet : public nodelet::Nodelet {
       }
     }
     // NOTE determin whether to pub hover
-    if ((goal_ - odom_p).norm() < tracking_dist_ + tolerance_d_ && odom_v.norm() < 0.1) {//已经接近目标点了，并且速度很小，认为到达目标点，可以悬停了
+    if (has_published_motion_traj_ &&
+        (goal_ - odom_p).norm() < tracking_dist_ + tolerance_d_ && odom_v.norm() < 0.1) {//已经接近目标点了，并且速度很小，认为到达目标点，可以悬停了
       if (!wait_hover_) {
         pub_hover_p(odom_p, ros::Time::now());
         wait_hover_ = true;
@@ -1155,6 +1347,9 @@ class Nodelet : public nodelet::Nodelet {
 
     // 如果轨迹已经过期，认为无效
     if (t0 >= total_dur) {
+      last_validcheck_fail_reason_ = "expired";
+      last_validcheck_fail_t_ = t0;
+      last_validcheck_fail_p_ = traj.getPos(total_dur);
       ROS_WARN_THROTTLE(1.0, "[validcheck] trajectory expired: t0=%.2f >= total_dur=%.2f", t0, total_dur);
       return false;
     }
@@ -1164,9 +1359,18 @@ class Nodelet : public nodelet::Nodelet {
     for (double t = t0; t < t_end; t += 0.01) {
       Eigen::Vector3d p = traj.getPos(t);
       if (gridmapPtr_->isOccupied(p)) {
+        last_validcheck_fail_reason_ = "occupied";
+        last_validcheck_fail_t_ = t;
+        last_validcheck_fail_p_ = p;
+        ROS_WARN_THROTTLE(0.2,
+                          "[validcheck] occupied at t=%.2f (window=[%.2f, %.2f]), p=[%.2f %.2f %.2f]",
+                          t, t0, t_end, p.x(), p.y(), p.z());
         return false;
       }
     }
+    last_validcheck_fail_reason_ = "none";
+    last_validcheck_fail_t_ = -1.0;
+    last_validcheck_fail_p_.setZero();
     return true;
   }
 
@@ -1177,6 +1381,14 @@ class Nodelet : public nodelet::Nodelet {
     nh.getParam("tracking_dur", tracking_dur_);
     nh.getParam("tracking_dist", tracking_dist_);
     nh.getParam("tolerance_d", tolerance_d_);
+    nh.param("hard_replan_hz", hard_replan_hz_, 5.0);
+    hard_replan_hz_ = std::max(0.1, hard_replan_hz_);
+    hard_replan_interval_ = 1.0 / hard_replan_hz_;
+    nh.param("obs_clip_enable", obs_clip_enable_, true);
+    nh.param("obs_clip_range", obs_clip_range_, 10.0);
+    nh.param("obs_clip_margin", obs_clip_margin_, 0.5);
+    obs_clip_range_ = std::max(0.5, obs_clip_range_);
+    obs_clip_margin_ = std::max(0.0, std::min(obs_clip_margin_, obs_clip_range_ - 0.1));
     nh.param("formation_heading_speed_thresh", formation_heading_speed_thresh_, 0.2);
     nh.getParam("debug", debug_);
     nh.getParam("fake", fake_);

@@ -83,8 +83,8 @@ python3 src/planning/planning/scripts/run_full_evasion_batch.py \
 --rviz-cmd，默认 rviz -d $(rospack find simulation)/config/tracking_sim.rviz
 --with-rviz（开关，默认关闭）
 --formation-side-length，默认 2.0
---collision-distance，默认 0.35（机间碰撞）
---collision-release-distance，默认 0.45（机间碰撞释放）
+--collision-distance，默认 0.0（机间碰撞）
+--collision-release-distance，默认 0.0（机间碰撞释放）
 --obstacle-collision-distance，默认 0.0（障碍碰撞）
 --obstacle-collision-release-distance，默认 0.0（障碍碰撞释放）
 --reacq-timeout-sec，默认 10.0

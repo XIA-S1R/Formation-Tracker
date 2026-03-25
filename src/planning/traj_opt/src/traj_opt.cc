@@ -352,11 +352,15 @@ TrajOpt::TrajOpt(ros::NodeHandle& nh) : nh_(nh) {
   nh.getParam("tolerance_d", tolerance_d_);
 
   // Formation-related parameters
-  nh.getParam("optimization/weight_formation", wei_formation_);
-  nh.getParam("optimization/formation_size", formation_size_);
-  nh.getParam("optimization/drone_id", drone_id_);
-  nh.getParam("optimization/use_formation", use_formation_);
-  nh.getParam("optimization/formation_type", formation_type_);
+  nh.param("optimization/weight_formation", wei_formation_, 0.0);
+  nh.param("optimization/formation_grad_clip", formation_grad_clip_, 5.0);
+  nh.param("optimization/formation_size", formation_size_, 0);
+  nh.param("optimization/drone_id", drone_id_, -1);
+  nh.param("optimization/use_formation", use_formation_, false);
+  nh.param("optimization/formation_type", formation_type_, 0);
+  nh.param("optimization/use_tracking_cost", use_tracking_cost_, false);
+  // Backward-compatible flat name.
+  nh.param("use_tracking_cost", use_tracking_cost_, use_tracking_cost_);
 
   if (!nh.getParam("rhoSwarm", rhoSwarm_)) {
     rhoSwarm_ = 1000.0;
@@ -472,7 +476,7 @@ int TrajOpt::optimize(const double& delta) {
   lbfgs_params.g_epsilon = 0.1;        // 对齐 Swarm-Formation：宽松收敛
   lbfgs_params.min_step = 1e-32;
   lbfgs_params.delta = delta;
-  lbfgs_params.max_iterations = 60;    // 限制迭代次数，避免 line search 失败
+  lbfgs_params.max_iterations = 60;   // 提高迭代上限，增强六机编队收敛能力
   Eigen::Map<Eigen::VectorXd> t(x_, dim_t_);
   Eigen::Map<Eigen::VectorXd> p(x_ + dim_t_, dim_p_);
   t = t_;
@@ -1044,14 +1048,6 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度走�
         double gradt_form = 0, grad_prev_t_form = 0, costp_form = 0;
         if (grad_cost_swarm_formation(i, t_sample, pos, vel,
                                        grad_tmp, gradt_form, grad_prev_t_form, costp_form)) {
-          // Clip formation gradient norm to prevent conflict with corridor hard constraint
-          double grad_norm = grad_tmp.norm();
-          if (grad_norm > 10.0) {
-            grad_tmp *= 10.0 / grad_norm;
-            gradt_form *= 10.0 / grad_norm;
-            grad_prev_t_form *= 10.0 / grad_norm;
-            costp_form *= 10.0 / grad_norm;
-          }
           gradViolaPc = beta0 * grad_tmp.transpose();
           gradViolaPt = alpha * gradt_form;
           jerkOpt_.gdC.block<6, 3>(i * 6, 0) += omg * step * gradViolaPc;
@@ -1148,6 +1144,7 @@ bool TrajOpt::grad_cost_swarm_formation(const int piece,
                                         double& grad_prev_t,
                                         double& costp) {
   if (!use_formation_ || swarm_graph_ == nullptr) return false;
+  if (drone_id_ < 0 || drone_id_ >= formation_size_) return false;
 
   // 严格对齐 Swarm-Formation 的冷启动逻辑：
   // 只有当所有其他无人机的轨迹都就绪时才计算编队代价；
@@ -1203,7 +1200,10 @@ bool TrajOpt::grad_cost_swarm_formation(const int piece,
     }
   }
 
-  swarm_graph_->updateGraph(swarm_pos);
+  if (!swarm_graph_->updateGraph(swarm_pos)) {
+    ROS_WARN_THROTTLE(1.0, "[drone %d traj_opt] skip formation: updateGraph failed (formation_size=%d)", drone_id_, formation_size_);
+    return false;
+  }
 
   double similarity_error;
   if (!swarm_graph_->calcFNorm2(similarity_error)) return false;
@@ -1213,7 +1213,22 @@ bool TrajOpt::grad_cost_swarm_formation(const int piece,
     costp = wei_formation_ * similarity_error;
 
     std::vector<Eigen::Vector3d> swarm_grad;
-    swarm_graph_->getGrad(swarm_grad);
+    if (!swarm_graph_->getGrad(swarm_grad)) return false;
+    if ((int)swarm_grad.size() <= drone_id_ || (int)swarm_grad.size() < formation_size_) {
+      ROS_WARN_THROTTLE(1.0,
+                        "[drone %d traj_opt] skip formation: invalid grad size=%zu, formation_size=%d",
+                        drone_id_, swarm_grad.size(), formation_size_);
+      return false;
+    }
+
+    if (formation_grad_clip_ > 0.0) {
+      for (auto& g : swarm_grad) {
+        const double g_norm = g.norm();
+        if (g_norm > formation_grad_clip_) {
+          g *= (formation_grad_clip_ / g_norm);
+        }
+      }
+    }
 
     gradp = wei_formation_ * swarm_grad[drone_id_];
 
@@ -1234,7 +1249,8 @@ bool TrajOpt::grad_cost_swarm_formation(const int piece,
 }
 
 void TrajOpt::addTimeCost(double& cost) {
-  if (emergency_recovery_) return;  // 紧急恢复：跳过追踪代价
+  if (emergency_recovery_) return;   // 紧急恢复：跳过追踪代价
+  if (!use_tracking_cost_) return;  // front-end target guidance only, no tracking term in optimizer
   const auto& T = jerkOpt_.T1;
   int piece = 0;
   int M = tracking_ps_.size() * 4 / 5;
@@ -1388,47 +1404,27 @@ bool TrajOpt::grad_cost_p_tracking(const Eigen::Vector3d& p,
                                    const Eigen::Vector3d& target_p,
                                    Eigen::Vector3d& gradp,
                                    double& costp) {
-  // return false;
-  double upper = tracking_dist_ + tolerance_d_;
-  double lower = tracking_dist_ - tolerance_d_;
-  upper = upper * upper;
-  lower = lower * lower;
+  // Simple point-tracking penalty:
+  // only penalize when distance to target point exceeds a threshold.
+  // J = max(0, ||p-target|| - d_th)^2
+  const double d_th = std::max(1e-3, tolerance_d_);
+  const Eigen::Vector3d dp = (p - target_p);
+  const double d = dp.norm();
 
-  Eigen::Vector3d dp = (p - target_p);
-  double dr2 = dp.head(2).squaredNorm();
-  double dz2 = dp.z() * dp.z();
-
-  bool ret;
   gradp.setZero();
   costp = 0;
+  if (d <= d_th) return false;
 
-  double pen = dr2 - upper;
-  if (pen > 0) {
-    double grad;
-    costp += penF(pen, grad);
-    gradp.head(2) += 2 * grad * dp.head(2);
-    ret = true;
-  } else {
-    pen = lower - dr2;
-    if (pen > 0) {
-      double pen2 = pen * pen;
-      gradp.head(2) -= 6 * pen2 * dp.head(2);
-      costp += pen2 * pen;
-      ret = true;
-    }
-  }
-  pen = dz2 - tolerance_d_ * tolerance_d_;
-  if (pen > 0) {
-    double pen2 = pen * pen;
-    gradp.z() += 6 * pen2 * dp.z();
-    costp += pen * pen2;
-    ret = true;
+  const double err = d - d_th;
+  costp = err * err;
+  if (d > 1e-6) {
+    gradp = 2.0 * err * (dp / d);
   }
 
   gradp *= rhoTracking_;
   costp *= rhoTracking_;
 
-  return ret;
+  return true;
 }
 
 bool TrajOpt::grad_cost_p_landing(const Eigen::Vector3d& p,
@@ -1439,7 +1435,7 @@ bool TrajOpt::grad_cost_p_landing(const Eigen::Vector3d& p,
   double dr2 = dp.head(2).squaredNorm();
   double dz2 = dp.z() * dp.z();
 
-  bool ret;
+  bool ret = false;
   gradp.setZero();
   costp = 0;
 
@@ -1517,21 +1513,21 @@ bool TrajOpt::grad_cost_a(const Eigen::Vector3d& a,
 
 void TrajOpt::setDesiredFormation(int type) {
   std::vector<Eigen::Vector3d> swarm_des;
-  Eigen::Vector3d v0, v1, v2, v3, v4, v5, v6;
+  Eigen::Vector3d v0, v1, v2, v3, v4, v5;
   switch (type) {
     case 0: // NONE_FORMATION
       use_formation_ = false;
       formation_size_ = 0;
+      formation_offset_.setZero();
       break;
-    case 1: // REGULAR_HEXAGON
-      // Set the desired formation
-      v0 << 0, 0, 0;
-      v1 << 1.7321, -1, 0;
-      v2 << 0, -2, 0;
-      v3 << -1.7321, -1, 0;
-      v4 << -1.7321, 1, 0;
-      v5 << 0, 2, 0;
-      v6 << 1.7321, 1, 0;
+    case 1: // REGULAR_HEXAGON_RING (6 drones, no center point)
+      // side length = 2m, centered at origin
+      v0 <<  1.7321, -1.0000, 0.0;
+      v1 <<  0.0000, -2.0000, 0.0;
+      v2 << -1.7321, -1.0000, 0.0;
+      v3 << -1.7321,  1.0000, 0.0;
+      v4 <<  0.0000,  2.0000, 0.0;
+      v5 <<  1.7321,  1.0000, 0.0;
 
       swarm_des.push_back(v0);
       swarm_des.push_back(v1);
@@ -1539,10 +1535,15 @@ void TrajOpt::setDesiredFormation(int type) {
       swarm_des.push_back(v3);
       swarm_des.push_back(v4);
       swarm_des.push_back(v5);
-      swarm_des.push_back(v6);
 
+      use_formation_ = true;
       formation_size_ = swarm_des.size();
       swarm_graph_->setDesiredForm(swarm_des);
+      if (drone_id_ >= 0 && drone_id_ < (int)swarm_des.size()) {
+        formation_offset_ = swarm_des[drone_id_];
+      } else {
+        formation_offset_.setZero();
+      }
       break;
     case 2: // EQUILATERAL_TRIANGLE (3 drones, edge length = 2m)
       v0 <<  0.0,    1.1547, 0;
@@ -1557,6 +1558,25 @@ void TrajOpt::setDesiredFormation(int type) {
       // 保存本机的期望偏移
       if (drone_id_ >= 0 && drone_id_ < (int)swarm_des.size())
         formation_offset_ = swarm_des[drone_id_];
+      else
+        formation_offset_.setZero();
+      break;
+    case 3: // SQUARE (4 drones, side length = 2m)
+      v0 <<  1.0,  1.0, 0.0;
+      v1 <<  1.0, -1.0, 0.0;
+      v2 << -1.0, -1.0, 0.0;
+      v3 << -1.0,  1.0, 0.0;
+      swarm_des.push_back(v0);
+      swarm_des.push_back(v1);
+      swarm_des.push_back(v2);
+      swarm_des.push_back(v3);
+      formation_size_ = swarm_des.size();
+      use_formation_ = true;
+      swarm_graph_->setDesiredForm(swarm_des);
+      if (drone_id_ >= 0 && drone_id_ < (int)swarm_des.size())
+        formation_offset_ = swarm_des[drone_id_];
+      else
+        formation_offset_.setZero();
       break;
     default:
       break;

@@ -723,10 +723,59 @@ class Env {
     Eigen::Vector3i start_idx = mapPtr_->pos2idx(start_p);
     Eigen::Vector3i end_idx = mapPtr_->pos2idx(end_p);
     Eigen::Vector3d adjusted_end = end_p;
+    Eigen::Vector3i adjusted_start_idx = start_idx;
+    Eigen::Vector3d adjusted_start = start_p;
+
+    // 起点若已在膨胀占据内，先在邻域找最近空闲栅格作为恢复起点。
+    if (mapPtr_->isOccupied(start_idx)) {
+      const double recover_radius = 1.5;  // m
+      const int max_step = std::max(1, (int)std::ceil(recover_radius / mapPtr_->resolution));
+      bool found = false;
+      double best_d2 = std::numeric_limits<double>::infinity();
+      Eigen::Vector3i best_idx = start_idx;
+
+      for (int step = 1; step <= max_step; ++step) {
+        bool found_this_shell = false;
+        for (int dx = -step; dx <= step; ++dx) {
+          for (int dy = -step; dy <= step; ++dy) {
+            for (int dz = -step; dz <= step; ++dz) {
+              if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != step) {
+                continue;
+              }
+              Eigen::Vector3i cand = start_idx + Eigen::Vector3i(dx, dy, dz);
+              if (!mapPtr_->isInMap(cand) || mapPtr_->isOccupied(cand)) {
+                continue;
+              }
+              double d2 = (cand - start_idx).cast<double>().squaredNorm();
+              if (d2 < best_d2) {
+                best_d2 = d2;
+                best_idx = cand;
+                found_this_shell = true;
+              }
+            }
+          }
+        }
+        if (found_this_shell) {
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        std::cout << "[short astar] start occupied, no free point in recovery radius!" << std::endl;
+        return false;
+      }
+
+      adjusted_start_idx = best_idx;
+      adjusted_start = mapPtr_->idx2pos(best_idx);
+      start_idx = adjusted_start_idx;
+      std::cout << "[short astar] start occupied, recover to nearby free cell, shift="
+                << (adjusted_start - start_p).norm() << "m" << std::endl;
+    }
 
     // 如果终点被占用，沿 终点→起点 方向回退找空闲点
     if (mapPtr_->isOccupied(end_idx)) {
-      Eigen::Vector3d dir = (start_p - end_p).normalized();
+      Eigen::Vector3d dir = (adjusted_start - end_p).normalized();
       double step = mapPtr_->resolution;
       bool found = false;
       for (double d = step; d < 5.0; d += step) {
@@ -782,10 +831,10 @@ class Env {
     }
     bool ret = false;
     NodePtr curPtr = visit(start_idx);
-    // NOTE we should permit the start pos invalid! (for corridor generation)
+    // 起点恢复后若仍无效，则直接失败。
     if (!curPtr->valid) {
       visited_nodes_.clear();
-      std::cout << "[short astar]start postition invalid!" << std::endl;
+      std::cout << "[short astar] start postition invalid after recovery!" << std::endl;
       return false;
     }
     curPtr->parent = nullptr;

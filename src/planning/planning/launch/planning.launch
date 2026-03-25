@@ -1,12 +1,14 @@
 <launch>
 
   <arg name="rhosVisibility_"/>
-  <arg name="rhoTracking_"/>
+  <arg name="rhoTracking_" default="100000.0"/>
   <arg name="target_name_"/>
-  <!-- Formation args: drone_id (int), formation_type_ ("none"|"hexagon") -->
+  <!-- Formation args: drone_id (int), formation_type_ ("none"|"hexagon"|"triangle"|"square") -->
   <arg name="drone_id"        default="0"/>
   <arg name="formation_type_" default="none"/>
   <arg name="num_drones"      default="3"/>
+  <arg name="weight_formation_" default="10000.0"/><!-- 100000.0-->
+  <arg name="formation_grad_clip_" default="15.0"/><!-- 编队梯度限幅阈值，<=0 表示关闭 -->
 
   <node pkg="nodelet" type="nodelet" name="planning" args="load planning/Nodelet manager" output="screen">
     <remap from="~odom" to="odom"/>
@@ -18,12 +20,13 @@
     <remap from="~triger" to="/triger"/> <!-- 在追踪者的规划上，triger只作为启动开关，不决定目标位置 -->
     <remap from="~land_triger" to="/land_triger"/>
 
-    <param name="plan_hz"        value="20"/>
+    <param name="plan_hz"        value="40"/>
+    <param name="hard_replan_hz" value="10"/>
     <param name="K"              value="8"/>
     <param name="vmax"           value="3.0"/>
     <param name="amax"           value="6.0"/>
     <param name="rhoT"           value="10.0"/>
-    <param name="rhoP"           value="1000000.0"/>
+    <param name="rhoP"           value="100000.0"/>
     <param name="rhoV"           value="1000.0"/>
     <param name="rhoA"           value="1000.0"/>
     <param name="rhoTracking"    value="$(arg rhoTracking_)"/><!-- 追踪成本的权重 -->
@@ -35,6 +38,9 @@
     <param name="tracking_dist"  value="2.5"/><!-- 希望维持的跟踪距离 -->
     <param name="tracking_dur"   value="3.0"/><!-- 跟踪规划规划未来3s的轨迹 -->
     <param name="tracking_dt"    value="0.2"/><!-- 采样间隔，用于计算代价 -->
+    <param name="obs_clip_enable" value="true"/><!-- 前端路径截断到观测半径内 -->
+    <param name="obs_clip_range"  value="7.0"/><!-- 观测半径（建议比 mapping/sensor_range 小） -->
+    <param name="obs_clip_margin" value="0.5"/><!-- 裁剪边界留白 -->
     <param name="formation_heading_speed_thresh" value="0.2"/><!-- 目标低速时保持上次编队朝向 -->
     <param name="debug"          value="false"/>
 
@@ -43,16 +49,18 @@
     <param name="num_drones"       value="$(arg num_drones)" type="int"/>
 
     <!-- Swarm / formation parameters -->
-    <param name="rhoSwarm"                       value="10000.0"/><!-- 集群避撞权重 -->
+    <param name="rhoSwarm"                       value="0.0"/><!-- 集群避撞权重 10000-->
     <param name="optimization/drone_id"          value="$(arg drone_id)" type="int"/>
-    <!-- formation_type: 0 = none, 1 = regular hexagon (7 drones), 2 = equilateral triangle (3 drones) -->
+    <!-- formation_type: 0 = none, 1 = regular hexagon ring (6 drones), 2 = equilateral triangle (3 drones), 3 = square (4 drones) -->
     <param name="optimization/formation_type"
-           value="$(eval 1 if arg('formation_type_') == 'hexagon' else (2 if arg('formation_type_') == 'triangle' else 0))" type="int"/>
+           value="$(eval 1 if arg('formation_type_') == 'hexagon' else (2 if arg('formation_type_') == 'triangle' else (3 if arg('formation_type_') == 'square' else 0)))" type="int"/>
     <param name="optimization/use_formation"
            value="$(eval arg('formation_type_') != 'none')" type="bool"/>
-    <param name="optimization/weight_formation"  value="100000.0"/><!-- 编队保持权重 -->
+    <param name="optimization/use_tracking_cost" value="true" type="bool"/>
+    <param name="optimization/weight_formation"  value="$(arg weight_formation_)"/><!-- 编队保持权重 -->
+    <param name="optimization/formation_grad_clip" value="$(arg formation_grad_clip_)"/><!-- 编队梯度clip阈值 -->
     <param name="optimization/formation_size"
-           value="$(eval 7 if arg('formation_type_') == 'hexagon' else (3 if arg('formation_type_') == 'triangle' else 0))" type="int"/>
+           value="$(eval 6 if arg('formation_type_') == 'hexagon' else (3 if arg('formation_type_') == 'triangle' else (4 if arg('formation_type_') == 'square' else 0)))" type="int"/>
 
   </node>
 

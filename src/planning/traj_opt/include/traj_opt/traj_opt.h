@@ -52,14 +52,16 @@ class TrajOpt {
 
   // Formation-related parameters
   SwarmGraph::Ptr swarm_graph_;
-  double wei_formation_;
-  int formation_size_, drone_id_;
+  double wei_formation_ = 0.0;
+  double formation_grad_clip_ = 5.0;  // <=0: disable clip, >0: clip each drone formation grad norm
+  int formation_size_ = 0, drone_id_ = -1;
   std::vector<SwarmTrajData> swarm_trajs_;
-  bool use_formation_;
-  int formation_type_;
+  bool use_formation_ = false;
+  int formation_type_ = 0;
   Eigen::Vector3d formation_offset_;  // 本机在期望编队中的偏移（相对编队质心），仅供外部参考，不用于锁定 finState
   bool use_soft_constraint_ = false;  // true: ESDF软约束, false: 走廊硬约束
-  bool emergency_recovery_ = false;   // 紧急刹车后首次规划：跳过编队+追踪代价
+  bool use_tracking_cost_ = false;    // false: disable tracking cost in trajectory optimization
+  bool emergency_recovery_ = false;   // 紧急刹车后首次规划：跳过编队代价和tracking代价
 
   // Absolute time at the start of each optimization call (fixed during one L-BFGS run)
   double t_now_;

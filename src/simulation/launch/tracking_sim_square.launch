@@ -74,10 +74,10 @@
       <remap from="~triger"          to="/move_base_simple/goal"/>
       <param name="plan_hz"          value="20"/>
       <param name="K"                value="8"/>
-      <param name="vmax"             value="3"/>
-      <param name="amax"             value="6"/>
+      <param name="vmax"             value="2.5"/>
+      <param name="amax"             value="5"/>
       <param name="rhoT"             value="100.0"/>
-      <param name="rhoP"             value="10000.0"/>
+      <param name="rhoP"             value="1000000.0"/>
       <param name="rhoV"             value="1000.0"/>
       <param name="rhoA"             value="1000.0"/>
       <param name="clearance_d"      value="0.2"/>
@@ -98,20 +98,20 @@
   </group>
 
   <!-- ============================================================
-       Tracking swarm：3架无人机，等边三角形编队跟踪目标
+       Tracking swarm：4架无人机，正方形编队跟踪目标
 
-       初始质心在 (-8, 0)，target在(0,0)，距离8m，在15m感知范围内
-       三角形顶点偏移（边长2m，质心为原点）：
-         v0: ( 0.00, +1.1547)  → drone0: (-8.00, +1.1547)  前顶点
-         v1: (+1.00, -0.5774)  → drone1: (-7.00, -0.5774)  右后
-         v2: (-1.00, -0.5774)  → drone2: (-9.00, -0.5774)  左后
+       初始质心在 (-18, 0)，正方形边长2m，顶点偏移（质心为原点）：
+         v0: (+1.0, +1.0) -> drone0: (-17.0, +1.0)
+         v1: (+1.0, -1.0) -> drone1: (-17.0, -1.0)
+         v2: (-1.0, -1.0) -> drone2: (-19.0, -1.0)
+         v3: (-1.0, +1.0) -> drone3: (-19.0, +1.0)
   ============================================================ -->
 
-  <!-- drone0：前顶点 -->
+  <!-- drone0：右前顶点 -->
   <group ns="drone0">
     <include file="$(find mapping)/launch/mapping.launch">
-      <arg name="init_x_" value="-18.00"/>
-      <arg name="init_y_" value=" 1.1547"/>
+      <arg name="init_x_" value="-17.00"/>
+      <arg name="init_y_" value=" 1.0000"/>
       <arg name="init_z_" value=" 1.50"/>
     </include>
     <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
@@ -132,13 +132,13 @@
       <param name="max_obs_depth" value="8.0"/>
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="0"/>
-      <param name="num_drones" value="3"/>
+      <param name="num_drones" value="4"/>
       <param name="dpf_rate" value="20"/>
       <param name="num_particles" value="200"/>
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
-      <param name="miss_detection_num" value="5"/>
+      <param name="miss_detection_num" value="10"/>
       <param name="neg_obs_ttl_sec" value="8.0"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
@@ -153,7 +153,8 @@
       <arg name="rhoTracking_"     value="10.0"/>
       <arg name="target_name_"     value="/drone0/target_ekf_odom"/>
       <arg name="drone_id"         value="0"/>
-      <arg name="formation_type_"  value="triangle"/>
+      <arg name="formation_type_"  value="square"/>
+      <arg name="num_drones"       value="4"/>
     </include>
   </group>
 
@@ -161,7 +162,7 @@
   <group ns="drone1">
     <include file="$(find mapping)/launch/mapping.launch">
       <arg name="init_x_" value="-17.00"/>
-      <arg name="init_y_" value="-0.5774"/>
+      <arg name="init_y_" value="-1.0000"/>
       <arg name="init_z_" value=" 1.50"/>
     </include>
     <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
@@ -182,13 +183,13 @@
       <param name="max_obs_depth" value="8.0"/>
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="1"/>
-      <param name="num_drones" value="3"/>
+      <param name="num_drones" value="4"/>
       <param name="dpf_rate" value="20"/>
       <param name="num_particles" value="200"/>
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
-      <param name="miss_detection_num" value="5"/>
+      <param name="miss_detection_num" value="10"/>
       <param name="neg_obs_ttl_sec" value="8.0"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
@@ -203,7 +204,8 @@
       <arg name="rhoTracking_"     value="10.0"/>
       <arg name="target_name_"     value="/drone1/target_ekf_odom"/>
       <arg name="drone_id"         value="1"/>
-      <arg name="formation_type_"  value="triangle"/>
+      <arg name="formation_type_"  value="square"/>
+      <arg name="num_drones"       value="4"/>
     </include>
   </group>
 
@@ -211,7 +213,7 @@
   <group ns="drone2">
     <include file="$(find mapping)/launch/mapping.launch">
       <arg name="init_x_" value="-19.00"/>
-      <arg name="init_y_" value="-0.5774"/>
+      <arg name="init_y_" value="-1.0000"/>
       <arg name="init_z_" value=" 1.50"/>
     </include>
     <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
@@ -232,13 +234,13 @@
       <param name="max_obs_depth" value="8.0"/>
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="2"/>
-      <param name="num_drones" value="3"/>
+      <param name="num_drones" value="4"/>
       <param name="dpf_rate" value="20"/>
       <param name="num_particles" value="200"/>
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
-      <param name="miss_detection_num" value="5"/>
+      <param name="miss_detection_num" value="10"/>
       <param name="neg_obs_ttl_sec" value="8.0"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
@@ -253,7 +255,59 @@
       <arg name="rhoTracking_"     value="10.0"/>
       <arg name="target_name_"     value="/drone2/target_ekf_odom"/>
       <arg name="drone_id"         value="2"/>
-      <arg name="formation_type_"  value="triangle"/>
+      <arg name="formation_type_"  value="square"/>
+      <arg name="num_drones"       value="4"/>
+    </include>
+  </group>
+
+  <!-- drone3：左前顶点 -->
+  <group ns="drone3">
+    <include file="$(find mapping)/launch/mapping.launch">
+      <arg name="init_x_" value="-19.00"/>
+      <arg name="init_y_" value=" 1.0000"/>
+      <arg name="init_z_" value=" 1.50"/>
+    </include>
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+      <remap from="~gridmap"         to="gridmap"/>
+      <remap from="~gridmap_inflate" to="gridmap_inflate"/>
+    </node>
+    <node pkg="odom_visualization" name="odom_visualization"
+          type="odom_visualization" output="screen">
+      <remap from="~odom" to="odom"/>
+      <param name="robot_scale" value="1.0"/>
+      <param name="color_r" value="0.8"/>
+      <param name="color_g" value="0.2"/>
+      <param name="color_b" value="0.8"/>
+    </node>
+    <node name="drone3_target_dpf" pkg="target_ekf"
+          type="target_dpf_sim_node" output="screen">
+      <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
+      <param name="max_obs_depth" value="8.0"/>
+      <param name="pitch_thr" value="37"/>
+      <param name="drone_id" value="3"/>
+      <param name="num_drones" value="4"/>
+      <param name="dpf_rate" value="20"/>
+      <param name="num_particles" value="200"/>
+      <param name="num_components" value="4"/>
+      <param name="num_em_iters" value="10"/>
+      <param name="check_fov" value="true"/>
+      <param name="miss_detection_num" value="10"/>
+      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="hotspot_min_drone_dist" value="2.0"/>
+      <param name="hotspot_seed_radius" value="1.5"/>
+      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
+      <remap from="~yolo"        to="/target/odom"/>
+      <remap from="~odom"        to="odom"/>
+      <remap from="~target_odom" to="target_ekf_odom"/>
+      <remap from="~global_map"  to="/global_map"/>
+    </node>
+    <include file="$(find planning)/launch/planning.launch">
+      <arg name="rhosVisibility_"  value="1000.0"/>
+      <arg name="rhoTracking_"     value="10.0"/>
+      <arg name="target_name_"     value="/drone3/target_ekf_odom"/>
+      <arg name="drone_id"         value="3"/>
+      <arg name="formation_type_"  value="square"/>
+      <arg name="num_drones"       value="4"/>
     </include>
   </group>
 
