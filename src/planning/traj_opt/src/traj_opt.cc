@@ -1044,7 +1044,8 @@ void TrajOpt::addTimeIntPenalty(double& cost) {//位置走廊约束、速度走�
 
       // ---- Formation cost ----
       // 只在轨迹前2/3部分计算编队代价（对齐swarm-formation，避免末端约束冲突）
-      if (use_formation_ && !emergency_recovery_ && t_sample > 0 && t_sample < sum_T_ * 2.0 / 3.0) {
+      if (use_formation_ && !emergency_recovery_ && !suppress_formation_cost_ &&
+          t_sample > 0 && t_sample < sum_T_ * 2.0 / 3.0) {
         double gradt_form = 0, grad_prev_t_form = 0, costp_form = 0;
         if (grad_cost_swarm_formation(i, t_sample, pos, vel,
                                        grad_tmp, gradt_form, grad_prev_t_form, costp_form)) {

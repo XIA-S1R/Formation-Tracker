@@ -138,7 +138,7 @@
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
-      <param name="miss_detection_num" value="10"/>
+      <param name="miss_detection_num" value="5"/>
       <param name="neg_obs_ttl_sec" value="8.0"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
@@ -189,7 +189,7 @@
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
-      <param name="miss_detection_num" value="10"/>
+      <param name="miss_detection_num" value="5"/>
       <param name="neg_obs_ttl_sec" value="8.0"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
@@ -240,7 +240,7 @@
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
-      <param name="miss_detection_num" value="10"/>
+      <param name="miss_detection_num" value="5"/>
       <param name="neg_obs_ttl_sec" value="8.0"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
@@ -291,7 +291,7 @@
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
-      <param name="miss_detection_num" value="10"/>
+      <param name="miss_detection_num" value="5"/>
       <param name="neg_obs_ttl_sec" value="8.0"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>

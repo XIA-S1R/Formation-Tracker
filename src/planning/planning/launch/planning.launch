@@ -35,12 +35,13 @@
     <param name="clearance_d"    value="0.5"/><!-- 距离障碍物的安全间隙 -->
     <param name="use_soft_constraint" value="true"/><!-- true: ESDF软约束, false: 走廊硬约束 -->
     <param name="tolerance_d"    value="0.5"/>
-    <param name="tracking_dist"  value="2.5"/><!-- 希望维持的跟踪距离 -->
+    <param name="tracking_dist"  value="2.0"/><!-- 希望维持的跟踪距离 -->
     <param name="tracking_dur"   value="3.0"/><!-- 跟踪规划规划未来3s的轨迹 -->
     <param name="tracking_dt"    value="0.2"/><!-- 采样间隔，用于计算代价 -->
     <param name="obs_clip_enable" value="true"/><!-- 前端路径截断到观测半径内 -->
     <param name="obs_clip_range"  value="7.0"/><!-- 观测半径（建议比 mapping/sensor_range 小） -->
     <param name="obs_clip_margin" value="0.5"/><!-- 裁剪边界留白 -->
+    <param name="post_reacquire_boost_sec" value="3.0"/><!-- 退出搜索后暂时关闭编队代价 -->
     <param name="formation_heading_speed_thresh" value="0.2"/><!-- 目标低速时保持上次编队朝向 -->
     <param name="debug"          value="false"/>
 

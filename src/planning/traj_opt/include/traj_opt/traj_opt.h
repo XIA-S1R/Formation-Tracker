@@ -62,6 +62,7 @@ class TrajOpt {
   bool use_soft_constraint_ = false;  // true: ESDF软约束, false: 走廊硬约束
   bool use_tracking_cost_ = false;    // false: disable tracking cost in trajectory optimization
   bool emergency_recovery_ = false;   // 紧急刹车后首次规划：跳过编队代价和tracking代价
+  bool suppress_formation_cost_ = false; // 临时关闭编队代价（不影响编队前端偏置和tracking代价）
 
   // Absolute time at the start of each optimization call (fixed during one L-BFGS run)
   double t_now_;

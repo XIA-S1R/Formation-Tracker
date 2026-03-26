@@ -95,6 +95,11 @@ int miss_detection_num_ = 5; // 连续多少帧都没有观测后进入搜索模
 int consecutive_no_obs_count_ = 0; // 连续无观测计数
 bool search_mode_active_ = false; // 是否处于搜索模式
 ros::Time last_global_obs_time_;
+bool reacquire_boost_active_ = false;                  // 重捕获后短时加强跟踪窗口
+ros::Time reacquire_boost_end_time_ = ros::Time(0);    // 加强跟踪结束时间
+double reacquire_boost_duration_sec_ = 3.0;            // 加强跟踪持续时长
+double reacquire_boost_miss_scale_ = 3.0;              // 回搜阈值放大倍数
+int reacquire_boost_miss_min_ = 0;                     // 回搜阈值最小值（<=0表示不限制）
 
 // 搜索方向承诺机制
 Eigen::Vector3d committed_search_dir_ = Eigen::Vector3d::Zero();
@@ -131,6 +136,35 @@ void resetCommittedDirectionState() {
   last_hotspot_extract_time_ = ros::Time(0);
   committed_direction_refresh_count_ = 0;
   current_hotspot_extract_interval_sec_ = hotspot_extract_interval_base_sec_;
+}
+
+int getCurrentMissDetectionThreshold() {
+  const int base = std::max(1, miss_detection_num_);
+  if (!reacquire_boost_active_) {
+    return base;
+  }
+  int boosted = std::max(base + 1, (int)std::ceil(base * reacquire_boost_miss_scale_));
+  if (reacquire_boost_miss_min_ > 0) {
+    boosted = std::max(boosted, reacquire_boost_miss_min_);
+  }
+  return boosted;
+}
+
+void activateReacquireBoost(const char* reason) {
+  if (reacquire_boost_duration_sec_ <= 0.0) return;
+  reacquire_boost_active_ = true;
+  reacquire_boost_end_time_ = ros::Time::now() + ros::Duration(reacquire_boost_duration_sec_);
+  ROS_WARN("[dpf%d] BOOSTED TRACKING ON (%s): hold=%.2fs, miss_threshold=%d->%d",
+           drone_id_, reason, reacquire_boost_duration_sec_,
+           std::max(1, miss_detection_num_), getCurrentMissDetectionThreshold());
+}
+
+void updateReacquireBoostState() {
+  if (reacquire_boost_active_ && ros::Time::now() >= reacquire_boost_end_time_) {
+    reacquire_boost_active_ = false;
+    ROS_WARN("[dpf%d] BOOSTED TRACKING OFF: miss_threshold back to %d",
+             drone_id_, std::max(1, miss_detection_num_));
+  }
 }
 
 // 6D搜索共识邻居数据
@@ -986,6 +1020,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     ROS_DEBUG_THROTTLE(1.0, "[dpf%d] Waiting for odom and map...", drone_id_);
     return;
   }
+  updateReacquireBoostState();
   // 读取无人机最新位姿
   Eigen::Vector3d odom_p;
   Eigen::Quaterniond odom_q;
@@ -1083,6 +1118,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       search_mode_active_ = false;
       consecutive_no_obs_count_ = 0;
       resetCommittedDirectionState();
+      activateReacquireBoost("self_reacquired");
       ROS_WARN("[dpf%d] EXITING SEARCH MODE: Target reacquired, resetting from direct observation!", drone_id_);
 
       // 发布 local_stats（has_obs=true），通知邻居此机已重新观测到目标
@@ -1110,6 +1146,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
           search_mode_active_ = false;
           consecutive_no_obs_count_ = 0;
           resetCommittedDirectionState();
+          activateReacquireBoost("neighbor_reacquired");
           ROS_WARN("[dpf%d] EXITING SEARCH MODE: Neighbor drone %d reacquired target!", drone_id_, kv.first);
           break;
         }
@@ -1389,15 +1426,17 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     }
     
     // 更新连续无观测计数
+    const int enter_search_threshold = getCurrentMissDetectionThreshold();
     if (all_drones_no_obs) {
       consecutive_no_obs_count_++;
-      if (consecutive_no_obs_count_ >= miss_detection_num_ && !search_mode_active_) {
+      if (consecutive_no_obs_count_ >= enter_search_threshold && !search_mode_active_) {
         // 立即进入搜索模式并进行初始化
         search_mode_active_ = true;
+        reacquire_boost_active_ = false;
         last_global_obs_time_ = ros::Time::now();
         resetCommittedDirectionState();
-        ROS_WARN("[dpf%d] ENTERING SEARCH MODE: All drones lost target for %d consecutive frames!",
-                 drone_id_, consecutive_no_obs_count_);
+        ROS_WARN("[dpf%d] ENTERING SEARCH MODE: All drones lost target for %d consecutive frames (threshold=%d)!",
+                 drone_id_, consecutive_no_obs_count_, enter_search_threshold);
 
         // 初始化6D搜索共识GMM（C = 2*num_drones）
         auto pw = dpfPtr_->getParticlesAndWeights();
@@ -1676,6 +1715,11 @@ int main(int argc, char** argv) {
   nh.getParam("max_obs_depth", max_obs_depth_);
   // 搜索模式参数
   nh.getParam("miss_detection_num", miss_detection_num_);
+  nh.param("reacquire_boost_duration_sec", reacquire_boost_duration_sec_, 3.0);
+  nh.param("reacquire_boost_miss_scale", reacquire_boost_miss_scale_, 3.0);
+  nh.param("reacquire_boost_miss_min", reacquire_boost_miss_min_, 0);
+  reacquire_boost_duration_sec_ = std::max(0.0, reacquire_boost_duration_sec_);
+  reacquire_boost_miss_scale_ = std::max(1.0, reacquire_boost_miss_scale_);
   nh.param("neg_obs_ttl_sec", neg_obs_ttl_sec_, 8.0);
   nh.param("hotspot_min_drone_dist", hotspot_min_drone_dist_, 2.0);
   nh.param("hotspot_seed_radius", hotspot_seed_radius_, 1.5);
@@ -1695,6 +1739,9 @@ int main(int argc, char** argv) {
 
   ROS_INFO("[dpf%d] Search frontier params: neg_obs_ttl=%.1fs, min_drone_dist=%.2fm, seed_radius=%.2fm, invalid_reject_ratio=%.2f",
            drone_id_, neg_obs_ttl_sec_, hotspot_min_drone_dist_, hotspot_seed_radius_, hotspot_invalid_reject_ratio_);
+  ROS_INFO("[dpf%d] Reacquire boost: hold=%.2fs, miss_scale=%.2f, miss_min=%d, base_miss=%d",
+           drone_id_, reacquire_boost_duration_sec_, reacquire_boost_miss_scale_,
+           reacquire_boost_miss_min_, miss_detection_num_);
   ROS_INFO("[dpf%d] Search commitment interval: base=%.2fs, growth=%.2fs, max=%.2fs",
            drone_id_, hotspot_extract_interval_base_sec_, hotspot_extract_interval_growth_sec_,
            hotspot_extract_interval_max_sec_);

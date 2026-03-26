@@ -61,6 +61,9 @@ class Nodelet : public nodelet::Nodelet {
   std::atomic_flag search_label_info_lock_ = ATOMIC_FLAG_INIT;
   Eigen::Vector3d search_target_with_offset_;  // 本机的搜索目标点（含偏置）
   double search_desired_yaw_ = 0.0;            // 搜索模式期望偏航角
+  double post_reacquire_boost_sec_ = 3.0;      // 退出搜索后的增强跟踪窗口
+  bool post_reacquire_boost_active_ = false;   // 增强跟踪是否激活
+  ros::Time post_reacquire_boost_end_time_ = ros::Time(0);
 
   // NOTE planning or fake target
   bool fake_ = false;
@@ -404,8 +407,18 @@ class Nodelet : public nodelet::Nodelet {
   void search_state_callback(const std_msgs::Bool::ConstPtr& msgPtr) {
     while (search_state_lock_.test_and_set())
       ;
+    const bool prev_search_mode = search_mode_active_;
     latest_search_state_ = *msgPtr;
     search_mode_active_ = msgPtr->data;
+    if (search_mode_active_) {
+      post_reacquire_boost_active_ = false;
+      post_reacquire_boost_end_time_ = ros::Time(0);
+    } else if (prev_search_mode && post_reacquire_boost_sec_ > 0.0) {
+      post_reacquire_boost_active_ = true;
+      post_reacquire_boost_end_time_ = ros::Time::now() + ros::Duration(post_reacquire_boost_sec_);
+      ROS_WARN("[drone %d planner] EXIT SEARCH -> BOOSTED TRACKING %.2fs: suppress formation cost",
+               trajOptPtr_->drone_id_, post_reacquire_boost_sec_);
+    }
     search_state_lock_.clear();
   }
 
@@ -505,6 +518,17 @@ class Nodelet : public nodelet::Nodelet {
     }
     if (!target_received_) {
       return;
+    }
+    if (post_reacquire_boost_active_ && ros::Time::now() >= post_reacquire_boost_end_time_) {
+      post_reacquire_boost_active_ = false;
+      ROS_WARN("[drone %d planner] BOOSTED TRACKING ended: restore formation cost", trajOptPtr_->drone_id_);
+    }
+    trajOptPtr_->suppress_formation_cost_ = post_reacquire_boost_active_;
+    if (post_reacquire_boost_active_) {
+      const double remain = std::max(0.0, (post_reacquire_boost_end_time_ - ros::Time::now()).toSec());
+      ROS_INFO_THROTTLE(1.0,
+                        "[drone %d planner] BOOSTED TRACKING active: suppress formation cost, remaining=%.2fs",
+                        trajOptPtr_->drone_id_, remain);
     }
 
     // NOTE sequential start：drone_id=0 直接规划；drone_id>=1 等收到前一架无人机的广播轨迹后才开始规划
@@ -1390,6 +1414,8 @@ class Nodelet : public nodelet::Nodelet {
     obs_clip_range_ = std::max(0.5, obs_clip_range_);
     obs_clip_margin_ = std::max(0.0, std::min(obs_clip_margin_, obs_clip_range_ - 0.1));
     nh.param("formation_heading_speed_thresh", formation_heading_speed_thresh_, 0.2);
+    nh.param("post_reacquire_boost_sec", post_reacquire_boost_sec_, 3.0);
+    post_reacquire_boost_sec_ = std::max(0.0, post_reacquire_boost_sec_);
     nh.getParam("debug", debug_);
     nh.getParam("fake", fake_);
     nh.getParam("vmax", vmax_);
