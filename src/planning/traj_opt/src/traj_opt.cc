@@ -1579,6 +1579,27 @@ void TrajOpt::setDesiredFormation(int type) {
       else
         formation_offset_.setZero();
       break;
+    case 4: // REGULAR_PENTAGON (5 drones, side length ~= 2m)
+      // Centered at origin, one vertex facing +x direction.
+      // Radius R = s / (2*sin(pi/5)) ~= 1.7013 for s=2.
+      v0 <<  1.7013,  0.0000, 0.0;
+      v1 <<  0.5257,  1.6180, 0.0;
+      v2 << -1.3764,  1.0000, 0.0;
+      v3 << -1.3764, -1.0000, 0.0;
+      v4 <<  0.5257, -1.6180, 0.0;
+      swarm_des.push_back(v0);
+      swarm_des.push_back(v1);
+      swarm_des.push_back(v2);
+      swarm_des.push_back(v3);
+      swarm_des.push_back(v4);
+      formation_size_ = swarm_des.size();
+      use_formation_ = true;
+      swarm_graph_->setDesiredForm(swarm_des);
+      if (drone_id_ >= 0 && drone_id_ < (int)swarm_des.size())
+        formation_offset_ = swarm_des[drone_id_];
+      else
+        formation_offset_.setZero();
+      break;
     default:
       break;
   }

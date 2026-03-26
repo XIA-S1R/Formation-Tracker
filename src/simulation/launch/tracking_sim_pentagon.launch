@@ -1,0 +1,366 @@
+<launch>
+<env name="ROSCONSOLE_CONFIG_FILE" value="$(find planning)/config/rosconsole.conf"/>
+  <!-- ============================================================
+       Map generator
+  ============================================================ -->
+  <node pkg="mockamap" type="mockamap_node" name="mockamap_node" output="screen">
+    <rosparam file="$(find uav_simulator)/config/mockamap.yaml"/>
+    <remap from="/mock_map" to="/global_map"/>
+  </node>
+
+  <!-- ============================================================
+       Swarm bridge relay (仿真共享 ROS master，回环轨迹话题)
+  ============================================================ -->
+  <node pkg="topic_tools" type="relay" name="swarm_traj_relay"
+        args="/planning/broadcast_traj_send /planning/broadcast_traj_recv"
+        output="screen"/>
+
+  <!-- ============================================================
+       Target UAV — 红色，由 RViz 2D Nav Goal 控制
+  ============================================================ -->
+  <group ns="target">
+    <node pkg="nodelet" type="nodelet" name="manager" args="manager" output="screen">
+      <param name="num_worker_threads" value="16"/>
+    </node>
+
+    <node pkg="nodelet" type="nodelet" name="so3_quadrotor"
+          args="load so3_quadrotor/Nodelet manager" output="screen">
+      <rosparam file="$(find uav_simulator)/config/so3_quadrotor.yaml"/>
+      <param name="init_x" value="-16"/>
+      <param name="init_y" value="0"/>
+      <param name="init_z" value="2"/>
+      <remap from="~odom"   to="odom"/>
+      <remap from="~imu"    to="imu"/>
+      <remap from="~so3cmd" to="so3cmd"/>
+      <remap from="~vis"    to="vis"/>
+    </node>
+
+    <node pkg="nodelet" type="nodelet" name="so3_controller"
+          args="load so3_controller/Nodelet manager" output="screen">
+      <rosparam file="$(find uav_simulator)/config/so3_controller.yaml"/>
+      <remap from="~odom"         to="odom"/>
+      <remap from="~imu"          to="imu"/>
+      <remap from="~so3cmd"       to="so3cmd"/>
+      <remap from="~position_cmd" to="position_cmd"/>
+    </node>
+
+    <node pkg="nodelet" type="nodelet" name="mapping"
+          args="load mapping/Nodelet manager" output="screen">
+      <rosparam file="$(find uav_simulator)/config/mockamap.yaml"/>
+      <remap from="~global_map"       to="/global_map"/>
+      <remap from="~gridmap"          to="gridmap"/>
+      <remap from="~gridmap_inflate"  to="gridmap_inflate"/>
+      <param name="resolution"        value="0.15"/>
+      <param name="inflate_size"      value="2"/>
+      <param name="use_global_map"    value="true"/>
+    </node>
+
+    <node pkg="odom_visualization" name="odom_visualization"
+          type="odom_visualization" output="screen">
+      <remap from="~odom" to="odom"/>
+      <param name="robot_scale" value="0.7"/>
+      <param name="color_r" value="1.0"/>
+      <param name="color_g" value="0.0"/>
+      <param name="color_b" value="0.0"/>
+    </node>
+
+    <node pkg="nodelet" type="nodelet" name="planning"
+          args="load planning/Nodelet manager" output="screen">
+      <remap from="~odom"            to="odom"/>
+      <remap from="~gridmap_inflate" to="gridmap_inflate"/>
+      <remap from="~heartbeat"       to="heartbeat"/>
+      <remap from="~trajectory"      to="trajectory"/>
+      <remap from="~replanState"     to="replanState"/>
+      <remap from="~triger"          to="/move_base_simple/goal"/>
+      <param name="plan_hz"          value="20"/>
+      <param name="K"                value="8"/>
+      <param name="vmax"             value="2.5"/>
+      <param name="amax"             value="5"/>
+      <param name="rhoT"             value="100.0"/>
+      <param name="rhoP"             value="1000000.0"/>
+      <param name="rhoV"             value="1000.0"/>
+      <param name="rhoA"             value="1000.0"/>
+      <param name="clearance_d"      value="0.2"/>
+      <param name="tolerance_d"      value="0.5"/>
+      <param name="tracking_dist"    value="3.0"/>
+      <param name="tracking_dur"     value="3.0"/>
+      <param name="tracking_dt"      value="0.2"/>
+      <param name="debug"            value="false"/>
+      <param name="fake"             value="true"/>
+    </node>
+
+    <node pkg="planning" name="traj_server" type="traj_server" output="screen">
+      <remap from="~position_cmd" to="position_cmd"/>
+      <remap from="~trajectory"   to="trajectory"/>
+      <remap from="~heartbeat"    to="heartbeat"/>
+      <param name="time_forward"  value="1.0" type="double"/>
+    </node>
+  </group>
+
+  <!-- ============================================================
+       Tracking swarm：5架无人机，正五边形编队跟踪目标
+
+       初始质心在 (-18, 0)，正五边形边长约2m，顶点偏移（质心为原点）：
+         v0: (+1.7013, +0.0000) -> drone0: (-16.2987, +0.0000)
+         v1: (+0.5257, +1.6180) -> drone1: (-17.4743, +1.6180)
+         v2: (-1.3764, +1.0000) -> drone2: (-19.3764, +1.0000)
+         v3: (-1.3764, -1.0000) -> drone3: (-19.3764, -1.0000)
+         v4: (+0.5257, -1.6180) -> drone4: (-17.4743, -1.6180)
+  ============================================================ -->
+
+  <!-- drone0：前方顶点 -->
+  <group ns="drone0">
+    <include file="$(find mapping)/launch/mapping.launch">
+      <arg name="init_x_" value="-16.2987"/>
+      <arg name="init_y_" value=" 0.0000"/>
+      <arg name="init_z_" value=" 1.50"/>
+    </include>
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+      <remap from="~gridmap"         to="gridmap"/>
+      <remap from="~gridmap_inflate" to="gridmap_inflate"/>
+    </node>
+    <node pkg="odom_visualization" name="odom_visualization"
+          type="odom_visualization" output="screen">
+      <remap from="~odom" to="odom"/>
+      <param name="robot_scale" value="1.0"/>
+      <param name="color_r" value="0.0"/>
+      <param name="color_g" value="0.5"/>
+      <param name="color_b" value="1.0"/>
+    </node>
+    <node name="drone0_target_dpf" pkg="target_ekf"
+          type="target_dpf_sim_node" output="screen">
+      <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
+      <param name="max_obs_depth" value="8.0"/>
+      <param name="pitch_thr" value="37"/>
+      <param name="drone_id" value="0"/>
+      <param name="num_drones" value="5"/>
+      <param name="dpf_rate" value="20"/>
+      <param name="num_particles" value="200"/>
+      <param name="num_components" value="4"/>
+      <param name="num_em_iters" value="10"/>
+      <param name="check_fov" value="true"/>
+      <param name="miss_detection_num" value="5"/>
+      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="hotspot_min_drone_dist" value="2.0"/>
+      <param name="hotspot_seed_radius" value="1.5"/>
+      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
+      <remap from="~yolo"        to="/target/odom"/>
+      <remap from="~odom"        to="odom"/>
+      <remap from="~target_odom" to="target_ekf_odom"/>
+      <remap from="~global_map"  to="/global_map"/>
+    </node>
+    <include file="$(find planning)/launch/planning.launch">
+      <arg name="rhosVisibility_"  value="1000.0"/>
+      <arg name="rhoTracking_"     value="10.0"/>
+      <arg name="target_name_"     value="/drone0/target_ekf_odom"/>
+      <arg name="drone_id"         value="0"/>
+      <arg name="formation_type_"  value="pentagon"/>
+      <arg name="num_drones"       value="5"/>
+    </include>
+  </group>
+
+  <!-- drone1：左上顶点 -->
+  <group ns="drone1">
+    <include file="$(find mapping)/launch/mapping.launch">
+      <arg name="init_x_" value="-17.4743"/>
+      <arg name="init_y_" value=" 1.6180"/>
+      <arg name="init_z_" value=" 1.50"/>
+    </include>
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+      <remap from="~gridmap"         to="gridmap"/>
+      <remap from="~gridmap_inflate" to="gridmap_inflate"/>
+    </node>
+    <node pkg="odom_visualization" name="odom_visualization"
+          type="odom_visualization" output="screen">
+      <remap from="~odom" to="odom"/>
+      <param name="robot_scale" value="1.0"/>
+      <param name="color_r" value="0.0"/>
+      <param name="color_g" value="0.8"/>
+      <param name="color_b" value="0.2"/>
+    </node>
+    <node name="drone1_target_dpf" pkg="target_ekf"
+          type="target_dpf_sim_node" output="screen">
+      <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
+      <param name="max_obs_depth" value="8.0"/>
+      <param name="pitch_thr" value="37"/>
+      <param name="drone_id" value="1"/>
+      <param name="num_drones" value="5"/>
+      <param name="dpf_rate" value="20"/>
+      <param name="num_particles" value="200"/>
+      <param name="num_components" value="4"/>
+      <param name="num_em_iters" value="10"/>
+      <param name="check_fov" value="true"/>
+      <param name="miss_detection_num" value="5"/>
+      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="hotspot_min_drone_dist" value="2.0"/>
+      <param name="hotspot_seed_radius" value="1.5"/>
+      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
+      <remap from="~yolo"        to="/target/odom"/>
+      <remap from="~odom"        to="odom"/>
+      <remap from="~target_odom" to="target_ekf_odom"/>
+      <remap from="~global_map"  to="/global_map"/>
+    </node>
+    <include file="$(find planning)/launch/planning.launch">
+      <arg name="rhosVisibility_"  value="1000.0"/>
+      <arg name="rhoTracking_"     value="10.0"/>
+      <arg name="target_name_"     value="/drone1/target_ekf_odom"/>
+      <arg name="drone_id"         value="1"/>
+      <arg name="formation_type_"  value="pentagon"/>
+      <arg name="num_drones"       value="5"/>
+    </include>
+  </group>
+
+  <!-- drone2：后上顶点 -->
+  <group ns="drone2">
+    <include file="$(find mapping)/launch/mapping.launch">
+      <arg name="init_x_" value="-19.3764"/>
+      <arg name="init_y_" value=" 1.0000"/>
+      <arg name="init_z_" value=" 1.50"/>
+    </include>
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+      <remap from="~gridmap"         to="gridmap"/>
+      <remap from="~gridmap_inflate" to="gridmap_inflate"/>
+    </node>
+    <node pkg="odom_visualization" name="odom_visualization"
+          type="odom_visualization" output="screen">
+      <remap from="~odom" to="odom"/>
+      <param name="robot_scale" value="1.0"/>
+      <param name="color_r" value="1.0"/>
+      <param name="color_g" value="0.6"/>
+      <param name="color_b" value="0.0"/>
+    </node>
+    <node name="drone2_target_dpf" pkg="target_ekf"
+          type="target_dpf_sim_node" output="screen">
+      <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
+      <param name="max_obs_depth" value="8.0"/>
+      <param name="pitch_thr" value="37"/>
+      <param name="drone_id" value="2"/>
+      <param name="num_drones" value="5"/>
+      <param name="dpf_rate" value="20"/>
+      <param name="num_particles" value="200"/>
+      <param name="num_components" value="4"/>
+      <param name="num_em_iters" value="10"/>
+      <param name="check_fov" value="true"/>
+      <param name="miss_detection_num" value="5"/>
+      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="hotspot_min_drone_dist" value="2.0"/>
+      <param name="hotspot_seed_radius" value="1.5"/>
+      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
+      <remap from="~yolo"        to="/target/odom"/>
+      <remap from="~odom"        to="odom"/>
+      <remap from="~target_odom" to="target_ekf_odom"/>
+      <remap from="~global_map"  to="/global_map"/>
+    </node>
+    <include file="$(find planning)/launch/planning.launch">
+      <arg name="rhosVisibility_"  value="1000.0"/>
+      <arg name="rhoTracking_"     value="10.0"/>
+      <arg name="target_name_"     value="/drone2/target_ekf_odom"/>
+      <arg name="drone_id"         value="2"/>
+      <arg name="formation_type_"  value="pentagon"/>
+      <arg name="num_drones"       value="5"/>
+    </include>
+  </group>
+
+  <!-- drone3：后下顶点 -->
+  <group ns="drone3">
+    <include file="$(find mapping)/launch/mapping.launch">
+      <arg name="init_x_" value="-19.3764"/>
+      <arg name="init_y_" value="-1.0000"/>
+      <arg name="init_z_" value=" 1.50"/>
+    </include>
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+      <remap from="~gridmap"         to="gridmap"/>
+      <remap from="~gridmap_inflate" to="gridmap_inflate"/>
+    </node>
+    <node pkg="odom_visualization" name="odom_visualization"
+          type="odom_visualization" output="screen">
+      <remap from="~odom" to="odom"/>
+      <param name="robot_scale" value="1.0"/>
+      <param name="color_r" value="0.8"/>
+      <param name="color_g" value="0.2"/>
+      <param name="color_b" value="0.8"/>
+    </node>
+    <node name="drone3_target_dpf" pkg="target_ekf"
+          type="target_dpf_sim_node" output="screen">
+      <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
+      <param name="max_obs_depth" value="8.0"/>
+      <param name="pitch_thr" value="37"/>
+      <param name="drone_id" value="3"/>
+      <param name="num_drones" value="5"/>
+      <param name="dpf_rate" value="20"/>
+      <param name="num_particles" value="200"/>
+      <param name="num_components" value="4"/>
+      <param name="num_em_iters" value="10"/>
+      <param name="check_fov" value="true"/>
+      <param name="miss_detection_num" value="5"/>
+      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="hotspot_min_drone_dist" value="2.0"/>
+      <param name="hotspot_seed_radius" value="1.5"/>
+      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
+      <remap from="~yolo"        to="/target/odom"/>
+      <remap from="~odom"        to="odom"/>
+      <remap from="~target_odom" to="target_ekf_odom"/>
+      <remap from="~global_map"  to="/global_map"/>
+    </node>
+    <include file="$(find planning)/launch/planning.launch">
+      <arg name="rhosVisibility_"  value="1000.0"/>
+      <arg name="rhoTracking_"     value="10.0"/>
+      <arg name="target_name_"     value="/drone3/target_ekf_odom"/>
+      <arg name="drone_id"         value="3"/>
+      <arg name="formation_type_"  value="pentagon"/>
+      <arg name="num_drones"       value="5"/>
+    </include>
+  </group>
+
+  <!-- drone4：右下顶点 -->
+  <group ns="drone4">
+    <include file="$(find mapping)/launch/mapping.launch">
+      <arg name="init_x_" value="-17.4743"/>
+      <arg name="init_y_" value="-1.6180"/>
+      <arg name="init_z_" value=" 1.50"/>
+    </include>
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+      <remap from="~gridmap"         to="gridmap"/>
+      <remap from="~gridmap_inflate" to="gridmap_inflate"/>
+    </node>
+    <node pkg="odom_visualization" name="odom_visualization"
+          type="odom_visualization" output="screen">
+      <remap from="~odom" to="odom"/>
+      <param name="robot_scale" value="1.0"/>
+      <param name="color_r" value="0.9"/>
+      <param name="color_g" value="0.9"/>
+      <param name="color_b" value="0.1"/>
+    </node>
+    <node name="drone4_target_dpf" pkg="target_ekf"
+          type="target_dpf_sim_node" output="screen">
+      <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
+      <param name="max_obs_depth" value="8.0"/>
+      <param name="pitch_thr" value="37"/>
+      <param name="drone_id" value="4"/>
+      <param name="num_drones" value="5"/>
+      <param name="dpf_rate" value="20"/>
+      <param name="num_particles" value="200"/>
+      <param name="num_components" value="4"/>
+      <param name="num_em_iters" value="10"/>
+      <param name="check_fov" value="true"/>
+      <param name="miss_detection_num" value="5"/>
+      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="hotspot_min_drone_dist" value="2.0"/>
+      <param name="hotspot_seed_radius" value="1.5"/>
+      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
+      <remap from="~yolo"        to="/target/odom"/>
+      <remap from="~odom"        to="odom"/>
+      <remap from="~target_odom" to="target_ekf_odom"/>
+      <remap from="~global_map"  to="/global_map"/>
+    </node>
+    <include file="$(find planning)/launch/planning.launch">
+      <arg name="rhosVisibility_"  value="1000.0"/>
+      <arg name="rhoTracking_"     value="10.0"/>
+      <arg name="target_name_"     value="/drone4/target_ekf_odom"/>
+      <arg name="drone_id"         value="4"/>
+      <arg name="formation_type_"  value="pentagon"/>
+      <arg name="num_drones"       value="5"/>
+    </include>
+  </group>
+
+</launch>

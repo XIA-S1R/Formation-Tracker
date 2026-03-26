@@ -3,7 +3,7 @@
   <arg name="rhosVisibility_"/>
   <arg name="rhoTracking_" default="100000.0"/>
   <arg name="target_name_"/>
-  <!-- Formation args: drone_id (int), formation_type_ ("none"|"hexagon"|"triangle"|"square") -->
+  <!-- Formation args: drone_id (int), formation_type_ ("none"|"hexagon"|"triangle"|"square"|"pentagon") -->
   <arg name="drone_id"        default="0"/>
   <arg name="formation_type_" default="none"/>
   <arg name="num_drones"      default="3"/>
@@ -35,7 +35,7 @@
     <param name="clearance_d"    value="0.5"/><!-- 距离障碍物的安全间隙 -->
     <param name="use_soft_constraint" value="true"/><!-- true: ESDF软约束, false: 走廊硬约束 -->
     <param name="tolerance_d"    value="0.5"/>
-    <param name="tracking_dist"  value="2.0"/><!-- 希望维持的跟踪距离 -->
+    <param name="tracking_dist"  value="3.0"/><!-- 希望维持的跟踪距离 -->
     <param name="tracking_dur"   value="3.0"/><!-- 跟踪规划规划未来3s的轨迹 -->
     <param name="tracking_dt"    value="0.2"/><!-- 采样间隔，用于计算代价 -->
     <param name="obs_clip_enable" value="true"/><!-- 前端路径截断到观测半径内 -->
@@ -52,16 +52,16 @@
     <!-- Swarm / formation parameters -->
     <param name="rhoSwarm"                       value="0.0"/><!-- 集群避撞权重 10000-->
     <param name="optimization/drone_id"          value="$(arg drone_id)" type="int"/>
-    <!-- formation_type: 0 = none, 1 = regular hexagon ring (6 drones), 2 = equilateral triangle (3 drones), 3 = square (4 drones) -->
+    <!-- formation_type: 0 = none, 1 = regular hexagon ring (6 drones), 2 = equilateral triangle (3 drones), 3 = square (4 drones), 4 = regular pentagon (5 drones) -->
     <param name="optimization/formation_type"
-           value="$(eval 1 if arg('formation_type_') == 'hexagon' else (2 if arg('formation_type_') == 'triangle' else (3 if arg('formation_type_') == 'square' else 0)))" type="int"/>
+           value="$(eval 1 if arg('formation_type_') == 'hexagon' else (2 if arg('formation_type_') == 'triangle' else (3 if arg('formation_type_') == 'square' else (4 if arg('formation_type_') == 'pentagon' else 0))))" type="int"/>
     <param name="optimization/use_formation"
            value="$(eval arg('formation_type_') != 'none')" type="bool"/>
     <param name="optimization/use_tracking_cost" value="true" type="bool"/>
     <param name="optimization/weight_formation"  value="$(arg weight_formation_)"/><!-- 编队保持权重 -->
     <param name="optimization/formation_grad_clip" value="$(arg formation_grad_clip_)"/><!-- 编队梯度clip阈值 -->
     <param name="optimization/formation_size"
-           value="$(eval 6 if arg('formation_type_') == 'hexagon' else (3 if arg('formation_type_') == 'triangle' else (4 if arg('formation_type_') == 'square' else 0)))" type="int"/>
+           value="$(eval 6 if arg('formation_type_') == 'hexagon' else (3 if arg('formation_type_') == 'triangle' else (4 if arg('formation_type_') == 'square' else (5 if arg('formation_type_') == 'pentagon' else 0))))" type="int"/>
 
   </node>
 
