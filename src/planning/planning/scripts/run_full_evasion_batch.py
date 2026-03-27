@@ -200,6 +200,8 @@ def build_default_topics(drone_count):
     for i in range(drone_count):
         topics.append(f'/drone{i}/odom')
     for i in range(drone_count):
+        topics.append(f'/drone{i}/drone{i}_target_dpf/local_stats')
+    for i in range(drone_count):
         topics.append(f'/drone{i}/drone{i}_target_dpf/search_state')
     for i in range(drone_count):
         topics.append(f'/drone{i}/replanState')

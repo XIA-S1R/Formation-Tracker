@@ -7,6 +7,7 @@ import json
 import math
 import os
 import statistics
+import sys
 from collections import defaultdict
 
 import rosbag
@@ -96,6 +97,226 @@ def parse_drone_id_from_topic(topic):
     return None
 
 
+def integrate_single_drone_visibility_from_search(events, t_max):
+    """
+    events: [(ts, search_state_bool), ...]
+    visible := not search_state
+    until_first_loss means:
+      from first valid timestamp to the end of first loss episode
+      (if never recovered from first loss, use t_max).
+    """
+    if not events:
+        return {
+            'visibility_rate_full': 0.0,
+            'visibility_rate_until_first_loss': 0.0,
+            'first_loss_time_sec': None,
+            'valid_duration_full_sec': 0.0,
+            'valid_duration_until_first_loss_sec': 0.0,
+        }
+
+    events = sorted(events, key=lambda x: x[0])
+    start_t = events[0][0]
+    last_t = start_t
+    prev_search = bool(events[0][1])
+    first_loss_start_t = start_t if prev_search else None
+
+    visible_full = 0.0
+    visible_until_first_loss = 0.0
+    first_loss_end_t = None
+    until_window_end_t = None
+
+    for ts, cur_search in events[1:]:
+        if ts < last_t:
+            continue
+        dt = ts - last_t
+        if not prev_search:
+            visible_full += dt
+        # integrate until-first-loss window:
+        # from start to first loss end (or t_max if unresolved).
+        if until_window_end_t is None and first_loss_start_t is None and (not prev_search):
+            visible_until_first_loss += dt
+
+        if first_loss_start_t is None and (not prev_search) and bool(cur_search):
+            first_loss_start_t = ts
+        elif first_loss_start_t is not None and first_loss_end_t is None and prev_search and (not bool(cur_search)):
+            first_loss_end_t = ts
+            until_window_end_t = ts
+
+        prev_search = bool(cur_search)
+        last_t = ts
+
+    if t_max >= last_t:
+        dt = t_max - last_t
+        if not prev_search:
+            visible_full += dt
+        if until_window_end_t is None and first_loss_start_t is None and (not prev_search):
+            visible_until_first_loss += dt
+
+    if until_window_end_t is None:
+        # no loss or unresolved first loss both end at t_max
+        until_window_end_t = t_max
+
+    full_dur = max(0.0, t_max - start_t)
+    until_loss_dur = max(0.0, until_window_end_t - start_t)
+
+    # first_loss_time_sec keeps existing meaning: first loss start timestamp
+    return {
+        'visibility_rate_full': (visible_full / full_dur) if full_dur > 1e-6 else 0.0,
+        'visibility_rate_until_first_loss': (
+            (visible_until_first_loss / until_loss_dur) if until_loss_dur > 1e-6 else 0.0
+        ),
+        'first_loss_time_sec': first_loss_start_t,
+        'first_loss_end_time_sec': first_loss_end_t,
+        'valid_duration_full_sec': full_dur,
+        'valid_duration_until_first_loss_sec': until_loss_dur,
+    }
+
+
+def integrate_single_drone_tracking_visibility(search_events, obs_events, t_max):
+    """
+    Integrate per-drone visibility while the drone is in tracking mode.
+    tracking mode: search_state == False
+    visibility: has_observation from local_stats; if unavailable, fallback to search_state-derived visibility.
+    """
+    if not search_events:
+        return {
+            'visibility_rate_tracking': 0.0,
+            'tracking_duration_sec': 0.0,
+            'valid_duration_sec': 0.0,
+            'visible_duration_sec': 0.0,
+            'source': 'none',
+        }
+
+    use_obs = bool(obs_events)
+    events = [(ts, 'search', bool(st)) for ts, st in search_events]
+    if use_obs:
+        events.extend((ts, 'obs', bool(st)) for ts, st in obs_events)
+    events.sort(key=lambda x: (x[0], 0 if x[1] == 'search' else 1))
+
+    search_state = None
+    obs_state = None
+    last_t = None
+
+    tracking_duration_sec = 0.0
+    valid_duration_sec = 0.0
+    visible_duration_sec = 0.0
+
+    for ts, kind, st in events:
+        if last_t is not None and ts >= last_t:
+            dt = ts - last_t
+            if search_state is not None and (not search_state):
+                tracking_duration_sec += dt
+                if use_obs:
+                    if obs_state is not None:
+                        valid_duration_sec += dt
+                        if obs_state:
+                            visible_duration_sec += dt
+                else:
+                    valid_duration_sec += dt
+                    visible_duration_sec += dt
+
+        if kind == 'search':
+            search_state = st
+        else:
+            obs_state = st
+        last_t = ts
+
+    if last_t is not None and t_max >= last_t:
+        dt = t_max - last_t
+        if search_state is not None and (not search_state):
+            tracking_duration_sec += dt
+            if use_obs:
+                if obs_state is not None:
+                    valid_duration_sec += dt
+                    if obs_state:
+                        visible_duration_sec += dt
+            else:
+                valid_duration_sec += dt
+                visible_duration_sec += dt
+
+    return {
+        'visibility_rate_tracking': (visible_duration_sec / valid_duration_sec) if valid_duration_sec > 1e-6 else 0.0,
+        'tracking_duration_sec': tracking_duration_sec,
+        'valid_duration_sec': valid_duration_sec,
+        'visible_duration_sec': visible_duration_sec,
+        'source': 'local_stats' if use_obs else 'search_state_fallback',
+    }
+
+
+def integrate_single_drone_visibility_over_total(search_events, obs_events, t_start, t_end):
+    """
+    Integrate per-drone visibility over full experiment duration:
+      visibility_rate_total = visible_duration / (t_end - t_start)
+    visible is from local_stats.has_observation when available,
+    otherwise fallback to (not search_state).
+    """
+    total_dur = max(0.0, float(t_end) - float(t_start))
+    if total_dur <= 1e-9:
+        return {
+            'visibility_rate_total': 0.0,
+            'visible_duration_sec': 0.0,
+            'total_duration_sec': total_dur,
+            'source': 'none',
+        }
+
+    use_obs = bool(obs_events)
+    if use_obs:
+        events = sorted((float(ts), bool(st)) for ts, st in obs_events)
+        visible_when_true = True
+        source = 'local_stats'
+    else:
+        events = sorted((float(ts), bool(st)) for ts, st in search_events)
+        visible_when_true = False  # search_state=False means visible
+        source = 'search_state_fallback'
+
+    if not events:
+        return {
+            'visibility_rate_total': 0.0,
+            'visible_duration_sec': 0.0,
+            'total_duration_sec': total_dur,
+            'source': source,
+        }
+
+    # Seed with latest state at or before t_start.
+    state = None
+    idx_start = 0
+    for i, (ts, st) in enumerate(events):
+        if ts <= t_start:
+            state = st
+            idx_start = i + 1
+        else:
+            break
+
+    visible_dur = 0.0
+    last_t = float(t_start)
+
+    for ts, st in events[idx_start:]:
+        if ts < t_start:
+            continue
+        if ts > t_end:
+            break
+        dt = ts - last_t
+        if dt > 0.0 and state is not None:
+            visible = (state if visible_when_true else (not state))
+            if visible:
+                visible_dur += dt
+        state = st
+        last_t = ts
+
+    if t_end > last_t and state is not None:
+        dt = t_end - last_t
+        visible = (state if visible_when_true else (not state))
+        if visible:
+            visible_dur += dt
+
+    return {
+        'visibility_rate_total': (visible_dur / total_dur) if total_dur > 1e-9 else 0.0,
+        'visible_duration_sec': visible_dur,
+        'total_duration_sec': total_dur,
+        'source': source,
+    }
+
+
 def analyze_bag(
     bag_path,
     formation_side_length=2.0,
@@ -104,6 +325,9 @@ def analyze_bag(
     obstacle_collision_distance=0.0,
     obstacle_collision_release_distance=0.0,
     reacq_timeout_sec=10.0,
+    hovering_fail_duration_sec=5.0,
+    dyn_vmax_limit=3.0,
+    dyn_amax_limit=6.0,
 ):
     collision_distance = max(0.0, float(collision_distance))
     collision_release_distance = max(collision_distance, float(collision_release_distance))
@@ -111,18 +335,25 @@ def analyze_bag(
     obstacle_collision_release_distance = max(
         obstacle_collision_distance, float(obstacle_collision_release_distance)
     )
+    hovering_fail_duration_sec = max(0.0, float(hovering_fail_duration_sec))
 
     drone_positions = {}  # drone_id -> (x,y,z)
     drone_speeds = defaultdict(list)
     drone_speeds_tracking = defaultdict(list)
     drone_speeds_search = defaultdict(list)
     drone_last_replan_state = {}
+    drone_last_replan_ts = {}
     replan_failed_hovering_count = 0
+    replan_hovering_total_duration_by_drone = defaultdict(float)
+    replan_hovering_max_continuous_by_drone = defaultdict(float)
+    hovering_episode_start_by_drone = {}
     emergency_stop_count = 0
 
     # search_state timeline
     search_state_now = {}
     search_state_events = []  # (t, drone_id, state)
+    obs_state_now = {}
+    obs_state_events = []  # (t, drone_id, has_observation)
 
     # odom-driven evaluation timeline
     eval_times = []
@@ -132,6 +363,12 @@ def analyze_bag(
     min_pair_dist_samples = []
     inter_drone_collision_count = 0
     inter_drone_collision_active = False
+    # dynamics legality
+    last_odom_state = {}  # drone_id -> (ts, vx, vy, vz, speed)
+    dyn_total_dur_by_drone = defaultdict(float)
+    dyn_speed_over_dur_by_drone = defaultdict(float)
+    dyn_acc_over_dur_by_drone = defaultdict(float)
+    dyn_any_over_dur_by_drone = defaultdict(float)
 
     # obstacle collision from /global_map
     obstacle_map_points_count = 0
@@ -175,6 +412,26 @@ def analyze_bag(
                 speed = vec_norm3(v.x, v.y, v.z)
                 drone_positions[drone_id] = (p.x, p.y, p.z)
                 drone_speeds[drone_id].append(speed)
+
+                # dynamics legality from odom (time weighted)
+                prev = last_odom_state.get(drone_id, None)
+                if prev is not None:
+                    ts_prev, vx_prev, vy_prev, vz_prev, speed_prev = prev
+                    dt = ts - ts_prev
+                    if 1e-4 < dt < 1.0:
+                        acc = vec_norm3((v.x - vx_prev) / dt, (v.y - vy_prev) / dt, (v.z - vz_prev) / dt)
+                        speed_eval = max(speed, speed_prev)
+                        speed_over = speed_eval > dyn_vmax_limit
+                        acc_over = acc > dyn_amax_limit
+                        any_over = speed_over or acc_over
+                        dyn_total_dur_by_drone[drone_id] += dt
+                        if speed_over:
+                            dyn_speed_over_dur_by_drone[drone_id] += dt
+                        if acc_over:
+                            dyn_acc_over_dur_by_drone[drone_id] += dt
+                        if any_over:
+                            dyn_any_over_dur_by_drone[drone_id] += dt
+                last_odom_state[drone_id] = (ts, v.x, v.y, v.z, speed)
                 # 速度按本机模式拆分
                 if drone_id in search_state_now:
                     if search_state_now[drone_id]:
@@ -245,6 +502,18 @@ def analyze_bag(
                 search_state_events.append((ts, drone_id, state))
                 continue
 
+            # local_stats: /droneX/droneX_target_dpf/local_stats
+            if topic.endswith('/local_stats') and topic.startswith('/drone'):
+                drone_id = parse_drone_id_from_topic(topic)
+                if drone_id is None:
+                    continue
+                has_obs = bool(getattr(msg, 'has_observation', False))
+                prev_obs = obs_state_now.get(drone_id, None)
+                if prev_obs is None or prev_obs != has_obs:
+                    obs_state_now[drone_id] = has_obs
+                    obs_state_events.append((ts, drone_id, has_obs))
+                continue
+
             # replanState: /droneX/replanState or /droneX/planning/replanState
             if topic.endswith('/replanState') and topic.startswith('/drone'):
                 drone_id = parse_drone_id_from_topic(topic)
@@ -252,15 +521,43 @@ def analyze_bag(
                     continue
                 st = int(msg.state)
                 prev = drone_last_replan_state.get(drone_id, None)
+                prev_ts = drone_last_replan_ts.get(drone_id, None)
+
+                # integrate previous state duration
+                if prev == 1 and prev_ts is not None and ts >= prev_ts:
+                    replan_hovering_total_duration_by_drone[drone_id] += (ts - prev_ts)
+
                 if st == 1 and prev != 1:
                     replan_failed_hovering_count += 1
+                    hovering_episode_start_by_drone[drone_id] = ts
+                elif prev == 1 and st != 1:
+                    start_t = hovering_episode_start_by_drone.pop(drone_id, None)
+                    if start_t is not None and ts >= start_t:
+                        dur = ts - start_t
+                        if dur > replan_hovering_max_continuous_by_drone[drone_id]:
+                            replan_hovering_max_continuous_by_drone[drone_id] = dur
+
                 if st == 2 and prev != 2:
                     emergency_stop_count += 1
                 drone_last_replan_state[drone_id] = st
+                drone_last_replan_ts[drone_id] = ts
                 continue
 
     if t_min is None or t_max is None:
         raise RuntimeError('bag is empty: {}'.format(bag_path))
+
+    # close replan hovering episodes at bag end
+    for drone_id, st in drone_last_replan_state.items():
+        if st != 1:
+            continue
+        prev_ts = drone_last_replan_ts.get(drone_id, None)
+        if prev_ts is not None and t_max >= prev_ts:
+            replan_hovering_total_duration_by_drone[drone_id] += (t_max - prev_ts)
+        start_t = hovering_episode_start_by_drone.get(drone_id, None)
+        if start_t is not None and t_max >= start_t:
+            dur = t_max - start_t
+            if dur > replan_hovering_max_continuous_by_drone[drone_id]:
+                replan_hovering_max_continuous_by_drone[drone_id] = dur
 
     duration = max(0.0, t_max - t_min)
 
@@ -347,6 +644,67 @@ def analyze_bag(
 
         visibility_rate = (visible_duration / valid_duration) if valid_duration > 1e-6 else 0.0
 
+    # single-drone visibility
+    search_events_by_drone = defaultdict(list)
+    for ts, drone_id, st in search_state_events:
+        search_events_by_drone[drone_id].append((ts, bool(st)))
+    obs_events_by_drone = defaultdict(list)
+    for ts, drone_id, st in obs_state_events:
+        obs_events_by_drone[drone_id].append((ts, bool(st)))
+
+    single_vis_rate_by_drone = {}
+    single_vis_source_by_drone = {}
+    single_vis_tracking_rate_by_drone = {}
+    single_vis_tracking_source_by_drone = {}
+    single_vis_tracking_valid_duration_by_drone = {}
+    single_tracking_mode_duration_by_drone = {}
+    for drone_id in sorted(drone_speeds.keys()):
+        search_ev = search_events_by_drone.get(drone_id, [])
+        obs_ev = obs_events_by_drone.get(drone_id, [])
+        if (not search_ev) and (not obs_ev):
+            continue
+        s_total = integrate_single_drone_visibility_over_total(
+            search_ev,
+            obs_ev,
+            t_min,
+            t_max,
+        )
+        if search_ev:
+            t = integrate_single_drone_tracking_visibility(search_ev, obs_ev, t_max)
+        else:
+            t = {
+                'visibility_rate_tracking': 0.0,
+                'tracking_duration_sec': 0.0,
+                'valid_duration_sec': 0.0,
+                'visible_duration_sec': 0.0,
+                'source': 'none',
+            }
+        single_vis_rate_by_drone[str(drone_id)] = float(s_total['visibility_rate_total'])
+        single_vis_source_by_drone[str(drone_id)] = s_total['source']
+        single_vis_tracking_rate_by_drone[str(drone_id)] = float(t['visibility_rate_tracking'])
+        single_vis_tracking_source_by_drone[str(drone_id)] = t['source']
+        single_vis_tracking_valid_duration_by_drone[str(drone_id)] = float(t['valid_duration_sec'])
+        single_tracking_mode_duration_by_drone[str(drone_id)] = float(t['tracking_duration_sec'])
+
+    single_vis_rates = list(single_vis_rate_by_drone.values())
+    single_vis_tracking_rates = list(single_vis_tracking_rate_by_drone.values())
+
+    # dynamics legality summary
+    dyn_total_duration_sec = float(sum(dyn_total_dur_by_drone.values()))
+    dyn_speed_over_sec = float(sum(dyn_speed_over_dur_by_drone.values()))
+    dyn_acc_over_sec = float(sum(dyn_acc_over_dur_by_drone.values()))
+    dyn_any_over_sec = float(sum(dyn_any_over_dur_by_drone.values()))
+    dyn_speed_over_ratio = (dyn_speed_over_sec / dyn_total_duration_sec) if dyn_total_duration_sec > 1e-6 else 0.0
+    dyn_acc_over_ratio = (dyn_acc_over_sec / dyn_total_duration_sec) if dyn_total_duration_sec > 1e-6 else 0.0
+    dyn_any_over_ratio = (dyn_any_over_sec / dyn_total_duration_sec) if dyn_total_duration_sec > 1e-6 else 0.0
+    dyn_legal_ratio = 1.0 - dyn_any_over_ratio if dyn_total_duration_sec > 1e-6 else 0.0
+    dyn_any_over_ratio_by_drone = {}
+    for drone_id, total_dur in dyn_total_dur_by_drone.items():
+        if total_dur > 1e-6:
+            dyn_any_over_ratio_by_drone[str(drone_id)] = float(dyn_any_over_dur_by_drone[drone_id] / total_dur)
+        else:
+            dyn_any_over_ratio_by_drone[str(drone_id)] = 0.0
+
     # speed stats
     speed_metrics = {}
     speed_metrics_tracking = {}
@@ -381,13 +739,66 @@ def analyze_bag(
     target_loss_total_duration_sec = float(sum(target_loss_durations_sec))
     target_loss_max_duration_sec = float(max(target_loss_durations_sec)) if target_loss_durations_sec else 0.0
     collision_count = inter_drone_collision_count + obstacle_collision_count
-    task_success = (collision_count == 0 and target_loss_max_duration_sec <= float(reacq_timeout_sec))
+    replan_hovering_total_duration_by_drone_out = {
+        str(k): float(v) for k, v in replan_hovering_total_duration_by_drone.items()
+    }
+    replan_hovering_max_continuous_by_drone_out = {
+        str(k): float(v) for k, v in replan_hovering_max_continuous_by_drone.items()
+    }
+    replan_hovering_max_continuous_sec = (
+        float(max(replan_hovering_max_continuous_by_drone.values()))
+        if replan_hovering_max_continuous_by_drone else 0.0
+    )
+    long_hovering_drones = []
+    if hovering_fail_duration_sec > 1e-6:
+        for drone_id, dur in replan_hovering_max_continuous_by_drone.items():
+            if dur >= hovering_fail_duration_sec:
+                long_hovering_drones.append(int(drone_id))
+    long_hovering_drones = sorted(long_hovering_drones)
+
+    task_failure_reasons = []
+    if collision_count > 0:
+        task_failure_reasons.append(
+            'collision_count={} (inter_drone={}, obstacle={})'.format(
+                collision_count, inter_drone_collision_count, obstacle_collision_count
+            )
+        )
+    if target_loss_max_duration_sec > float(reacq_timeout_sec):
+        task_failure_reasons.append(
+            'target_loss_max_duration_sec={:.3f} > reacq_timeout_sec={:.3f}'.format(
+                target_loss_max_duration_sec, float(reacq_timeout_sec)
+            )
+        )
+    if long_hovering_drones:
+        drone_parts = [
+            'drone{}:{:.3f}s'.format(did, replan_hovering_max_continuous_by_drone.get(did, 0.0))
+            for did in long_hovering_drones
+        ]
+        task_failure_reasons.append(
+            'replan_failed_hovering_max_continuous >= {:.3f}s ({})'.format(
+                hovering_fail_duration_sec, ', '.join(drone_parts)
+            )
+        )
+
+    task_success = (len(task_failure_reasons) == 0)
 
     result = {
         'bag_path': bag_path,
         'duration_sec': duration,
         'num_drones_observed': len(drone_speeds),
         'visibility_rate': visibility_rate,
+        'single_drone_visibility_rate_by_drone': single_vis_rate_by_drone,
+        'single_drone_visibility_source_by_drone': single_vis_source_by_drone,
+        'single_drone_visibility_rate_mean': mean_or_zero(single_vis_rates),
+        'single_drone_visibility_rate_min': min(single_vis_rates) if single_vis_rates else 0.0,
+        'single_drone_visibility_rate_tracking_by_drone': single_vis_tracking_rate_by_drone,
+        'single_drone_visibility_tracking_source_by_drone': single_vis_tracking_source_by_drone,
+        'single_drone_visibility_tracking_valid_duration_sec_by_drone': single_vis_tracking_valid_duration_by_drone,
+        'single_drone_tracking_mode_duration_sec_by_drone': single_tracking_mode_duration_by_drone,
+        'single_drone_visibility_rate_tracking_mean': mean_or_zero(single_vis_tracking_rates),
+        'single_drone_visibility_rate_tracking_min': (
+            min(single_vis_tracking_rates) if single_vis_tracking_rates else 0.0
+        ),
         'view_loss_count': view_loss_count,
         'target_loss_durations_sec': target_loss_durations_sec,
         'target_loss_total_duration_sec': target_loss_total_duration_sec,
@@ -398,6 +809,8 @@ def analyze_bag(
         'reacq_time_max_sec': max(reacq_time_list) if reacq_time_list else 0.0,
         'reacq_failure_count': reacq_failure_count,
         'task_success': task_success,
+        'task_failure_reasons': task_failure_reasons,
+        'task_failure_reason': '; '.join(task_failure_reasons),
         'task_success_loss_timeout_sec': float(reacq_timeout_sec),
         'formation_error_mean': mean_or_zero(formation_err_samples),
         'formation_error_p95': percentile(formation_err_samples, 0.95),
@@ -415,7 +828,21 @@ def analyze_bag(
         'obstacle_map_available': bool(obstacle_map_points_count > 0),
         'obstacle_map_points_count': int(obstacle_map_points_count),
         'min_obstacle_clearance': min(min_obstacle_dist_samples) if min_obstacle_dist_samples else 0.0,
+        'dynamics_vmax_limit': float(dyn_vmax_limit),
+        'dynamics_amax_limit': float(dyn_amax_limit),
+        'dynamics_total_duration_sec': dyn_total_duration_sec,
+        'dynamics_speed_overlimit_ratio': dyn_speed_over_ratio,
+        'dynamics_acc_overlimit_ratio': dyn_acc_over_ratio,
+        'dynamics_overlimit_ratio': dyn_any_over_ratio,
+        'dynamics_legal_ratio': dyn_legal_ratio,
+        'dynamics_overlimit_ratio_by_drone': dyn_any_over_ratio_by_drone,
         'replan_failed_hovering_count': replan_failed_hovering_count,
+        'replan_failed_hovering_duration_by_drone': replan_hovering_total_duration_by_drone_out,
+        'replan_failed_hovering_max_continuous_sec_by_drone': replan_hovering_max_continuous_by_drone_out,
+        'replan_failed_hovering_max_continuous_sec': replan_hovering_max_continuous_sec,
+        'hovering_fail_duration_sec': float(hovering_fail_duration_sec),
+        'replan_failed_hovering_long_stuck_drones': long_hovering_drones,
+        'replan_failed_hovering_long_stuck_detected': bool(len(long_hovering_drones) > 0),
         'emergency_stop_count': emergency_stop_count,
         'speed_mean_all': mean_or_zero(all_speed_samples),
         'speed_p95_all': percentile(all_speed_samples, 0.95),
@@ -442,6 +869,10 @@ def write_summary_csv(rows, out_csv):
         'duration_sec',
         'num_drones_observed',
         'visibility_rate',
+        'single_drone_visibility_rate_mean',
+        'single_drone_visibility_rate_min',
+        'single_drone_visibility_rate_tracking_mean',
+        'single_drone_visibility_rate_tracking_min',
         'view_loss_count',
         'target_loss_total_duration_sec',
         'target_loss_max_duration_sec',
@@ -451,6 +882,7 @@ def write_summary_csv(rows, out_csv):
         'reacq_time_max_sec',
         'reacq_failure_count',
         'task_success',
+        'task_failure_reason',
         'formation_error_mean',
         'formation_error_p95',
         'formation_error_max',
@@ -467,7 +899,13 @@ def write_summary_csv(rows, out_csv):
         'obstacle_map_available',
         'obstacle_map_points_count',
         'min_obstacle_clearance',
+        'dynamics_overlimit_ratio',
+        'dynamics_speed_overlimit_ratio',
+        'dynamics_acc_overlimit_ratio',
+        'dynamics_legal_ratio',
         'replan_failed_hovering_count',
+        'replan_failed_hovering_max_continuous_sec',
+        'replan_failed_hovering_long_stuck_detected',
         'emergency_stop_count',
         'speed_mean_all',
         'speed_p95_all',
@@ -496,6 +934,12 @@ def main():
     parser.add_argument('--obstacle-collision-distance', type=float, default=0.0)
     parser.add_argument('--obstacle-collision-release-distance', type=float, default=0.0)
     parser.add_argument('--reacq-timeout-sec', type=float, default=10.0)
+    parser.add_argument('--hovering-fail-duration-sec', type=float, default=5.0,
+                        help='Fail task if any drone stays in replan failed hovering continuously beyond this time.')
+    parser.add_argument('--dyn-vmax-limit', type=float, default=3.0,
+                        help='Speed limit used by trajectory dynamics legality analysis.')
+    parser.add_argument('--dyn-amax-limit', type=float, default=6.0,
+                        help='Acceleration limit used by trajectory dynamics legality analysis.')
     parser.add_argument('--out-json', default='', help='Output JSON file path')
     parser.add_argument('--out-csv', default='', help='Output CSV file path')
     args = parser.parse_args()
@@ -510,8 +954,13 @@ def main():
             obstacle_collision_distance=args.obstacle_collision_distance,
             obstacle_collision_release_distance=args.obstacle_collision_release_distance,
             reacq_timeout_sec=args.reacq_timeout_sec,
+            hovering_fail_duration_sec=args.hovering_fail_duration_sec,
+            dyn_vmax_limit=args.dyn_vmax_limit,
+            dyn_amax_limit=args.dyn_amax_limit,
         )
         result['run_id'] = i
+        if not result.get('task_success', True):
+            print('[run {}] task failed: {}'.format(i, result.get('task_failure_reason', 'unknown')), file=sys.stderr)
         rows.append(result)
 
     if args.out_json:

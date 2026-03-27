@@ -7,6 +7,8 @@
   <arg name="drone_id"        default="0"/>
   <arg name="formation_type_" default="none"/>
   <arg name="num_drones"      default="3"/>
+  <arg name="plan_hz_" default="20"/>
+  <arg name="hard_replan_hz_" default="5"/>
   <arg name="weight_formation_" default="10000.0"/><!-- 100000.0-->
   <arg name="formation_grad_clip_" default="15.0"/><!-- 编队梯度限幅阈值，<=0 表示关闭 -->
 
@@ -20,8 +22,8 @@
     <remap from="~triger" to="/triger"/> <!-- 在追踪者的规划上，triger只作为启动开关，不决定目标位置 -->
     <remap from="~land_triger" to="/land_triger"/>
 
-    <param name="plan_hz"        value="40"/>
-    <param name="hard_replan_hz" value="10"/>
+    <param name="plan_hz"        value="$(arg plan_hz_)"/>
+    <param name="hard_replan_hz" value="$(arg hard_replan_hz_)"/>
     <param name="K"              value="8"/>
     <param name="vmax"           value="3.0"/>
     <param name="amax"           value="6.0"/>

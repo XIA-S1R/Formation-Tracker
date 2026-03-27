@@ -1,5 +1,13 @@
 <launch>
 <env name="ROSCONSOLE_CONFIG_FILE" value="$(find planning)/config/rosconsole.conf"/>
+  <arg name="enable_swarm_vis" default="false"/>
+  <arg name="mapping_worker_threads" default="4"/>
+  <arg name="target_worker_threads" default="4"/>
+  <arg name="dpf_rate" default="15"/>
+  <arg name="consensus_rate" default="30"/>
+  <arg name="num_particles" default="120"/>
+  <arg name="plan_hz" default="20"/>
+  <arg name="hard_replan_hz" default="5"/>
   <!-- ============================================================
        Map generator
   ============================================================ -->
@@ -20,7 +28,7 @@
   ============================================================ -->
   <group ns="target">
     <node pkg="nodelet" type="nodelet" name="manager" args="manager" output="screen">
-      <param name="num_worker_threads" value="16"/>
+      <param name="num_worker_threads" value="$(arg target_worker_threads)"/>
     </node>
 
     <node pkg="nodelet" type="nodelet" name="so3_quadrotor"
@@ -55,7 +63,7 @@
       <param name="use_global_map"    value="true"/>
     </node>
 
-    <node pkg="odom_visualization" name="odom_visualization"
+    <node pkg="odom_visualization" name="odom_visualization" if="$(arg enable_swarm_vis)"
           type="odom_visualization" output="screen">
       <remap from="~odom" to="odom"/>
       <param name="robot_scale" value="0.7"/>
@@ -117,15 +125,16 @@
   <!-- drone0 -->
   <group ns="drone0">
     <include file="$(find mapping)/launch/mapping.launch">
+      <arg name="num_worker_threads_" value="$(arg mapping_worker_threads)"/>
       <arg name="init_x_" value="-16.2679"/>
       <arg name="init_y_" value="-1.0000"/>
       <arg name="init_z_" value=" 1.50"/>
     </include>
-    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node" if="$(arg enable_swarm_vis)">
       <remap from="~gridmap"         to="gridmap"/>
       <remap from="~gridmap_inflate" to="gridmap_inflate"/>
     </node>
-    <node pkg="odom_visualization" name="odom_visualization"
+    <node pkg="odom_visualization" name="odom_visualization" if="$(arg enable_swarm_vis)"
           type="odom_visualization" output="screen">
       <remap from="~odom" to="odom"/>
       <param name="robot_scale" value="1.0"/>
@@ -140,8 +149,9 @@
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="0"/>
       <param name="num_drones" value="6"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="200"/>
+      <param name="dpf_rate" value="$(arg dpf_rate)"/>
+      <param name="consensus_rate" value="$(arg consensus_rate)"/>
+      <param name="num_particles" value="$(arg num_particles)"/>
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
@@ -156,6 +166,8 @@
       <remap from="~global_map"  to="/global_map"/>
     </node>
     <include file="$(find planning)/launch/planning.launch">
+      <arg name="plan_hz_" value="$(arg plan_hz)"/>
+      <arg name="hard_replan_hz_" value="$(arg hard_replan_hz)"/>
       <arg name="rhosVisibility_"  value="1000.0"/>
       <arg name="target_name_"     value="/drone0/target_ekf_odom"/>
       <arg name="drone_id"         value="0"/>
@@ -167,15 +179,16 @@
   <!-- drone1 -->
   <group ns="drone1">
     <include file="$(find mapping)/launch/mapping.launch">
+      <arg name="num_worker_threads_" value="$(arg mapping_worker_threads)"/>
       <arg name="init_x_" value="-18.0000"/>
       <arg name="init_y_" value="-2.0000"/>
       <arg name="init_z_" value=" 1.50"/>
     </include>
-    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node" if="$(arg enable_swarm_vis)">
       <remap from="~gridmap"         to="gridmap"/>
       <remap from="~gridmap_inflate" to="gridmap_inflate"/>
     </node>
-    <node pkg="odom_visualization" name="odom_visualization"
+    <node pkg="odom_visualization" name="odom_visualization" if="$(arg enable_swarm_vis)"
           type="odom_visualization" output="screen">
       <remap from="~odom" to="odom"/>
       <param name="robot_scale" value="1.0"/>
@@ -190,8 +203,9 @@
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="1"/>
       <param name="num_drones" value="6"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="200"/>
+      <param name="dpf_rate" value="$(arg dpf_rate)"/>
+      <param name="consensus_rate" value="$(arg consensus_rate)"/>
+      <param name="num_particles" value="$(arg num_particles)"/>
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
@@ -206,6 +220,8 @@
       <remap from="~global_map"  to="/global_map"/>
     </node>
     <include file="$(find planning)/launch/planning.launch">
+      <arg name="plan_hz_" value="$(arg plan_hz)"/>
+      <arg name="hard_replan_hz_" value="$(arg hard_replan_hz)"/>
       <arg name="rhosVisibility_"  value="1000.0"/>
       <arg name="target_name_"     value="/drone0/target_ekf_odom"/>
       <arg name="drone_id"         value="1"/>
@@ -217,15 +233,16 @@
   <!-- drone2 -->
   <group ns="drone2">
     <include file="$(find mapping)/launch/mapping.launch">
+      <arg name="num_worker_threads_" value="$(arg mapping_worker_threads)"/>
       <arg name="init_x_" value="-19.7321"/>
       <arg name="init_y_" value="-1.0000"/>
       <arg name="init_z_" value=" 1.50"/>
     </include>
-    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node" if="$(arg enable_swarm_vis)">
       <remap from="~gridmap"         to="gridmap"/>
       <remap from="~gridmap_inflate" to="gridmap_inflate"/>
     </node>
-    <node pkg="odom_visualization" name="odom_visualization"
+    <node pkg="odom_visualization" name="odom_visualization" if="$(arg enable_swarm_vis)"
           type="odom_visualization" output="screen">
       <remap from="~odom" to="odom"/>
       <param name="robot_scale" value="1.0"/>
@@ -240,8 +257,9 @@
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="2"/>
       <param name="num_drones" value="6"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="200"/>
+      <param name="dpf_rate" value="$(arg dpf_rate)"/>
+      <param name="consensus_rate" value="$(arg consensus_rate)"/>
+      <param name="num_particles" value="$(arg num_particles)"/>
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
@@ -256,6 +274,8 @@
       <remap from="~global_map"  to="/global_map"/>
     </node>
     <include file="$(find planning)/launch/planning.launch">
+      <arg name="plan_hz_" value="$(arg plan_hz)"/>
+      <arg name="hard_replan_hz_" value="$(arg hard_replan_hz)"/>
       <arg name="rhosVisibility_"  value="1000.0"/>
       <arg name="target_name_"     value="/drone0/target_ekf_odom"/>
       <arg name="drone_id"         value="2"/>
@@ -267,15 +287,16 @@
   <!-- drone3 -->
   <group ns="drone3">
     <include file="$(find mapping)/launch/mapping.launch">
+      <arg name="num_worker_threads_" value="$(arg mapping_worker_threads)"/>
       <arg name="init_x_" value="-19.7321"/>
       <arg name="init_y_" value=" 1.0000"/>
       <arg name="init_z_" value=" 1.50"/>
     </include>
-    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node" if="$(arg enable_swarm_vis)">
       <remap from="~gridmap"         to="gridmap"/>
       <remap from="~gridmap_inflate" to="gridmap_inflate"/>
     </node>
-    <node pkg="odom_visualization" name="odom_visualization"
+    <node pkg="odom_visualization" name="odom_visualization" if="$(arg enable_swarm_vis)"
           type="odom_visualization" output="screen">
       <remap from="~odom" to="odom"/>
       <param name="robot_scale" value="1.0"/>
@@ -290,8 +311,9 @@
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="3"/>
       <param name="num_drones" value="6"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="200"/>
+      <param name="dpf_rate" value="$(arg dpf_rate)"/>
+      <param name="consensus_rate" value="$(arg consensus_rate)"/>
+      <param name="num_particles" value="$(arg num_particles)"/>
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
@@ -306,6 +328,8 @@
       <remap from="~global_map"  to="/global_map"/>
     </node>
     <include file="$(find planning)/launch/planning.launch">
+      <arg name="plan_hz_" value="$(arg plan_hz)"/>
+      <arg name="hard_replan_hz_" value="$(arg hard_replan_hz)"/>
       <arg name="rhosVisibility_"  value="1000.0"/>
       <arg name="target_name_"     value="/drone0/target_ekf_odom"/>
       <arg name="drone_id"         value="3"/>
@@ -317,15 +341,16 @@
   <!-- drone4 -->
   <group ns="drone4">
     <include file="$(find mapping)/launch/mapping.launch">
+      <arg name="num_worker_threads_" value="$(arg mapping_worker_threads)"/>
       <arg name="init_x_" value="-18.0000"/>
       <arg name="init_y_" value=" 2.0000"/>
       <arg name="init_z_" value=" 1.50"/>
     </include>
-    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node" if="$(arg enable_swarm_vis)">
       <remap from="~gridmap"         to="gridmap"/>
       <remap from="~gridmap_inflate" to="gridmap_inflate"/>
     </node>
-    <node pkg="odom_visualization" name="odom_visualization"
+    <node pkg="odom_visualization" name="odom_visualization" if="$(arg enable_swarm_vis)"
           type="odom_visualization" output="screen">
       <remap from="~odom" to="odom"/>
       <param name="robot_scale" value="1.0"/>
@@ -340,8 +365,9 @@
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="4"/>
       <param name="num_drones" value="6"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="200"/>
+      <param name="dpf_rate" value="$(arg dpf_rate)"/>
+      <param name="consensus_rate" value="$(arg consensus_rate)"/>
+      <param name="num_particles" value="$(arg num_particles)"/>
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
@@ -356,6 +382,8 @@
       <remap from="~global_map"  to="/global_map"/>
     </node>
     <include file="$(find planning)/launch/planning.launch">
+      <arg name="plan_hz_" value="$(arg plan_hz)"/>
+      <arg name="hard_replan_hz_" value="$(arg hard_replan_hz)"/>
       <arg name="rhosVisibility_"  value="1000.0"/>
       <arg name="target_name_"     value="/drone0/target_ekf_odom"/>
       <arg name="drone_id"         value="4"/>
@@ -367,15 +395,16 @@
   <!-- drone5 -->
   <group ns="drone5">
     <include file="$(find mapping)/launch/mapping.launch">
+      <arg name="num_worker_threads_" value="$(arg mapping_worker_threads)"/>
       <arg name="init_x_" value="-16.2679"/>
       <arg name="init_y_" value=" 1.0000"/>
       <arg name="init_z_" value=" 1.50"/>
     </include>
-    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node" if="$(arg enable_swarm_vis)">
       <remap from="~gridmap"         to="gridmap"/>
       <remap from="~gridmap_inflate" to="gridmap_inflate"/>
     </node>
-    <node pkg="odom_visualization" name="odom_visualization"
+    <node pkg="odom_visualization" name="odom_visualization" if="$(arg enable_swarm_vis)"
           type="odom_visualization" output="screen">
       <remap from="~odom" to="odom"/>
       <param name="robot_scale" value="1.0"/>
@@ -390,8 +419,9 @@
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="5"/>
       <param name="num_drones" value="6"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="200"/>
+      <param name="dpf_rate" value="$(arg dpf_rate)"/>
+      <param name="consensus_rate" value="$(arg consensus_rate)"/>
+      <param name="num_particles" value="$(arg num_particles)"/>
       <param name="num_components" value="4"/>
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
@@ -406,6 +436,8 @@
       <remap from="~global_map"  to="/global_map"/>
     </node>
     <include file="$(find planning)/launch/planning.launch">
+      <arg name="plan_hz_" value="$(arg plan_hz)"/>
+      <arg name="hard_replan_hz_" value="$(arg hard_replan_hz)"/>
       <arg name="rhosVisibility_"  value="1000.0"/>
       <arg name="target_name_"     value="/drone0/target_ekf_odom"/>
       <arg name="drone_id"         value="5"/>
