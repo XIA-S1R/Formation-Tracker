@@ -52,7 +52,7 @@
     <param name="num_drones"       value="$(arg num_drones)" type="int"/>
 
     <!-- Swarm / formation parameters -->
-    <param name="rhoSwarm"                       value="0.0"/><!-- 集群避撞权重 10000-->
+    <param name="rhoSwarm"                       value="10000.0"/><!-- 集群避撞权重 10000-->
     <param name="optimization/drone_id"          value="$(arg drone_id)" type="int"/>
     <!-- formation_type: 0 = none, 1 = regular hexagon ring (6 drones), 2 = equilateral triangle (3 drones), 3 = square (4 drones), 4 = regular pentagon (5 drones) -->
     <param name="optimization/formation_type"

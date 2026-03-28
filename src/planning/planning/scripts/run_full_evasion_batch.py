@@ -169,6 +169,15 @@ def write_summary_csv(rows, out_csv):
         'formation_error_mean_search',
         'formation_error_p95_search',
         'formation_error_max_search',
+        'formation_graph_jf_mean',
+        'formation_graph_jf_p95',
+        'formation_graph_jf_max',
+        'formation_graph_jf_mean_tracking',
+        'formation_graph_jf_p95_tracking',
+        'formation_graph_jf_max_tracking',
+        'formation_graph_jf_mean_search',
+        'formation_graph_jf_p95_search',
+        'formation_graph_jf_max_search',
         'collision_count',
         'inter_drone_collision_count',
         'obstacle_collision_count',
@@ -178,6 +187,11 @@ def write_summary_csv(rows, out_csv):
         'min_obstacle_clearance',
         'replan_failed_hovering_count',
         'emergency_stop_count',
+        'speed_eval_basis',
+        'speed_tail_trim_sec',
+        'speed_eval_start_time_sec',
+        'speed_eval_end_time_sec',
+        'speed_eval_duration_sec',
         'speed_mean_all',
         'speed_p95_all',
         'speed_max_all',
@@ -229,6 +243,7 @@ def main():
     parser.add_argument('--with-rviz', action='store_true')
 
     parser.add_argument('--formation-side-length', type=float, default=2.0)
+    parser.add_argument('--formation-type', type=int, default=2)
     parser.add_argument('--collision-distance', type=float, default=0.0)
     parser.add_argument('--collision-release-distance', type=float, default=0.0)
     parser.add_argument('--obstacle-collision-distance', type=float, default=0.0)
@@ -236,6 +251,14 @@ def main():
     parser.add_argument('--reacq-timeout-sec', type=float, default=10.0)
     parser.add_argument('--post-reacq-extra-sec', type=float, default=2.0,
                         help='Extra seconds after reacq-timeout before stopping one run.')
+    parser.add_argument('--speed-tail-trim-sec', type=float, default=11.0,
+                        help='Trim this many seconds from each run tail when computing speed metrics.')
+    parser.add_argument('--target-motion-speed-thresh', type=float, default=0.2,
+                        help='Target speed threshold for maneuver-start detection in analysis.')
+    parser.add_argument('--target-motion-dist-thresh', type=float, default=0.5,
+                        help='Target displacement threshold for maneuver-start detection in analysis.')
+    parser.add_argument('--target-motion-confirm-sec', type=float, default=1.0,
+                        help='Required continuous moving duration to confirm target maneuver start in analysis.')
 
     parser.add_argument('--output-dir', default='')
     args = parser.parse_args()
@@ -340,11 +363,16 @@ def main():
             analyze_cmd = (
                 f'python3 {analyze_script} {bag_path} '
                 f'--formation-side-length {args.formation_side_length} '
+                f'--formation-type {args.formation_type} '
                 f'--collision-distance {args.collision_distance} '
                 f'--collision-release-distance {args.collision_release_distance} '
                 f'--obstacle-collision-distance {args.obstacle_collision_distance} '
                 f'--obstacle-collision-release-distance {args.obstacle_collision_release_distance} '
                 f'--reacq-timeout-sec {args.reacq_timeout_sec} '
+                f'--speed-tail-trim-sec {args.speed_tail_trim_sec} '
+                f'--target-motion-speed-thresh {args.target_motion_speed_thresh} '
+                f'--target-motion-dist-thresh {args.target_motion_dist_thresh} '
+                f'--target-motion-confirm-sec {args.target_motion_confirm_sec} '
                 f'--out-json {run_metrics_json}'
             )
             print(f'[{run_tag}] analyzing bag...')

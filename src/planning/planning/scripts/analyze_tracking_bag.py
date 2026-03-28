@@ -37,6 +37,13 @@ def pairwise_dist(a, b):
     return vec_norm3(a[0] - b[0], a[1] - b[1], a[2] - b[2])
 
 
+def pairwise_dist2(a, b):
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    dz = a[2] - b[2]
+    return dx * dx + dy * dy + dz * dz
+
+
 def mean_or_zero(values):
     return float(statistics.mean(values)) if values else 0.0
 
@@ -80,6 +87,89 @@ def query_min_dist_in_radius(pos, voxel_index, voxel_size, radius):
     if best2 is None:
         return None
     return math.sqrt(best2)
+
+
+def get_desired_formation_nodes(formation_type):
+    # Keep consistent with traj_opt::TrajOpt::setDesiredFormation
+    if formation_type == 1:
+        # regular hexagon ring (6 drones)
+        return [
+            (1.7321, -1.0000, 0.0),
+            (0.0000, -2.0000, 0.0),
+            (-1.7321, -1.0000, 0.0),
+            (-1.7321, 1.0000, 0.0),
+            (0.0000, 2.0000, 0.0),
+            (1.7321, 1.0000, 0.0),
+        ]
+    if formation_type == 2:
+        # equilateral triangle (3 drones)
+        return [
+            (0.0, 1.1547, 0.0),
+            (1.0, -0.5774, 0.0),
+            (-1.0, -0.5774, 0.0),
+        ]
+    if formation_type == 3:
+        # square (4 drones)
+        return [
+            (1.0, 1.0, 0.0),
+            (1.0, -1.0, 0.0),
+            (-1.0, -1.0, 0.0),
+            (-1.0, 1.0, 0.0),
+        ]
+    if formation_type == 4:
+        # regular pentagon (5 drones)
+        return [
+            (1.7013, 0.0000, 0.0),
+            (0.5257, 1.6180, 0.0),
+            (-1.3764, 1.0000, 0.0),
+            (-1.3764, -1.0000, 0.0),
+            (0.5257, -1.6180, 0.0),
+        ]
+    return []
+
+
+def calc_snl_matrix(nodes):
+    n = len(nodes)
+    if n <= 0:
+        return None
+
+    A = [[0.0 for _ in range(n)] for __ in range(n)]
+    D = [0.0 for _ in range(n)]
+
+    for i in range(n):
+        for j in range(n):
+            A[i][j] = pairwise_dist2(nodes[i], nodes[j])
+            D[i] += A[i][j]
+
+    for di in D:
+        if di <= 1e-12:
+            return None
+
+    Lhat = [[0.0 for _ in range(n)] for __ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                Lhat[i][j] = 1.0
+            else:
+                Lhat[i][j] = -A[i][j] / math.sqrt(D[i] * D[j])
+    return Lhat
+
+
+def calc_formation_graph_jf(nodes, desired_nodes):
+    if len(nodes) != len(desired_nodes) or len(nodes) <= 0:
+        return None
+    L = calc_snl_matrix(nodes)
+    Ld = calc_snl_matrix(desired_nodes)
+    if L is None or Ld is None:
+        return None
+
+    n = len(nodes)
+    jf = 0.0
+    for i in range(n):
+        for j in range(n):
+            d = L[i][j] - Ld[i][j]
+            jf += d * d
+    return float(jf)
 
 
 def parse_drone_id_from_topic(topic):
@@ -317,9 +407,63 @@ def integrate_single_drone_visibility_over_total(search_events, obs_events, t_st
     }
 
 
+def find_target_maneuver_start(target_samples, speed_thresh, dist_thresh, confirm_sec):
+    """
+    target_samples: [(ts, speed, (x,y,z)), ...]
+    Return first timestamp considered as target maneuver start.
+    Rule: speed >= speed_thresh AND displacement from initial position >= dist_thresh,
+    and this state lasts for confirm_sec (time accumulated over continuous samples).
+    """
+    if not target_samples:
+        return None
+
+    samples = sorted(target_samples, key=lambda x: float(x[0]))
+    p0 = samples[0][2]
+    speed_thresh = max(0.0, float(speed_thresh))
+    dist_thresh = max(0.0, float(dist_thresh))
+    confirm_sec = max(0.0, float(confirm_sec))
+
+    run_start = None
+    run_dur = 0.0
+    prev_ts = None
+
+    for ts, speed, pos in samples:
+        ts = float(ts)
+        moved = pairwise_dist(pos, p0) >= dist_thresh
+        moving = (float(speed) >= speed_thresh) and moved
+
+        if moving:
+            if run_start is None:
+                run_start = ts
+                run_dur = 0.0
+            if prev_ts is not None and ts >= prev_ts:
+                dt = ts - prev_ts
+                # Discontinuous samples break continuity.
+                if dt > 1.0:
+                    run_start = ts
+                    run_dur = 0.0
+                else:
+                    run_dur += dt
+            if run_dur >= confirm_sec:
+                return run_start
+        else:
+            run_start = None
+            run_dur = 0.0
+
+        prev_ts = ts
+
+    # Fallback: first sample with enough displacement.
+    for ts, speed, pos in samples:
+        if pairwise_dist(pos, p0) >= dist_thresh:
+            return float(ts)
+
+    return None
+
+
 def analyze_bag(
     bag_path,
     formation_side_length=2.0,
+    formation_type=2,
     collision_distance=0.0,
     collision_release_distance=0.0,
     obstacle_collision_distance=0.0,
@@ -328,6 +472,10 @@ def analyze_bag(
     hovering_fail_duration_sec=5.0,
     dyn_vmax_limit=3.0,
     dyn_amax_limit=6.0,
+    speed_tail_trim_sec=11.0,
+    target_motion_speed_thresh=0.2,
+    target_motion_dist_thresh=0.5,
+    target_motion_confirm_sec=1.0,
 ):
     collision_distance = max(0.0, float(collision_distance))
     collision_release_distance = max(collision_distance, float(collision_release_distance))
@@ -336,11 +484,20 @@ def analyze_bag(
         obstacle_collision_distance, float(obstacle_collision_release_distance)
     )
     hovering_fail_duration_sec = max(0.0, float(hovering_fail_duration_sec))
+    speed_tail_trim_sec = max(0.0, float(speed_tail_trim_sec))
 
     drone_positions = {}  # drone_id -> (x,y,z)
     drone_speeds = defaultdict(list)
     drone_speeds_tracking = defaultdict(list)
     drone_speeds_search = defaultdict(list)
+    drone_speed_samples = defaultdict(list)
+    drone_speed_samples_tracking = defaultdict(list)
+    drone_speed_samples_search = defaultdict(list)
+    desired_nodes = get_desired_formation_nodes(int(formation_type))
+    formation_jf_samples = []
+    formation_jf_samples_tracking = []
+    formation_jf_samples_search = []
+    target_speed_samples = []  # [(ts, speed, (x,y,z))]
     drone_last_replan_state = {}
     drone_last_replan_ts = {}
     replan_failed_hovering_count = 0
@@ -402,6 +559,14 @@ def analyze_bag(
                     obstacle_voxel_index = build_voxel_index(pts, obstacle_voxel_size)
                 continue
 
+            # Target odom
+            if topic == '/target/odom':
+                p = msg.pose.pose.position
+                v = msg.twist.twist.linear
+                target_speed = vec_norm3(v.x, v.y, v.z)
+                target_speed_samples.append((ts, target_speed, (float(p.x), float(p.y), float(p.z))))
+                continue
+
             # Drone odom: /droneX/odom
             if topic.endswith('/odom') and topic.startswith('/drone') and topic.count('/') == 2:
                 drone_id = parse_drone_id_from_topic(topic)
@@ -412,6 +577,7 @@ def analyze_bag(
                 speed = vec_norm3(v.x, v.y, v.z)
                 drone_positions[drone_id] = (p.x, p.y, p.z)
                 drone_speeds[drone_id].append(speed)
+                drone_speed_samples[drone_id].append((ts, speed))
 
                 # dynamics legality from odom (time weighted)
                 prev = last_odom_state.get(drone_id, None)
@@ -436,8 +602,10 @@ def analyze_bag(
                 if drone_id in search_state_now:
                     if search_state_now[drone_id]:
                         drone_speeds_search[drone_id].append(speed)
+                        drone_speed_samples_search[drone_id].append((ts, speed))
                     else:
                         drone_speeds_tracking[drone_id].append(speed)
+                        drone_speed_samples_tracking[drone_id].append((ts, speed))
 
                 # use every odom update as eval tick when all drones are available
                 eval_times.append(ts)
@@ -470,6 +638,21 @@ def analyze_bag(
                             inter_drone_collision_active = True
                         elif inter_drone_collision_active and min_d >= collision_release_distance:
                             inter_drone_collision_active = False
+
+                # graph formation metric J_f = ||Lhat - Lhat_des||_F^2
+                if desired_nodes:
+                    req_ids = list(range(len(desired_nodes)))
+                    if all(i in drone_positions for i in req_ids):
+                        swarm_nodes = [drone_positions[i] for i in req_ids]
+                        jf = calc_formation_graph_jf(swarm_nodes, desired_nodes)
+                        if jf is not None:
+                            formation_jf_samples.append(jf)
+                            if req_ids and all(i in search_state_now for i in req_ids):
+                                all_search_now = all(search_state_now[i] for i in req_ids)
+                                if all_search_now:
+                                    formation_jf_samples_search.append(jf)
+                                else:
+                                    formation_jf_samples_tracking.append(jf)
 
                 # obstacle collision event with hysteresis (per drone)
                 if obstacle_query_radius > 0.0 and obstacle_voxel_index:
@@ -705,17 +888,50 @@ def analyze_bag(
         else:
             dyn_any_over_ratio_by_drone[str(drone_id)] = 0.0
 
-    # speed stats
+    # speed stats (strict window):
+    # target maneuver start -> (bag end - tail trim).
+    maneuver_start_ts = find_target_maneuver_start(
+        target_speed_samples,
+        speed_thresh=target_motion_speed_thresh,
+        dist_thresh=target_motion_dist_thresh,
+        confirm_sec=target_motion_confirm_sec,
+    )
+    if maneuver_start_ts is None:
+        speed_eval_start_ts = float(t_min)
+        speed_eval_basis = 'fallback_no_target_motion'
+    else:
+        speed_eval_start_ts = max(float(t_min), float(maneuver_start_ts))
+        speed_eval_basis = 'target_maneuver_window'
+
+    speed_eval_end_ts = max(speed_eval_start_ts, float(t_max) - speed_tail_trim_sec)
+    if speed_eval_end_ts <= speed_eval_start_ts + 1e-6:
+        speed_eval_start_ts = float(t_min)
+        speed_eval_end_ts = float(t_max)
+        speed_eval_basis = speed_eval_basis + '_fallback_full_duration'
+
+    def cut_speed_samples(samples_by_drone):
+        cut = {}
+        for drone_id, samples in samples_by_drone.items():
+            cut[drone_id] = [
+                spd for ts, spd in samples
+                if (float(ts) >= speed_eval_start_ts and float(ts) <= speed_eval_end_ts)
+            ]
+        return cut
+
+    drone_speeds_cut = cut_speed_samples(drone_speed_samples)
+    drone_speeds_tracking_cut = cut_speed_samples(drone_speed_samples_tracking)
+    drone_speeds_search_cut = cut_speed_samples(drone_speed_samples_search)
+
     speed_metrics = {}
     speed_metrics_tracking = {}
     speed_metrics_search = {}
     all_speed_samples = []
     all_speed_samples_tracking = []
     all_speed_samples_search = []
-    for drone_id in sorted(drone_speeds.keys()):
-        s = drone_speeds[drone_id]
-        s_tracking = drone_speeds_tracking[drone_id]
-        s_search = drone_speeds_search[drone_id]
+    for drone_id in sorted(drone_speed_samples.keys()):
+        s = drone_speeds_cut.get(drone_id, [])
+        s_tracking = drone_speeds_tracking_cut.get(drone_id, [])
+        s_search = drone_speeds_search_cut.get(drone_id, [])
         all_speed_samples.extend(s)
         all_speed_samples_tracking.extend(s_tracking)
         all_speed_samples_search.extend(s_search)
@@ -821,6 +1037,20 @@ def analyze_bag(
         'formation_error_mean_search': mean_or_zero(formation_err_samples_search),
         'formation_error_p95_search': percentile(formation_err_samples_search, 0.95),
         'formation_error_max_search': max(formation_err_samples_search) if formation_err_samples_search else 0.0,
+        'formation_type': int(formation_type),
+        'formation_graph_jf_mean': mean_or_zero(formation_jf_samples),
+        'formation_graph_jf_p95': percentile(formation_jf_samples, 0.95),
+        'formation_graph_jf_max': max(formation_jf_samples) if formation_jf_samples else 0.0,
+        'formation_graph_jf_mean_tracking': mean_or_zero(formation_jf_samples_tracking),
+        'formation_graph_jf_p95_tracking': percentile(formation_jf_samples_tracking, 0.95),
+        'formation_graph_jf_max_tracking': (
+            max(formation_jf_samples_tracking) if formation_jf_samples_tracking else 0.0
+        ),
+        'formation_graph_jf_mean_search': mean_or_zero(formation_jf_samples_search),
+        'formation_graph_jf_p95_search': percentile(formation_jf_samples_search, 0.95),
+        'formation_graph_jf_max_search': (
+            max(formation_jf_samples_search) if formation_jf_samples_search else 0.0
+        ),
         'collision_count': collision_count,
         'inter_drone_collision_count': inter_drone_collision_count,
         'obstacle_collision_count': obstacle_collision_count,
@@ -844,6 +1074,11 @@ def analyze_bag(
         'replan_failed_hovering_long_stuck_drones': long_hovering_drones,
         'replan_failed_hovering_long_stuck_detected': bool(len(long_hovering_drones) > 0),
         'emergency_stop_count': emergency_stop_count,
+        'speed_eval_basis': speed_eval_basis,
+        'speed_tail_trim_sec': float(speed_tail_trim_sec),
+        'speed_eval_start_time_sec': float(speed_eval_start_ts - t_min),
+        'speed_eval_end_time_sec': float(speed_eval_end_ts - t_min),
+        'speed_eval_duration_sec': float(max(0.0, speed_eval_end_ts - speed_eval_start_ts)),
         'speed_mean_all': mean_or_zero(all_speed_samples),
         'speed_p95_all': percentile(all_speed_samples, 0.95),
         'speed_max_all': max(all_speed_samples) if all_speed_samples else 0.0,
@@ -892,6 +1127,15 @@ def write_summary_csv(rows, out_csv):
         'formation_error_mean_search',
         'formation_error_p95_search',
         'formation_error_max_search',
+        'formation_graph_jf_mean',
+        'formation_graph_jf_p95',
+        'formation_graph_jf_max',
+        'formation_graph_jf_mean_tracking',
+        'formation_graph_jf_p95_tracking',
+        'formation_graph_jf_max_tracking',
+        'formation_graph_jf_mean_search',
+        'formation_graph_jf_p95_search',
+        'formation_graph_jf_max_search',
         'collision_count',
         'inter_drone_collision_count',
         'obstacle_collision_count',
@@ -907,6 +1151,11 @@ def write_summary_csv(rows, out_csv):
         'replan_failed_hovering_max_continuous_sec',
         'replan_failed_hovering_long_stuck_detected',
         'emergency_stop_count',
+        'speed_eval_basis',
+        'speed_tail_trim_sec',
+        'speed_eval_start_time_sec',
+        'speed_eval_end_time_sec',
+        'speed_eval_duration_sec',
         'speed_mean_all',
         'speed_p95_all',
         'speed_max_all',
@@ -929,6 +1178,8 @@ def main():
     parser = argparse.ArgumentParser(description='Analyze tracking experiment rosbag.')
     parser.add_argument('bags', nargs='+', help='Bag file paths')
     parser.add_argument('--formation-side-length', type=float, default=2.0)
+    parser.add_argument('--formation-type', type=int, default=2,
+                        help='Formation type consistent with traj_opt (1:hex,2:triangle,3:square,4:pentagon).')
     parser.add_argument('--collision-distance', type=float, default=0)
     parser.add_argument('--collision-release-distance', type=float, default=0)
     parser.add_argument('--obstacle-collision-distance', type=float, default=0.0)
@@ -940,6 +1191,14 @@ def main():
                         help='Speed limit used by trajectory dynamics legality analysis.')
     parser.add_argument('--dyn-amax-limit', type=float, default=6.0,
                         help='Acceleration limit used by trajectory dynamics legality analysis.')
+    parser.add_argument('--speed-tail-trim-sec', type=float, default=11.0,
+                        help='Trim this many seconds from bag end when computing speed metrics.')
+    parser.add_argument('--target-motion-speed-thresh', type=float, default=0.2,
+                        help='Target speed threshold (m/s) for maneuver-start detection.')
+    parser.add_argument('--target-motion-dist-thresh', type=float, default=0.5,
+                        help='Target displacement threshold (m) from initial point for maneuver-start detection.')
+    parser.add_argument('--target-motion-confirm-sec', type=float, default=1.0,
+                        help='Required continuous moving duration (s) to confirm maneuver start.')
     parser.add_argument('--out-json', default='', help='Output JSON file path')
     parser.add_argument('--out-csv', default='', help='Output CSV file path')
     args = parser.parse_args()
@@ -949,6 +1208,7 @@ def main():
         result = analyze_bag(
             bag_path=bag_path,
             formation_side_length=args.formation_side_length,
+            formation_type=args.formation_type,
             collision_distance=args.collision_distance,
             collision_release_distance=args.collision_release_distance,
             obstacle_collision_distance=args.obstacle_collision_distance,
@@ -957,6 +1217,10 @@ def main():
             hovering_fail_duration_sec=args.hovering_fail_duration_sec,
             dyn_vmax_limit=args.dyn_vmax_limit,
             dyn_amax_limit=args.dyn_amax_limit,
+            speed_tail_trim_sec=args.speed_tail_trim_sec,
+            target_motion_speed_thresh=args.target_motion_speed_thresh,
+            target_motion_dist_thresh=args.target_motion_dist_thresh,
+            target_motion_confirm_sec=args.target_motion_confirm_sec,
         )
         result['run_id'] = i
         if not result.get('task_success', True):

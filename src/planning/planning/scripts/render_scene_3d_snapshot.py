@@ -21,8 +21,9 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager as fm
 from matplotlib.lines import Line2D
 from matplotlib.legend_handler import HandlerBase
-from matplotlib.patches import Circle, FancyArrowPatch
+from matplotlib.patches import Circle, FancyArrowPatch, Polygon as MplPolygon
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from mpl_toolkits.mplot3d import proj3d
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 import rosbag
@@ -93,8 +94,8 @@ class HandlerTrendLegend(HandlerBase):
         y0 = ydescent + 0.46 * height
         x0 = xdescent + 0.10 * width
         x1 = xdescent + 0.92 * width
-        col_base = plt.cm.Oranges(0.35)
-        col_tip = plt.cm.Oranges(0.62)
+        col_base = (0.66, 0.66, 0.66, 1.0)
+        col_tip = (0.46, 0.46, 0.46, 1.0)
         body = FancyArrowPatch(
             (x0, y0), (x1, y0),
             connectionstyle='arc3,rad=-0.22',
@@ -333,6 +334,42 @@ def draw_quad_marker(ax, x, y, z, arm=0.55, rotor_r=0.11, color='#1f77b4', lw=1.
         ax.plot(xr, yr, zr, color=color, linewidth=max(0.8, lw * 0.9), alpha=alpha)
 
 
+def densify_obstacle_points_np(
+    pts_xyz,
+    max_base_points=120000,
+    densify_factor=2.5,
+    jitter_xy=0.06,
+    jitter_z=0.03,
+    seed=7,
+):
+    pts = np.asarray(pts_xyz, dtype=np.float64)
+    if len(pts) == 0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    rng = np.random.default_rng(int(seed))
+
+    # 与 formation_shots 一致：随机采样，避免环障碍条纹空洞
+    if len(pts) > int(max_base_points):
+        idx = rng.choice(len(pts), size=int(max_base_points), replace=False)
+        pts = pts[idx]
+
+    densify_factor = max(1.0, float(densify_factor))
+    extra_n = int(round(len(pts) * (densify_factor - 1.0)))
+    if extra_n <= 0:
+        return pts
+
+    base_idx = rng.integers(0, len(pts), size=extra_n)
+    base = pts[base_idx]
+    jitter = np.column_stack(
+        (
+            rng.normal(0.0, float(jitter_xy), size=extra_n),
+            rng.normal(0.0, float(jitter_xy), size=extra_n),
+            rng.normal(0.0, float(jitter_z), size=extra_n),
+        )
+    )
+    return np.vstack((pts, base + jitter))
+
+
 def sample_history_at_or_before(ts_list, value_list, query_ts):
     if len(ts_list) == 0:
         return None, None
@@ -349,6 +386,9 @@ def pick_snapshot_and_data(
     min_target_move,
     min_elapsed,
     max_obs_points,
+    crop_obstacles=False,
+    crop_margin_xy=10.0,
+    crop_margin_z=4.0,
     state_lookback_sec=3.0,
 ):
     topics = ['/global_map', '/target/odom']
@@ -492,13 +532,14 @@ def pick_snapshot_and_data(
     if obstacle_pts is None:
         obstacle_pts = np.empty((0, 3), dtype=np.float32)
 
-    # Crop obstacles around target trajectory area
-    x_min, x_max = float(np.min(traj_arr[:, 1])), float(np.max(traj_arr[:, 1]))
-    y_min, y_max = float(np.min(traj_arr[:, 2])), float(np.max(traj_arr[:, 2]))
-    z_min, z_max = float(np.min(traj_arr[:, 3])), float(np.max(traj_arr[:, 3]))
-    margin_xy = 10.0
-    margin_z = 4.0
-    if len(obstacle_pts) > 0:
+    # Optional: crop obstacles around target trajectory area.
+    # Default is disabled to preserve full scene structures (wide walls/columns).
+    if bool(crop_obstacles) and len(obstacle_pts) > 0:
+        x_min, x_max = float(np.min(traj_arr[:, 1])), float(np.max(traj_arr[:, 1]))
+        y_min, y_max = float(np.min(traj_arr[:, 2])), float(np.max(traj_arr[:, 2]))
+        z_min, z_max = float(np.min(traj_arr[:, 3])), float(np.max(traj_arr[:, 3]))
+        margin_xy = float(crop_margin_xy)
+        margin_z = float(crop_margin_z)
         m = (
             (obstacle_pts[:, 0] >= x_min - margin_xy) & (obstacle_pts[:, 0] <= x_max + margin_xy) &
             (obstacle_pts[:, 1] >= y_min - margin_xy) & (obstacle_pts[:, 1] <= y_max + margin_xy) &
@@ -675,7 +716,7 @@ def sample_subcurve(pts, s, s0, s1, n_points):
     return out
 
 
-def draw_smooth_trend_arrow(ax, curve, segment_count=28):
+def draw_smooth_trend_arrow(ax, curve, segment_count=28, zorder_base=50):
     if len(curve) < 2:
         return 0
 
@@ -719,7 +760,7 @@ def draw_smooth_trend_arrow(ax, curve, segment_count=28):
     body_end = max(2, min(len(pts) - 2, body_end))
 
     body_segments = max(1, body_end - 1)
-    body_colors = plt.cm.Oranges(np.linspace(0.24, 0.56, body_segments))
+    gray_vals = np.linspace(0.72, 0.46, body_segments)
     for i in range(body_segments):
         i0 = i
         i1 = i + 1
@@ -727,12 +768,15 @@ def draw_smooth_trend_arrow(ax, curve, segment_count=28):
         r0 = pts[i0] - normals[i0] * (0.5 * widths[i0])
         l1 = pts[i1] + normals[i1] * (0.5 * widths[i1])
         r1 = pts[i1] - normals[i1] * (0.5 * widths[i1])
-        c = body_colors[i]
+        g = float(gray_vals[i])
         quad = Poly3DCollection(
             [[l0, r0, r1, l1]],
-            facecolors=[(c[0], c[1], c[2], 0.60)],
+            facecolors=[(g, g, g, 0.60)],
             edgecolors='none',
+            zorder=float(zorder_base + 1),
         )
+        if hasattr(quad, 'set_sort_zpos'):
+            quad.set_sort_zpos(1e6)
         ax.add_collection3d(quad)
 
     tip = pts[-1]
@@ -741,25 +785,29 @@ def draw_smooth_trend_arrow(ax, curve, segment_count=28):
     head_half_w = max(0.5 * neck_w, 0.13)
     bl = base + head_n * head_half_w
     br = base - head_n * head_half_w
-    c_tip = plt.cm.Oranges(0.70)
+    c_tip = (0.40, 0.40, 0.40, 1.0)
     head = Poly3DCollection(
         [[bl, br, tip]],
         facecolors=[(c_tip[0], c_tip[1], c_tip[2], 0.74)],
         edgecolors='none',
+        zorder=float(zorder_base + 2),
     )
+    if hasattr(head, 'set_sort_zpos'):
+        head.set_sort_zpos(1e6)
     ax.add_collection3d(head)
 
     # Slight centerline highlight for smoother visual continuity.
     ax.plot(
         pts[:, 0], pts[:, 1], pts[:, 2],
-        color=(1.0, 0.77, 0.48, 0.33),
-        linewidth=1.1
+        color=(0.58, 0.58, 0.58, 0.35),
+        linewidth=1.1,
+        zorder=float(zorder_base + 3),
     )
 
     return 1
 
 
-def draw_smooth_trend_arrows(ax, curve, arrow_count=5, segment_count=16):
+def draw_smooth_trend_arrows(ax, curve, arrow_count=5, segment_count=16, zorder_base=50):
     if len(curve) < 2:
         return 0
     pts = resample_polyline(curve, max(120, arrow_count * 50))
@@ -780,7 +828,95 @@ def draw_smooth_trend_arrows(ax, curve, arrow_count=5, segment_count=16):
         if (s1 - s0) <= 0.22:
             continue
         sub = sample_subcurve(pts, s, s0, s1, n_points=max(24, segment_count * 2))
-        drawn += draw_smooth_trend_arrow(ax, sub, segment_count=segment_count)
+        drawn += draw_smooth_trend_arrow(
+            ax, sub, segment_count=segment_count, zorder_base=zorder_base
+        )
+    return drawn
+
+
+def project_points_to_figure(fig, ax, pts3):
+    arr = np.asarray(pts3, dtype=np.float64)
+    if len(arr) == 0:
+        return np.empty((0, 2), dtype=np.float64)
+    x2, y2, _ = proj3d.proj_transform(arr[:, 0], arr[:, 1], arr[:, 2], ax.get_proj())
+    disp = ax.transData.transform(np.column_stack((x2, y2)))
+    fig_xy = fig.transFigure.inverted().transform(disp)
+    return np.asarray(fig_xy, dtype=np.float64)
+
+
+def draw_trend_overlay_on_top(fig, ax, curve, arrow_count=5):
+    """
+    在 figure 2D 层叠加绘制目标趋势箭头，保证视觉上始终在最上层（不受3D遮挡）。
+    """
+    if len(curve) < 2:
+        return 0
+
+    pts = resample_polyline(curve, max(120, int(max(2, arrow_count)) * 50))
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    s = np.concatenate(([0.0], np.cumsum(seg)))
+    total = float(s[-1])
+    if total < 1e-6:
+        return 0
+
+    n = int(max(2, arrow_count))
+    margin = min(0.55, 0.08 * total)
+    usable = max(0.8, total - 2.0 * margin)
+    span = usable / n
+
+    drawn = 0
+    for i in range(n):
+        s0 = margin + i * span + 0.04 * span
+        s1 = margin + (i + 1) * span - 0.08 * span
+        if (s1 - s0) <= 0.22:
+            continue
+        sub3 = sample_subcurve(pts, s, s0, s1, n_points=36)
+        sub2 = project_points_to_figure(fig, ax, sub3)
+        if len(sub2) < 3:
+            continue
+        if not np.all(np.isfinite(sub2)):
+            continue
+
+        # Build arrow head from the end tangent to ensure exact connection at curve end.
+        tip = np.asarray(sub2[-1], dtype=np.float64)
+        prev = np.asarray(sub2[max(0, len(sub2) - 4)], dtype=np.float64)
+        tvec = tip - prev
+        tnorm = float(np.linalg.norm(tvec))
+        if tnorm < 1e-10:
+            continue
+        tdir = tvec / tnorm
+        nrm = np.array([-tdir[1], tdir[0]], dtype=np.float64)
+
+        # Length/width in figure-normalized coordinates
+        head_len = float(np.clip(0.11 * tnorm, 0.010, 0.030))
+        head_w = float(np.clip(0.65 * head_len, 0.006, 0.020))
+        base = tip - tdir * head_len
+        left = base + nrm * head_w
+        right = base - nrm * head_w
+
+        # 2D overlay centerline (end at head base, not passing tip)
+        body = sub2.copy()
+        body[-1] = base
+        line = Line2D(
+            body[:, 0], body[:, 1],
+            transform=fig.transFigure,
+            color=(0.50, 0.50, 0.50, 0.92),
+            linewidth=2.0,
+            solid_capstyle='round',
+            zorder=10000,
+        )
+        fig.add_artist(line)
+
+        # 2D overlay triangle head with exact tip at curve end.
+        head = MplPolygon(
+            np.vstack([left, tip, right]),
+            closed=True,
+            transform=fig.transFigure,
+            facecolor=(0.36, 0.36, 0.36, 0.96),
+            edgecolor='none',
+            zorder=10001,
+        )
+        fig.add_artist(head)
+        drawn += 1
     return drawn
 
 
@@ -795,6 +931,10 @@ def draw_scene(
     fov_range_scale=1.30,
     fov_size_scale=0.68,
     fov_forward_offset=0.85,
+    obstacle_densify_factor=2.5,
+    obstacle_jitter_xy=0.06,
+    obstacle_jitter_z=0.03,
+    obstacle_point_size=1.8,
 ):
     traj_arr = data['traj_arr']
     obs = data['obs']
@@ -810,14 +950,31 @@ def draw_scene(
     fig = plt.figure(figsize=(10, 8), dpi=220)
     ax = fig.add_subplot(111, projection='3d')
 
-    # Darker obstacle point cloud
-    if len(obs) > 0:
-        ax.scatter(
-            obs[:, 0], obs[:, 1], obs[:, 2],
-            s= 0.5, c='#4a4a4a', alpha=0.36, marker='s', linewidths=0, rasterized=True
+    # Obstacle point cloud style aligned with formation_shots.py
+    obs_draw = densify_obstacle_points_np(
+        obs,
+        max_base_points=max(1000, int(len(obs)) if len(obs) < 120000 else 120000),
+        densify_factor=float(obstacle_densify_factor),
+        jitter_xy=float(obstacle_jitter_xy),
+        jitter_z=float(obstacle_jitter_z),
+        seed=7,
+    )
+    if len(obs_draw) > 0:
+        obs_sc = ax.scatter(
+            obs_draw[:, 0], obs_draw[:, 1], obs_draw[:, 2],
+            c=obs_draw[:, 2],
+            cmap='plasma',
+            s=float(obstacle_point_size),
+            alpha=0.70,
+            linewidths=0.0,
+            depthshade=False,
+            zorder=1,
+            rasterized=True,
         )
+        cbar = plt.colorbar(obs_sc, ax=ax, fraction=0.022, pad=0.01)
+        cbar.set_label('障碍高度 z (m)', fontsize=10)
 
-    # Smooth trend arrows: from current target marker through evasion waypoints.
+    # Smooth trend curve: from current target marker through evasion waypoints.
     trend_curve = build_smooth_trend_curve_from_waypoints(
         best_tgt=best_tgt,
         waypoint_xy=(evasion_waypoints or []),
@@ -826,12 +983,7 @@ def draw_scene(
     )
     if len(trend_curve) < 2:
         trend_curve = build_smooth_trend_curve_from_traj(traj_arr, render_ts, best_tgt, ctrl_count=7)
-    trend_arrow_count = draw_smooth_trend_arrows(
-        ax,
-        trend_curve,
-        arrow_count=int(max(2, path_arrows)),
-        segment_count=int(max(8, trend_arrows)),
-    )
+    trend_arrow_count = 0
 
     # Target marker at snapshot
     draw_quad_marker(
@@ -868,14 +1020,17 @@ def draw_scene(
     poly = np.vstack([poly, poly[0]])
     ax.plot(poly[:, 0], poly[:, 1], poly[:, 2], color='#1f77b4', linestyle='--', linewidth=1.25, alpha=0.95)
 
+    # Draw trend arrows last and with high z-order (visual top layer).
+    trend_arrow_count = 0
+
     # Limits with moderate z scale
     all_x = [float(np.min(traj_arr[:, 1])), float(np.max(traj_arr[:, 1])), best_tgt[0]] + [best_pos[i][0] for i in drone_ids]
     all_y = [float(np.min(traj_arr[:, 2])), float(np.max(traj_arr[:, 2])), best_tgt[1]] + [best_pos[i][1] for i in drone_ids]
     all_z = [float(np.min(traj_arr[:, 3])), float(np.max(traj_arr[:, 3])), best_tgt[2]] + [best_pos[i][2] for i in drone_ids]
-    if len(obs) > 0:
-        all_x += [float(np.min(obs[:, 0])), float(np.max(obs[:, 0]))]
-        all_y += [float(np.min(obs[:, 1])), float(np.max(obs[:, 1]))]
-        all_z += [float(np.min(obs[:, 2])), float(np.max(obs[:, 2]))]
+    if len(obs_draw) > 0:
+        all_x += [float(np.min(obs_draw[:, 0])), float(np.max(obs_draw[:, 0]))]
+        all_y += [float(np.min(obs_draw[:, 1])), float(np.max(obs_draw[:, 1]))]
+        all_z += [float(np.min(obs_draw[:, 2])), float(np.max(obs_draw[:, 2]))]
 
     x_mid = 0.5 * (min(all_x) + max(all_x))
     y_mid = 0.5 * (min(all_y) + max(all_y))
@@ -917,7 +1072,7 @@ def draw_scene(
         DroneLegendHandle(color='#1f77b4', count=3),
         DroneLegendHandle(color='#e74c3c', count=1),
         TrendLegendHandle(),
-        Line2D([0], [0], marker='s', markersize=7.2, markerfacecolor='#4a4a4a',
+        Line2D([0], [0], marker='o', markersize=6.6, markerfacecolor='#42a5f5',
                markeredgecolor='none', linestyle='none', alpha=0.70, label='Obstacles'),
     ]
     legend_font = get_chinese_font()
@@ -943,14 +1098,19 @@ def draw_scene(
     )
 
     # More top-down, still biased toward the bisector direction in xy-plane.
-    ax.view_init(elev=60, azim=225)
+    ax.view_init(elev=60, azim=236)
 
     fig.tight_layout(pad=0.05)
+    # 强制最上层显示：将箭头投影成2D叠加图层，不受3D遮挡。
+    fig.canvas.draw()
+    trend_arrow_count = draw_trend_overlay_on_top(
+        fig, ax, trend_curve, arrow_count=int(max(2, path_arrows))
+    )
     fig.savefig(out_path, dpi=380)
     return {
         'best_snapshot_time_sec': render_ts - start_ts,
         'best_score': best_score,
-        'obstacle_points_drawn': int(len(obs)),
+        'obstacle_points_drawn': int(len(obs_draw)),
         'trend_arrows': int(trend_arrow_count),
     }
 
@@ -970,6 +1130,13 @@ def main():
         help='Use target/tracker/FOV states this many seconds before selected snapshot',
     )
     parser.add_argument('--max-obs-points', type=int, default=180000)
+    parser.add_argument('--crop-obstacles', action='store_true', help='Crop obstacle cloud around target trajectory')
+    parser.add_argument('--crop-margin-xy', type=float, default=10.0, help='XY crop margin when --crop-obstacles is enabled')
+    parser.add_argument('--crop-margin-z', type=float, default=4.0, help='Z crop margin when --crop-obstacles is enabled')
+    parser.add_argument('--obstacle-densify-factor', type=float, default=2.5, help='Obstacle densification factor')
+    parser.add_argument('--obstacle-jitter-xy', type=float, default=0.06, help='Obstacle XY jitter for densification')
+    parser.add_argument('--obstacle-jitter-z', type=float, default=0.03, help='Obstacle Z jitter for densification')
+    parser.add_argument('--obstacle-point-size', type=float, default=1.8, help='Obstacle point size')
     parser.add_argument('--trend-arrows', type=int, default=18, help='Per-arrow smoothness segments')
     parser.add_argument('--path-arrows', type=int, default=5, help='How many smooth arrows along trend path')
     parser.add_argument(
@@ -1013,6 +1180,9 @@ def main():
         min_target_move=float(args.min_target_move),
         min_elapsed=float(args.min_elapsed),
         max_obs_points=int(args.max_obs_points),
+        crop_obstacles=bool(args.crop_obstacles),
+        crop_margin_xy=float(args.crop_margin_xy),
+        crop_margin_z=float(args.crop_margin_z),
         state_lookback_sec=float(args.state_lookback_sec),
     )
     evasion_waypoints = load_waypoints_from_script(args.evasion_script)
@@ -1028,6 +1198,10 @@ def main():
         fov_range_scale=float(args.fov_range_scale),
         fov_size_scale=float(args.fov_size_scale),
         fov_forward_offset=float(args.fov_forward_offset),
+        obstacle_densify_factor=max(1.0, float(args.obstacle_densify_factor)),
+        obstacle_jitter_xy=max(0.0, float(args.obstacle_jitter_xy)),
+        obstacle_jitter_z=max(0.0, float(args.obstacle_jitter_z)),
+        obstacle_point_size=max(0.2, float(args.obstacle_point_size)),
     )
 
     print(str(out_path))
