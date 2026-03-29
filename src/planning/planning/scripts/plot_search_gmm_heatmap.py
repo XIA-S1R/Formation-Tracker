@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-绘制搜索模式期间的GMM状态估计热力图和搜索热点。
-从bag包中提取指定失锁事件，可视化失锁后几秒内的粒子分布（通过DPF GMM均值）
-以及最终重新找回目标的过程。
-
-用法:
-  python3 plot_search_gmm_heatmap.py \
-    --bag /path/to/tracking.bag \
-    --loss_idx 5 \
-    --duration 12.0 \
-    --out_dir ./search_heatmap_out
-"""
-
 import argparse
 import os
 import sys
@@ -19,14 +6,31 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from matplotlib.colors import Normalize
-from matplotlib.cm import ScalarMappable
 import matplotlib.patches as mpatches
+
+# 中文字体 — matplotlib 3.1 兼容方式，直接注册 .ttc 字体文件
+import matplotlib.font_manager as _fm
+_CJK_CANDIDATES = [
+    '/usr/share/fonts/truetype/arphic/uming.ttc',
+    '/usr/share/fonts/truetype/arphic/ukai.ttc',
+    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+]
+_cjk_registered = False
+for _p in _CJK_CANDIDATES:
+    if os.path.exists(_p):
+        _fm.fontManager.ttflist += _fm.createFontList([_p])
+        _cjk_name = _fm.FontProperties(fname=_p).get_name()
+        matplotlib.rcParams['font.sans-serif'] = [_cjk_name, 'DejaVu Sans', 'sans-serif']
+        _cjk_registered = True
+        break
+if not _cjk_registered:
+    matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans', 'sans-serif']
+matplotlib.rcParams['axes.unicode_minus'] = False
 
 # ROS bag读取
 try:
     import rosbag
+    import sensor_msgs.point_cloud2 as pc2
 except ImportError:
     print("需要rosbag: source devel/setup.bash")
     sys.exit(1)
@@ -55,20 +59,21 @@ def load_bag(bag_path):
     bag = rosbag.Bag(bag_path)
     t0 = bag.get_start_time()
 
-    search_states  = {d: [] for d in range(3)}   # (rel_t, bool)
-    search_gmm     = {d: [] for d in range(3)}   # (rel_t, weights_C, means_Cx3)  -- 6D GMM
-    invalid_gmms   = {d: [] for d in range(3)}   # (rel_t, type, weights_C, means_Cx3)
-    search_targets = {d: [] for d in range(3)}   # (rel_t, list of (x,y,z))
-    target_odom    = []                           # (rel_t, x, y, z)
-    drone_odom     = {d: [] for d in range(3)}   # (rel_t, x, y, z)
+    search_states  = {d: [] for d in range(3)}
+    search_gmm     = {d: [] for d in range(3)}
+    invalid_gmms   = {d: [] for d in range(3)}
+    search_targets = {d: [] for d in range(3)}
+    target_odom    = []
+    drone_odom     = {d: [] for d in range(3)}
+    obstacle_xy    = None   # Nx2 障碍物XY点云（只取第一帧）
 
     topics = (
-        [f'/drone{d}/drone{d}_target_dpf/search_state'    for d in range(3)] +
-        [f'/drone{d}/drone{d}_target_dpf/search_pos_gmm'  for d in range(3)] +
+        [f'/drone{d}/drone{d}_target_dpf/search_state'       for d in range(3)] +
+        [f'/drone{d}/drone{d}_target_dpf/search_pos_gmm'     for d in range(3)] +
         [f'/drone{d}/drone{d}_target_dpf/invalid_region_gmm' for d in range(3)] +
-        [f'/drone{d}/drone{d}_target_dpf/search_targets'  for d in range(3)] +
+        [f'/drone{d}/drone{d}_target_dpf/search_targets'     for d in range(3)] +
         [f'/drone{d}/odom' for d in range(3)] +
-        ['/target/odom']
+        ['/target/odom', '/global_map']
     )
 
     for topic, msg, t in bag.read_messages(topics=topics):
@@ -117,10 +122,17 @@ def load_bag(bag_path):
             p = msg.pose.pose.position
             drone_odom[d].append((rel, p.x, p.y, p.z))
 
+        elif topic == '/global_map' and obstacle_xy is None:
+            pts = list(pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True))
+            if pts:
+                arr = np.array(pts)
+                obstacle_xy = arr[:, :2]
+
     bag.close()
     print(f"  search_gmm records: {[len(search_gmm[d]) for d in range(3)]}")
     print(f"  invalid_gmm records: {[len(invalid_gmms[d]) for d in range(3)]}")
-    return search_states, search_gmm, invalid_gmms, search_targets, target_odom, drone_odom
+    print(f"  obstacle points: {len(obstacle_xy) if obstacle_xy is not None else 0}")
+    return search_states, search_gmm, invalid_gmms, search_targets, target_odom, drone_odom, obstacle_xy
 
 
 def find_loss_intervals(search_states):
@@ -169,12 +181,11 @@ DRONE_CMAPS = [
 ]
 
 
-def gmm_density_grid(positions, weights, xx, yy, bandwidth=1.5):
+def gmm_density_grid(positions, weights, xx, yy, bandwidth=0.8):
     """在网格上计算加权GMM密度（XY平面）"""
     density = np.zeros_like(xx)
     w_sum = weights.sum()
     if w_sum < 1e-30:
-        # 权重全为0时退化为等权
         weights = np.ones(len(positions)) / len(positions)
         w_sum = 1.0
     for i, pos in enumerate(positions):
@@ -186,11 +197,16 @@ def gmm_density_grid(positions, weights, xx, yy, bandwidth=1.5):
 
 
 def plot_frame(ax, t_query, gmm_data, target_odom, drone_odom,
-               search_states, t_loss_start, t_loss_end, title, xlim, ylim,
-               invalid_gmms=None, search_targets=None):
+               t_loss_start, t_loss_end, title, xlim, ylim,
+               obstacle_xy=None):
     """绘制单帧的XY平面热力图"""
     ax.set_aspect('equal')
     ax.set_facecolor('#1a1a2e')
+
+    # 障碍物点云（灰色小点，z方向投影到XY平面）
+    if obstacle_xy is not None and len(obstacle_xy) > 0:
+        ax.scatter(obstacle_xy[:, 0], obstacle_xy[:, 1],
+                   s=0.3, c='#555577', alpha=0.4, linewidths=0, zorder=1)
 
     # 网格
     res = 80
@@ -209,49 +225,16 @@ def plot_frame(ax, t_query, gmm_data, target_odom, drone_odom,
         if len(positions) == 0:
             continue
 
-        density = gmm_density_grid(positions, weights, xx, yy, bandwidth=1.5)
+        density = gmm_density_grid(positions, weights, xx, yy, bandwidth=0.8)
         if density.max() < 1e-30:
             continue
         density /= density.max()
+        density = np.power(density, 0.1)  # sqrt 拉伸：突出高权重峰值，压低背景散漫区域
 
-        # 用各无人机专属 colormap 叠加，alpha 随密度变化
         rgba = DRONE_CMAPS[d](density)
-        rgba[..., 3] = density * 0.65  # alpha channel
+        rgba[..., 3] = density * 0.65
         ax.imshow(rgba, extent=[xlim[0], xlim[1], ylim[0], ylim[1]],
                   origin='lower', aspect='auto', zorder=2)
-
-        # 叠加分量均值散点（小点标记）
-        w_norm = weights / (weights.max() + 1e-30)
-        sizes = 8 + w_norm * 60
-        ax.scatter(positions[:, 0], positions[:, 1],
-                   s=sizes, c=DRONE_COLORS[d], alpha=0.9,
-                   edgecolors='none', zorder=4)
-
-    # 绘制无效GMM轮廓（负观测=橙色虚线圆，障碍=灰色实线圆）
-    if invalid_gmms is not None:
-        for d in range(3):
-            entries = [(t, tp, w, m) for t, tp, w, m in invalid_gmms[d]
-                       if abs(t - t_query) < 0.5]
-            if not entries:
-                continue
-            _, _, weights, means = min(entries, key=lambda x: abs(x[0] - t_query))
-            for c in range(len(means)):
-                color = '#f39c12' if _ == 0 else '#7f8c8d'  # orange=neg_obs, gray=obstacle
-                ax.plot(means[c, 0], means[c, 1], 'x', ms=6,
-                        color=color, alpha=0.7, zorder=3)
-
-    # 绘制搜索热点
-    if search_targets is not None:
-        for d in range(3):
-            entries = [(t, pts) for t, pts in search_targets[d]
-                       if abs(t - t_query) < 0.5]
-            if not entries:
-                continue
-            _, pts = min(entries, key=lambda x: abs(x[0] - t_query))
-            for pt in pts:
-                ax.plot(pt[0], pt[1], 'D', ms=8,
-                        color=DRONE_COLORS[d], alpha=0.9, zorder=5,
-                        markeredgecolor='white', markeredgewidth=0.8)
 
     # 绘制无人机当前位置
     for d in range(3):
@@ -284,7 +267,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     print(f"Loading bag: {args.bag}")
-    search_states, search_gmm, invalid_gmms, search_targets, target_odom, drone_odom = load_bag(args.bag)
+    search_states, search_gmm, invalid_gmms, search_targets, target_odom, drone_odom, obstacle_xy = load_bag(args.bag)
 
     # 找失锁区间
     intervals = find_loss_intervals(search_states)
@@ -308,43 +291,57 @@ def main():
                                      t_plot_end + 1.0)
     print(f"  {len(gmm_data)} GMM records")
 
-    # 确定绘图范围（基于目标轨迹）
-    tgt = np.array([(x, y) for _, x, y, _ in target_odom
-                    if t_loss_start - 2 <= _ <= t_plot_end + 2])
-    if len(tgt) > 0:
-        cx, cy = tgt[:, 0].mean(), tgt[:, 1].mean()
-        span = max(tgt[:, 0].ptp(), tgt[:, 1].ptp(), 10.0) * 0.7
-    else:
-        cx, cy, span = 0, 0, 15
+    print(f"\n=== GMM分量诊断 (失锁后 {args.duration:.0f}s 内) ===")
+    for d in range(3):
+        entries = [(t, w, p) for t, dd, w, p in gmm_data if dd == d
+                   and t_loss_start <= t <= t_plot_end]
+        if not entries:
+            print(f"  Drone {d}: 无数据")
+            continue
+        # 每隔2秒打印一次
+        last_print = -999.0
+        for t, weights, positions in sorted(entries, key=lambda x: x[0]):
+            if t - last_print < 2.0:
+                continue
+            last_print = t
+            print(f"  Drone {d} t={t:.2f}s: {len(positions)}个分量")
+            for c, (w, pos) in enumerate(zip(weights, positions)):
+                print(f"    [c{c}] w={w:.3f}  pos=({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
 
-    # 采样时间帧
+    # 打印目标消失位置
+    loss_entries = [(t, x, y, z) for t, x, y, z in target_odom
+                    if abs(t - t_loss_start) < 0.5]
+    if loss_entries:
+        _, lx, ly, lz = min(loss_entries, key=lambda e: abs(e[0] - t_loss_start))
+        print(f"\n  目标消失位置: ({lx:.2f}, {ly:.2f}, {lz:.2f})")
+    print("=" * 50)
+
+    # 均匀采样帧时刻
     frame_times = np.linspace(t_loss_start, t_plot_end, args.n_frames)
 
-    # ===== 主图：多帧热力图 =====
-    ncols = 4
+    # 固定40×40全地图范围
+    xlim = (-20.0, 20.0)
+    ylim = (-20.0, 20.0)
+
+    # 创建主图
+    ncols = min(4, args.n_frames)
     nrows = (args.n_frames + ncols - 1) // ncols
-    fig = plt.figure(figsize=(ncols * 4, nrows * 4 + 1.5), facecolor='#0d0d1a')
-    fig.suptitle(
-        f'搜索模式GMM状态估计  |  第{args.loss_idx}次失锁  '
-        f'(t={t_loss_start:.2f}s, 持续{loss_dur:.2f}s)',
-        color='white', fontsize=13, y=0.98
-    )
+    fig, axes_arr = plt.subplots(nrows, ncols,
+                                 figsize=(ncols * 4, nrows * 4 + 0.8),
+                                 facecolor='#0d0d1a')
+    fig.suptitle(f'搜索GMM热力图 — 第{args.loss_idx}次失锁 (持续{loss_dur:.2f}s)',
+                 color='white', fontsize=12)
+    axes = np.array(axes_arr).flatten()
+    # 隐藏多余子图
+    for j in range(args.n_frames, len(axes)):
+        axes[j].set_visible(False)
 
-    axes = []
-    for i in range(args.n_frames):
-        ax = fig.add_subplot(nrows, ncols, i + 1)
-        ax.set_facecolor('#1a1a2e')
-        axes.append(ax)
-
-    xlim = (cx - span, cx + span)
-    ylim = (cy - span, cy + span)
     for i, t_q in enumerate(frame_times):
         ax = axes[i]
         plot_frame(ax, t_q, gmm_data, target_odom, drone_odom,
-                   search_states, t_loss_start, t_loss_end,
+                   t_loss_start, t_loss_end,
                    f't={t_q:.2f}s', xlim, ylim,
-                   invalid_gmms=invalid_gmms,
-                   search_targets=search_targets)
+                   obstacle_xy=obstacle_xy)
         ax.set_xlim(*xlim)
         ax.set_ylim(*ylim)
         ax.set_xlabel('X (m)', fontsize=6, color='gray')
@@ -352,7 +349,7 @@ def main():
 
     # 图例
     legend_elements = [
-        mpatches.Patch(color=DRONE_COLORS[d], label=f'Drone {d} GMM分量') for d in range(3)
+        mpatches.Patch(color=DRONE_COLORS[d], label=f'Drone {d} 搜索密度') for d in range(3)
     ] + [
         plt.Line2D([0], [0], marker='^', color='w', ms=8, label='无人机位置',
                    markerfacecolor='white', linestyle='None'),

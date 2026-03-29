@@ -83,7 +83,10 @@ public:
       nh->param("/target/camera/cy", cam_cy_, cam_cy_);
       nh->param("/target/camera/width", cam_width_, cam_width_);
       nh->param("/target/camera/height", cam_height_, cam_height_);
-      nh->param("/target/camera/max_range", cam_max_range_, cam_max_range_);
+      // 优先读 max_obs_depth（与 dpf_sim_node 对齐），fallback 到 camera/max_range
+      if (!nh->getParam("max_obs_depth", cam_max_range_))
+        nh->param("/target/camera/max_range", cam_max_range_, cam_max_range_);
+      nh->param("neg_obs_cov_min", neg_obs_cov_min_, neg_obs_cov_min_);
     }
     
     rng_.seed(std::random_device{}());
@@ -635,11 +638,51 @@ public:
     gmm.means.resize(C);
     gmm.covs.resize(C);
 
-    // 初始化：均匀间隔选取粒子作为初始均值
-    for (int c = 0; c < C; ++c) {
-      int idx = indices[c * N / C];
-      gmm.means[c] = particles.col(idx).head(3);
-      gmm.covs[c] = Eigen::Matrix3d::Identity() * 0.5;
+    // 初始化：k-means++ 按空间距离加权随机选中心
+    {
+      std::mt19937 rng(42);
+      std::vector<int> chosen;
+      // 第一个中心随机选
+      std::uniform_int_distribution<int> uni(0, N - 1);
+      chosen.push_back(indices[uni(rng)]);
+      for (int c = 1; c < C; ++c) {
+        // 计算每个粒子到最近已选中心的距离平方
+        std::vector<double> d2(N);
+        for (int n = 0; n < N; ++n) {
+          Eigen::Vector3d p = particles.col(indices[n]).head(3);
+          double min_d2 = 1e30;
+          for (int ci : chosen) {
+            double dd = (p - particles.col(ci).head(3)).squaredNorm();
+            if (dd < min_d2) min_d2 = dd;
+          }
+          d2[n] = min_d2;
+        }
+        double sum_d2 = 0.0;
+        for (double v : d2) sum_d2 += v;
+        if (sum_d2 < 1e-30) {
+          // 所有粒子重叠，退化为单分量
+          gmm.C = 1;
+          gmm.weights.setConstant(1, 1.0);
+          gmm.means.resize(1);
+          gmm.covs.resize(1);
+          gmm.means[0] = particles.col(chosen[0]).head(3);
+          gmm.covs[0] = Eigen::Matrix3d::Identity() * neg_obs_cov_min_;
+          return gmm;
+        }
+        std::uniform_real_distribution<double> udist(0.0, sum_d2);
+        double r = udist(rng);
+        double acc = 0.0;
+        int sel = indices[N - 1];
+        for (int n = 0; n < N; ++n) {
+          acc += d2[n];
+          if (acc >= r) { sel = indices[n]; break; }
+        }
+        chosen.push_back(sel);
+      }
+      for (int c = 0; c < C; ++c) {
+        gmm.means[c] = particles.col(chosen[c]).head(3);
+        gmm.covs[c] = Eigen::Matrix3d::Identity() * neg_obs_cov_min_;
+      }
     }
 
     // EM迭代
@@ -678,7 +721,10 @@ public:
           gmm.covs[c] += resp(n, c) * diff * diff.transpose();
         }
         gmm.covs[c] /= Nc;
-        gmm.covs[c] += Eigen::Matrix3d::Identity() * 1e-4; // 正定保证
+        // 协方差下界：确保每个分量至少覆盖 neg_obs_cov_min_ 半径（默认4.0 m²）
+        for (int j = 0; j < 3; ++j)
+          gmm.covs[c](j, j) = std::max(gmm.covs[c](j, j), neg_obs_cov_min_);
+        gmm.covs[c] += Eigen::Matrix3d::Identity() * 1e-4;
       }
     }
     // 归一化权重
@@ -698,8 +744,6 @@ public:
     // 合并两个无效GMM的所有分量
     std::vector<Eigen::Vector3d> all_mu;
     std::vector<Eigen::Matrix3d> all_cov_inv;
-    std::vector<double> all_norm;
-    std::vector<double> all_w;
 
     auto addComponents = [&](const InvalidGMM3D& gmm) {
       for (int c = 0; c < gmm.C; ++c) {
@@ -707,8 +751,6 @@ public:
         if (det < 1e-30) continue;
         all_mu.push_back(gmm.means[c]);
         all_cov_inv.push_back(gmm.covs[c].inverse());
-        all_norm.push_back(1.0 / std::sqrt(std::pow(2.0 * M_PI, 3) * det));
-        all_w.push_back(gmm.weights(c));
       }
     };
     addComponents(neg_obs_gmm);
@@ -716,29 +758,17 @@ public:
 
     if (all_mu.empty()) return;
 
-    // 自动计算阈值：取所有分量峰值密度的中位数作为参考
-    if (p_threshold <= 0) {
-      std::vector<double> peaks;
-      for (size_t c = 0; c < all_mu.size(); ++c) {
-        peaks.push_back(all_w[c] * all_norm[c]); // 分量中心处的密度
-      }
-      std::sort(peaks.begin(), peaks.end());
-      p_threshold = peaks[peaks.size() / 2] * 0.5; // 峰值中位数的一半
-      if (p_threshold < 1e-10) p_threshold = 1e-10;
-    }
-
-    // 对每个粒子计算无效密度并衰减权重
+    // 对每个粒子：若马氏距离 < mahal_thresh（默认2.0σ）则裁剪
+    const double mahal_thresh2 = 2.0 * 2.0; // 马氏距离平方阈值
     for (int i = 0; i < N; ++i) {
       Eigen::Vector3d pos = particles.col(i).head(3);
-      double p_invalid = 0.0;
+      bool invalid = false;
       for (size_t c = 0; c < all_mu.size(); ++c) {
         Eigen::Vector3d diff = pos - all_mu[c];
-        double exponent = -0.5 * diff.transpose() * all_cov_inv[c] * diff;
-        p_invalid += all_w[c] * all_norm[c] * std::exp(exponent);
+        double mahal2 = diff.transpose() * all_cov_inv[c] * diff;
+        if (mahal2 < mahal_thresh2) { invalid = true; break; }
       }
-      double ratio = p_invalid / p_threshold;
-      double factor = std::max(0.0, 1.0 - ratio);
-      weights(i) *= factor;
+      if (invalid) weights(i) = 0.0;
     }
 
     // 归一化权重
@@ -779,15 +809,51 @@ public:
     search_gmm_pi_.setConstant(C, 1.0 / C);
     search_gmm_mu_.resize(C);
     search_gmm_S_.resize(C);
-    // 用加权均值初始化
+
+    // k-means++ 初始化：从粒子中按加权距离采样，保证分量分散
+    double w_sum = weights.sum();
+    Eigen::VectorXd w_norm(N);
+    if (w_sum > 1e-30) w_norm = weights / w_sum;
+    else w_norm.setConstant(1.0 / N);
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+
+    // 第一个分量：按权重随机选一个粒子
+    {
+      double u = uniform(rng_), cum = 0.0;
+      int sel = N - 1;
+      for (int i = 0; i < N; ++i) { cum += w_norm(i); if (u <= cum) { sel = i; break; } }
+      search_gmm_mu_[0] = particles.col(sel).head(nx6_);
+    }
+    // 后续分量：按到已选分量的最小距离加权采样
+    for (int c = 1; c < C; ++c) {
+      Eigen::VectorXd dist2(N);
+      for (int i = 0; i < N; ++i) {
+        double min_d2 = 1e30;
+        for (int cc = 0; cc < c; ++cc) {
+          double d2 = (particles.col(i).head(nx6_) - search_gmm_mu_[cc]).squaredNorm();
+          min_d2 = std::min(min_d2, d2);
+        }
+        dist2(i) = w_norm(i) * min_d2;
+      }
+      double d_sum = dist2.sum();
+      if (d_sum < 1e-30) { search_gmm_mu_[c] = search_gmm_mu_[0]; continue; }
+      double u = uniform(rng_) * d_sum, cum = 0.0;
+      int sel = N - 1;
+      for (int i = 0; i < N; ++i) { cum += dist2(i); if (u <= cum) { sel = i; break; } }
+      search_gmm_mu_[c] = particles.col(sel).head(nx6_);
+    }
+    // 协方差初始化：用粒子实际方差，位置方向至少1.0，速度方向至少0.25
     Eigen::VectorXd mean6 = Eigen::VectorXd::Zero(nx6_);
-    for (int i = 0; i < N; ++i) mean6 += weights(i) * particles.col(i).head(nx6_);
+    for (int i = 0; i < N; ++i) mean6 += w_norm(i) * particles.col(i).head(nx6_);
+    Eigen::VectorXd var6 = Eigen::VectorXd::Zero(nx6_);
+    for (int i = 0; i < N; ++i) {
+      Eigen::VectorXd d = particles.col(i).head(nx6_) - mean6;
+      var6 += w_norm(i) * d.cwiseProduct(d);
+    }
     for (int c = 0; c < C; ++c) {
-      search_gmm_mu_[c] = mean6;
-      // 加随机扰动区分各分量
-      std::normal_distribution<double> dist(0.0, 0.3);
-      for (int j = 0; j < nx6_; ++j) search_gmm_mu_[c](j) += dist(rng_);
-      search_gmm_S_[c] = Eigen::MatrixXd::Identity(nx6_, nx6_) * 0.5;
+      search_gmm_S_[c] = Eigen::MatrixXd::Identity(nx6_, nx6_);
+      for (int j = 0; j < nx6_; ++j)
+        search_gmm_S_[c](j, j) = std::max(var6(j), (j < 3) ? 1.0 : 0.25);
     }
     // 初始化共识状态
     search_zeta_alpha_ = search_gmm_pi_ * N;
@@ -882,6 +948,9 @@ public:
       search_gmm_pi_(c) = search_zeta_alpha_(c) / alpha_sum;
       search_gmm_mu_[c] = search_zeta_a_[c] / search_zeta_alpha_(c);
       search_gmm_S_[c] = search_zeta_b_[c] / search_zeta_alpha_(c);
+      // 协方差下界：位置1.0（std=1m），速度0.25，防止E步覆盖范围收缩导致退化
+      for (int j = 0; j < nx6_; ++j)
+        search_gmm_S_[c](j, j) = std::max(search_gmm_S_[c](j, j), (j < 3) ? 1.0 : 0.25);
       search_gmm_S_[c] += Eigen::MatrixXd::Identity(nx6_, nx6_) * 1e-4;
     }
     double pi_sum = search_gmm_pi_.sum();
@@ -1779,6 +1848,7 @@ private:
   // 相机内参（用于负观测权重更新）
   double cam_fx_, cam_fy_, cam_cx_, cam_cy_;
   double cam_width_, cam_height_, cam_max_range_;
+  double neg_obs_cov_min_ = 4.0;  // neg_obs GMM协方差对角下界（m²），控制裁剪范围
 
   // 随机数生成器
   std::mt19937 rng_;

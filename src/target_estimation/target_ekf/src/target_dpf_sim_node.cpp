@@ -48,7 +48,8 @@ ros::Publisher target_odom_pub_;
 ros::Publisher local_stats_pub_;
 ros::Publisher labeled_consensus_pub_;
 ros::Publisher search_state_pub_;
-ros::Publisher search_particles_vis_pub_;
+ros::Publisher search_particles_vis_pub_;      // 动力学后粒子云
+ros::Publisher search_particles_pruned_pub_;   // 裁剪后粒子云
 ros::Publisher search_gmm_vis_pub_; // 搜索GMM分布可视化发布器
 ros::Publisher search_pos_gmm_pub_;  // 位置GMM发布器
 ros::Publisher search_targets_pub_;  // 搜索目标点发布器
@@ -652,7 +653,21 @@ InvalidGMM3D unionGMMs(const InvalidGMM3D& local, const std::map<int, InvalidGMM
     merged_counts.push_back(count);
   }
 
-  // 3. 构建结果，等权重
+  // 3. 构建结果，等权重，最多保留 max_C 个分量（按 count 降序）
+  const int max_C = 12;
+  if ((int)merged_means.size() > max_C) {
+    // 按合并数量降序排序，保留最显著的分量
+    std::vector<int> order(merged_means.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(),
+              [&](int a, int b) { return merged_counts[a] > merged_counts[b]; });
+    order.resize(max_C);
+    std::vector<Eigen::Vector3d> top_means;
+    std::vector<Eigen::Matrix3d> top_covs;
+    for (int idx : order) { top_means.push_back(merged_means[idx]); top_covs.push_back(merged_covs[idx]); }
+    merged_means = top_means;
+    merged_covs  = top_covs;
+  }
   InvalidGMM3D result;
   result.C = merged_means.size();
   result.weights.setConstant(result.C, 1.0 / result.C);
@@ -1173,17 +1188,52 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     }
     last_search_update = ros::Time::now();
 
-    // 从6D共识GMM采样新粒子（高权重区域粒子多，已观测区域粒子被淘汰）
-    search_particles_manager_->sampleParticlesFromSearchGMM(
-        dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_);
+    // 诊断步计数（每5步打印一次，约1Hz）
+    static int diag_step_counter = 0;
+    ++diag_step_counter;
+    const bool do_diag = (diag_step_counter % 5 == 1);
 
-    // 粒子动力学更新
+    // 粒子退化时从GMM补充（存活粒子 < 阈值才重采样，不做定期重采样）
+    // 注意：退化检查放在裁剪之后（见下方），这里只做动力学更新前的补充
+    // 动力学更新
     search_particles_manager_->searchParticlesDynamicsUpdate(dpfPtr_->particles_, dpfPtr_->N_);
+
+    // --- 诊断1：动力学后粒子分布 ---
+    if (do_diag) {
+      Eigen::Vector3d pmean = dpfPtr_->particles_.topRows(3).rowwise().mean();
+      double pvar = 0.0;
+      for (int _i = 0; _i < dpfPtr_->N_; ++_i)
+        pvar += (dpfPtr_->particles_.col(_i).head(3) - pmean).squaredNorm();
+      pvar /= dpfPtr_->N_;
+      ROS_INFO("[dpf%d][1/4] 动力学后: 粒子均值=(%.1f,%.1f,%.1f) 方差=%.1f",
+          drone_id_, pmean.x(), pmean.y(), pmean.z(), pvar);
+      // 发布动力学后粒子云（白色）
+      pcl::PointCloud<pcl::PointXYZRGB> _cloud;
+      _cloud.header.frame_id = "world";
+      for (int _i = 0; _i < dpfPtr_->N_; ++_i) {
+        pcl::PointXYZRGB _pt;
+        _pt.x = dpfPtr_->particles_(0, _i);
+        _pt.y = dpfPtr_->particles_(1, _i);
+        _pt.z = dpfPtr_->particles_(2, _i);
+        _pt.r = 200; _pt.g = 200; _pt.b = 200;
+        _cloud.push_back(_pt);
+      }
+      sensor_msgs::PointCloud2 _msg;
+      pcl::toROSMsg(_cloud, _msg);
+      _msg.header.stamp = ros::Time::now();
+      search_particles_vis_pub_.publish(_msg);
+    }
 
     // 粒子分类：负观测无效 + 障碍无效
     auto classification = search_particles_manager_->classifyInvalidParticles(
         dpfPtr_->particles_, dpfPtr_->N_, cam_p, cam_q,
         [](const Eigen::Vector3d& p) { return occMap_.isOccupied(p); });
+
+    // --- 诊断2：分类结果 ---
+    if (do_diag)
+      ROS_INFO("[dpf%d][2/4] 分类: neg_obs=%zu obstacle=%zu / total=%d",
+          drone_id_, classification.neg_obs_indices.size(),
+          classification.obstacle_indices.size(), dpfPtr_->N_);
 
     // 拟合本地3D无效区域GMM（每类最多3个分量）
     auto local_neg_obs_gmm = search_particles_manager_->fitGMM3D(
@@ -1200,6 +1250,13 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     // 并集共识
     {
       std::lock_guard<std::mutex> lock(invalid_gmm_mutex_);
+      // 本机负观测先存入缓存，确保本帧参与 union
+      if (local_neg_obs_gmm.C > 0) {
+        TimedInvalidGMM3D self_timed;
+        self_timed.gmm = local_neg_obs_gmm;
+        self_timed.stamp = ros::Time::now();
+        received_neg_obs_gmms_[drone_id_] = self_timed;
+      }
       // 负观测GMM：TTL缓存内有效，超时自动清理
       std::map<int, InvalidGMM3D> fresh_neg_obs_gmms;
       const ros::Time now = ros::Time::now();
@@ -1212,7 +1269,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
           it = received_neg_obs_gmms_.erase(it);
         }
       }
-      global_neg_obs_gmm_ = unionGMMs(local_neg_obs_gmm, fresh_neg_obs_gmms);
+      global_neg_obs_gmm_ = unionGMMs(InvalidGMM3D(), fresh_neg_obs_gmms);
 
       // 障碍GMM：持久留存，更新本机的，保留历史邻居的
       received_obstacle_gmms_[drone_id_] = local_obstacle_gmm;
@@ -1229,10 +1286,124 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     if (global_obstacle_gmm_.C > 0)
       invalid_gmm_pub_.publish(toInvalidGMMMsg(global_obstacle_gmm_, drone_id_, 1));
 
-    // 用全局无效GMM裁剪粒子权重
-    search_particles_manager_->pruneParticlesByInvalidGMM(
-        dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_,
-        global_neg_obs_gmm_, global_obstacle_gmm_);
+    // 本机裁剪：直接用分类结果置零（语义最准确，不依赖GMM时序）
+    for (int _i : classification.neg_obs_indices)
+      dpfPtr_->weights_(_i) = 0.0;
+    for (int _i : classification.obstacle_indices)
+      dpfPtr_->weights_(_i) = 0.0;
+
+    // 邻居neg_obs裁剪：用邻居的GMM做马氏距离裁剪（邻居没有本机FOV原始数据）
+    {
+      std::map<int, InvalidGMM3D> neighbor_gmms;
+      {
+        std::lock_guard<std::mutex> lock(invalid_gmm_mutex_);
+        for (auto& kv : received_neg_obs_gmms_)
+          if (kv.first != drone_id_) neighbor_gmms[kv.first] = kv.second.gmm;
+      }
+      if (!neighbor_gmms.empty()) {
+        InvalidGMM3D neighbor_neg_obs = unionGMMs(InvalidGMM3D(), neighbor_gmms);
+        if (neighbor_neg_obs.C > 0)
+          search_particles_manager_->pruneParticlesByInvalidGMM(
+              dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_,
+              neighbor_neg_obs, global_obstacle_gmm_);
+      }
+    }
+
+    // --- 诊断3：裁剪后存活粒子 + 漏裁检查 ---
+    if (do_diag) {
+      double w_sum = dpfPtr_->weights_.sum();
+      int alive = 0;
+      Eigen::Vector3d wmean = Eigen::Vector3d::Zero();
+      for (int _i = 0; _i < dpfPtr_->N_; ++_i) {
+        if (dpfPtr_->weights_(_i) > 1e-30) {
+          ++alive;
+          wmean += dpfPtr_->weights_(_i) * dpfPtr_->particles_.col(_i).head(3);
+        }
+      }
+      if (w_sum > 1e-30) wmean /= w_sum;
+      double wvar = 0.0;
+      for (int _i = 0; _i < dpfPtr_->N_; ++_i) {
+        if (dpfPtr_->weights_(_i) > 1e-30)
+          wvar += dpfPtr_->weights_(_i) * (dpfPtr_->particles_.col(_i).head(3) - wmean).squaredNorm();
+      }
+      if (w_sum > 1e-30) wvar /= w_sum;
+      // 漏裁检查：neg_obs粒子（在FOV内）裁剪后权重是否真的为0
+      int fov_leaked = 0;
+      for (int _i : classification.neg_obs_indices)
+        if (dpfPtr_->weights_(_i) > 1e-30) ++fov_leaked;
+      int obs_leaked = 0;
+      for (int _i : classification.obstacle_indices)
+        if (dpfPtr_->weights_(_i) > 1e-30) ++obs_leaked;
+      ROS_INFO("[dpf%d][3/4] 裁剪后: alive=%d/%d 方差=%.1f | 漏裁: FOV内=%d/%zu 障碍内=%d/%zu",
+          drone_id_, alive, dpfPtr_->N_, wvar,
+          fov_leaked, classification.neg_obs_indices.size(),
+          obs_leaked, classification.obstacle_indices.size());
+      // 发布裁剪后粒子云（绿=存活，红=死亡）
+      pcl::PointCloud<pcl::PointXYZRGB> _cloud2;
+      _cloud2.header.frame_id = "world";
+      for (int _i = 0; _i < dpfPtr_->N_; ++_i) {
+        pcl::PointXYZRGB _pt;
+        _pt.x = dpfPtr_->particles_(0, _i);
+        _pt.y = dpfPtr_->particles_(1, _i);
+        _pt.z = dpfPtr_->particles_(2, _i);
+        if (dpfPtr_->weights_(_i) > 1e-30) { _pt.r = 0; _pt.g = 220; _pt.b = 80; }
+        else                               { _pt.r = 220; _pt.g = 40; _pt.b = 40; }
+        _cloud2.push_back(_pt);
+      }
+      sensor_msgs::PointCloud2 _msg2;
+      pcl::toROSMsg(_cloud2, _msg2);
+      _msg2.header.stamp = ros::Time::now();
+      search_particles_pruned_pub_.publish(_msg2);
+    }
+    // 裁剪后退化检查：存活粒子 < 20% 时从GMM补充
+    {
+      int alive_count = 0;
+      for (int _i = 0; _i < dpfPtr_->N_; ++_i)
+        if (dpfPtr_->weights_(_i) > 1e-30) ++alive_count;
+      if (alive_count < dpfPtr_->N_ / 5) {
+        search_particles_manager_->sampleParticlesFromSearchGMM(
+            dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_);
+        ROS_WARN("[dpf%d] 粒子退化(alive=%d/%d)，从GMM重采样",
+            drone_id_, alive_count, dpfPtr_->N_);
+      }
+    }
+    // --- 诊断4：GMM拟合质量（从GMM重采样 vs 存活粒子分布差距） ---
+    if (do_diag) {
+      // 存活粒子的加权均值和方差
+      double w_sum2 = dpfPtr_->weights_.sum();
+      Eigen::Vector3d p_mean = Eigen::Vector3d::Zero();
+      for (int _i = 0; _i < dpfPtr_->N_; ++_i)
+        if (dpfPtr_->weights_(_i) > 1e-30)
+          p_mean += dpfPtr_->weights_(_i) * dpfPtr_->particles_.col(_i).head(3);
+      if (w_sum2 > 1e-30) p_mean /= w_sum2;
+      double p_var = 0.0;
+      for (int _i = 0; _i < dpfPtr_->N_; ++_i)
+        if (dpfPtr_->weights_(_i) > 1e-30)
+          p_var += dpfPtr_->weights_(_i) * (dpfPtr_->particles_.col(_i).head(3) - p_mean).squaredNorm();
+      if (w_sum2 > 1e-30) p_var /= w_sum2;
+      // 从当前GMM重采样200个粒子，计算其均值和方差
+      Eigen::MatrixXd tmp_p(6, 200);
+      Eigen::VectorXd tmp_w(200);
+      tmp_w.setConstant(1.0 / 200);
+      search_particles_manager_->sampleParticlesFromSearchGMM(tmp_p, tmp_w, 200);
+      Eigen::Vector3d g_mean = tmp_p.topRows(3).rowwise().mean();
+      double g_var = 0.0;
+      for (int _i = 0; _i < 200; ++_i)
+        g_var += (tmp_p.col(_i).head(3) - g_mean).squaredNorm();
+      g_var /= 200;
+      double mean_err = (g_mean - p_mean).norm();
+      double var_ratio = (p_var > 1e-6) ? g_var / p_var : 0.0;
+      // GMM分量信息
+      int C = search_particles_manager_->getSearchC();
+      const auto& za = search_particles_manager_->getSearchZetaAlpha();
+      int dead_c = 0;
+      for (int _c = 0; _c < C; ++_c) if (za(_c) < 1e-30) ++dead_c;
+      ROS_INFO("[dpf%d][4/4] GMM拟合: C=%d dead=%d | 粒子均值=(%.1f,%.1f) var=%.1f | GMM采样均值=(%.1f,%.1f) var=%.1f | 均值偏差=%.2fm var比=%.2f",
+          drone_id_, C, dead_c,
+          p_mean.x(), p_mean.y(), p_var,
+          g_mean.x(), g_mean.y(), g_var,
+          mean_err, var_ratio);
+    }
 
     // === 方向承诺式搜索：定期提取热点确定方向，中间沿方向推进 ===
     const ros::Time now = ros::Time::now();
@@ -1833,6 +2004,7 @@ int main(int argc, char** argv) {
   search_pos_gmm_pub_ = nh.advertise<target_ekf::LocalStats>("search_pos_gmm", 1);
   search_gmm_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>("search_gmm_vis", 1);
   search_particles_vis_pub_ = nh.advertise<sensor_msgs::PointCloud2>("search_particles_vis", 1);
+  search_particles_pruned_pub_ = nh.advertise<sensor_msgs::PointCloud2>("search_particles_pruned", 1);
   search_targets_pub_ = nh.advertise<geometry_msgs::PoseArray>("search_targets", 1);
   search_label_info_pub_ = nh.advertise<target_ekf::SearchLabelInfo>("search_label_info", 1);
   invalid_gmm_pub_ = nh.advertise<target_ekf::InvalidRegionGMM>("invalid_region_gmm", 1);

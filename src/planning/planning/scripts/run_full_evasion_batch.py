@@ -225,6 +225,10 @@ def build_default_topics(drone_count):
         topics.append(f'/drone{i}/drone{i}_target_dpf/search_targets')
     for i in range(drone_count):
         topics.append(f'/drone{i}/replanState')
+    # 粒子云诊断topic（动力学后 + 裁剪后）
+    for i in range(drone_count):
+        topics.append(f'/drone{i}/drone{i}_target_dpf/search_particles_vis')
+        topics.append(f'/drone{i}/drone{i}_target_dpf/search_particles_pruned')
     return topics
 
 
