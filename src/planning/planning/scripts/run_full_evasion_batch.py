@@ -218,6 +218,12 @@ def build_default_topics(drone_count):
     for i in range(drone_count):
         topics.append(f'/drone{i}/drone{i}_target_dpf/search_state')
     for i in range(drone_count):
+        topics.append(f'/drone{i}/drone{i}_target_dpf/search_pos_gmm')
+    for i in range(drone_count):
+        topics.append(f'/drone{i}/drone{i}_target_dpf/invalid_region_gmm')
+    for i in range(drone_count):
+        topics.append(f'/drone{i}/drone{i}_target_dpf/search_targets')
+    for i in range(drone_count):
         topics.append(f'/drone{i}/replanState')
     return topics
 

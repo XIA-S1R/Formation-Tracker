@@ -1223,6 +1223,12 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
         drone_id_, classification.neg_obs_indices.size(), classification.obstacle_indices.size(),
         global_neg_obs_gmm_.C, global_obstacle_gmm_.C);
 
+    // 发布全局无效GMM（用于bag录制）
+    if (global_neg_obs_gmm_.C > 0)
+      invalid_gmm_pub_.publish(toInvalidGMMMsg(global_neg_obs_gmm_, drone_id_, 0));
+    if (global_obstacle_gmm_.C > 0)
+      invalid_gmm_pub_.publish(toInvalidGMMMsg(global_obstacle_gmm_, drone_id_, 1));
+
     // 用全局无效GMM裁剪粒子权重
     search_particles_manager_->pruneParticlesByInvalidGMM(
         dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_,
@@ -1349,6 +1355,40 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
           drone_id_, committed_target_pos_.x(), committed_target_pos_.y(), committed_target_pos_.z(),
           committed_search_dir_.x(), committed_search_dir_.y(),
           time_since_extract, current_hotspot_extract_interval_sec_);
+    }
+
+    // 发布搜索GMM（用于bag录制和可视化）
+    {
+      int C = search_particles_manager_->getSearchC();
+      const auto& za = search_particles_manager_->getSearchZetaAlpha();
+      const auto& zav = search_particles_manager_->getSearchZetaA();
+      const auto& zbv = search_particles_manager_->getSearchZetaB();
+      if (C > 0 && (int)za.size() == C) {
+        target_ekf::LocalStats gmm_msg;
+        gmm_msg.header.stamp = ros::Time::now();
+        gmm_msg.header.frame_id = "world";
+        gmm_msg.drone_id = drone_id_;
+        gmm_msg.num_components = C;
+        gmm_msg.state_dim = 6;
+        gmm_msg.obs_dim = 0;
+        gmm_msg.has_observation = false;
+        // 用 zeta_alpha/a/b 直接作为 GMM 参数发布（M步后 mu_c = zeta_a[c]/zeta_alpha[c]）
+        gmm_msg.zeta_alpha.resize(C);
+        gmm_msg.zeta_a.resize(C * 6);
+        gmm_msg.zeta_b.resize(C * 36);
+        for (int c = 0; c < C; ++c) {
+          gmm_msg.zeta_alpha[c] = za(c);
+          if (c < (int)zav.size() && zav[c].size() == 6) {
+            for (int i = 0; i < 6; ++i) gmm_msg.zeta_a[c * 6 + i] = zav[c](i);
+          }
+          if (c < (int)zbv.size() && zbv[c].rows() == 6) {
+            for (int i = 0; i < 6; ++i)
+              for (int j = 0; j < 6; ++j)
+                gmm_msg.zeta_b[c * 36 + i * 6 + j] = zbv[c](i, j);
+          }
+        }
+        search_pos_gmm_pub_.publish(gmm_msg);
+      }
     }
 
     // 发布搜索状态
