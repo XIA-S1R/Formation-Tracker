@@ -28,29 +28,6 @@ struct SearchParticle {
   int particle_id;
 };
 
-// 标签化统计量结构体（用于分标签共识）
-struct LabeledLocalStat {
-  int drone_id;
-  SearchIntent label;     // 标签类型
-  int C;        // GMM 分量数
-  int nx;       // 状态维度 = 9 (GMM拟合此空间)
-  Eigen::VectorXd alpha;              // [C] 对应 kα_{m,c}^t
-  std::vector<Eigen::VectorXd> a;     // C 个 [nx] 向量 对应 a_{m,c}^t
-  std::vector<Eigen::MatrixXd> b;     // C 个 [nx x nx] 矩阵 对应 b_{m,c}^t
-  bool has_obs;
-  ros::Time timestamp;  // 时间戳，用于时间同步
-};
-
-// 标签化邻居共识状态结构体
-struct LabeledNeighborConsensus {
-  SearchIntent label;   // 标签类型
-  Eigen::VectorXd zeta_alpha;
-  std::vector<Eigen::VectorXd> zeta_a;
-  std::vector<Eigen::MatrixXd> zeta_b;
-  bool has_obs;
-  ros::Time timestamp;
-};
-
 // 搜索粒子管理类
 class SearchParticlesManager {
 public:
@@ -59,9 +36,6 @@ public:
     : drone_id_(drone_id),
       num_components_(num_components),
       search_particles_initialized_(false),
-      my_label_(static_cast<SearchIntent>(drone_id % 3)),  // 根据ID分配标签
-      is_label_master_(drone_id < 3),                       // 前3架是掌管者
-      frames_since_init_(0),
       search_dt_(0.2),  // 搜索模式更新周期，5Hz
       search_vmax_(2),        // 最大速度 m/s (默认值)
       search_vmin_(0.5),        // 最小速度 m/s
@@ -526,30 +500,6 @@ public:
     return num_components_;
   }
 
-  // 获取本无人机负责的标签
-  SearchIntent getMyLabel() const {
-    return my_label_;
-  }
-
-  // 是否是该标签的掌管者
-  bool isLabelMaster() const {
-    return is_label_master_;
-  }
-
-  // 获取标签名称（用于日志）
-  static const char* getLabelName(SearchIntent label) {
-    static const char* names[] = {"STRAIGHT", "LEFT_TURN", "RIGHT_TURN"};
-    return names[static_cast<int>(label)];
-  }
-
-  // 设置标签分配结果（由匈牙利算法计算后调用）
-  void setLabelAssignment(SearchIntent label, bool is_master) {
-    my_label_ = label;
-    is_label_master_ = is_master;
-    ROS_INFO("[sp_mgr%d] Label assignment updated: %s, is_master=%d",
-             drone_id_, getLabelName(label), is_master);
-  }
-
   // 新搜索方案：粒子动力学更新
   // 水平速度方向加扰动，速度大小从[0.5*vmax, vmax]均匀采样，步进dt
   void searchParticlesDynamicsUpdate(Eigen::MatrixXd& particles, int N) {
@@ -571,183 +521,376 @@ public:
     }
   }
 
-  // === 3D无效区域GMM结构体 ===
-  struct InvalidGMM3D {
-    int C = 0;
-    Eigen::VectorXd weights;
-    std::vector<Eigen::Vector3d> means;
-    std::vector<Eigen::Matrix3d> covs;
-  };
+  // === 虚拟栅格无效区域结构体 ===
+  // cells: 0=未知, 1=负观测无效, 2=障碍无效
+  // cell_times: 负观测格最近一次被标记为无效的时间戳（秒）
+  // dist_field: 有符号欧氏距离场（米），无效格内为负，有效格内为正
+  //             需在每帧 unionWith 后调用 computeDistField() 更新
+  struct InvalidGrid2D {
+    double origin_x = 0.0;
+    double origin_y = 0.0;
+    double resolution = 1.0;
+    int nx = 0;
+    int ny = 0;
+    std::vector<uint8_t> cells;       // 行优先: cells[iy*nx + ix]
+    std::vector<double>  cell_times;  // 同尺寸，负观测格最近标记时间（秒）
+    std::vector<float>   dist_field;  // 有符号距离场（米）
 
-  // === 粒子分类：找出负观测无效粒子和障碍无效粒子的索引 ===
-  // neg_obs_indices: 在FOV内且视线无遮挡的粒子（能看到但没目标）
-  // obstacle_indices: 在局部地图障碍内的粒子
-  struct ParticleClassification {
-    std::vector<int> neg_obs_indices;
-    std::vector<int> obstacle_indices;
-  };
+    bool valid() const {
+      return nx > 0 && ny > 0
+          && (int)cells.size() == nx * ny
+          && cell_times.size() == cells.size();
+    }
 
-  // is_occupied: 外部传入的占据检查函数
-  ParticleClassification classifyInvalidParticles(
-      const Eigen::MatrixXd& particles, int N,
-      const Eigen::Vector3d& cam_p, const Eigen::Quaterniond& cam_q,
-      std::function<bool(const Eigen::Vector3d&)> is_occupied) {
-    ParticleClassification result;
-    Eigen::Matrix3d R_cam_inv = cam_q.toRotationMatrix().transpose();
+    void toCell(double wx, double wy, int& ix, int& iy) const {
+      ix = static_cast<int>(std::floor((wx - origin_x) / resolution));
+      iy = static_cast<int>(std::floor((wy - origin_y) / resolution));
+    }
 
-    for (int i = 0; i < N; ++i) {
-      Eigen::Vector3d p = particles.col(i).head(3);
+    bool inBounds(int ix, int iy) const {
+      return ix >= 0 && ix < nx && iy >= 0 && iy < ny;
+    }
 
-      // 障碍检查
-      if (is_occupied(p)) {
-        result.obstacle_indices.push_back(i);
-        continue; // 障碍内的粒子不再做FOV检查
+    uint8_t get(int ix, int iy) const { return cells[iy * nx + ix]; }
+
+    void set(int ix, int iy, uint8_t val, double stamp_sec = 0.0) {
+      int idx = iy * nx + ix;
+      cells[idx] = val;
+      if (val == 1) {
+        cell_times[idx] = stamp_sec;
+      } else {
+        cell_times[idx] = 0.0;
+      }
+    }
+
+    bool isInvalid(double wx, double wy, double now_sec, double ttl_sec) const {
+      if (!valid()) return false;
+      int ix, iy;
+      toCell(wx, wy, ix, iy);
+      if (!inBounds(ix, iy)) return false;
+      int idx = iy * nx + ix;
+      uint8_t v = cells[idx];
+      if (v == 2) return true;
+      if (v == 1) {
+        const double t = cell_times[idx];
+        return t > 0.0 && (now_sec - t) <= ttl_sec;
+      }
+      return false;
+    }
+
+    int clearExpiredNegObs(double now_sec, double ttl_sec) {
+      if (!valid()) return 0;
+      int cleared = 0;
+      const int n = nx * ny;
+      for (int i = 0; i < n; ++i) {
+        if (cells[i] != 1) continue;
+        const double t = cell_times[i];
+        if (t <= 0.0 || (now_sec - t) > ttl_sec) {
+          cells[i] = 0;
+          cell_times[i] = 0.0;
+          ++cleared;
+        }
+      }
+      return cleared;
+    }
+
+    // Felzenszwalb 1D 精确平方距离变换（沿一个轴）
+    // f_get(q): 输入，q 处的初始平方距离（障碍格=0，其余=INF）
+    // f_set(q, val): 输出，写入 q 处的最终平方距离
+    template<typename FGet, typename FSet>
+    static void fill1DESDF(FGet f_get, FSet f_set, int start, int end) {
+      int n = end - start + 1;
+      if (n <= 0) return;
+      const double INF = 1e18;
+      std::vector<int>    v(n);
+      std::vector<double> z(n + 1);
+      int k = 0;
+      v[0] = start; z[0] = -INF; z[1] = INF;
+      auto sep = [&](int q, int vk) -> double {
+        return ((f_get(q) + (double)q * q) - (f_get(vk) + (double)vk * vk))
+             / (2.0 * (q - vk));
+      };
+      for (int q = start + 1; q <= end; ++q) {
+        double s = sep(q, v[k]);
+        while (k > 0 && s <= z[k]) {
+          --k;
+          s = sep(q, v[k]);
+        }
+        ++k;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = INF;
+      }
+      k = 0;
+      for (int q = start; q <= end; ++q) {
+        while (z[k+1] < q) ++k;
+        double val = (double)(q - v[k])*(q - v[k]) + f_get(v[k]);
+        f_set(q, val);
+      }
+    }
+
+    // 计算有符号欧氏距离场（Felzenszwalb 2D，Y轴→X轴两遍扫描）
+    // 无效格（考虑TTL）内为负距离，有效格内为正距离，单位：米
+    void computeDistField(double now_sec, double ttl_sec) {
+      const int n = nx * ny;
+      const double INF = 1e18;
+      const double res = resolution;
+
+      // 标记当前哪些格是无效的
+      std::vector<bool> inv(n, false);
+      for (int i = 0; i < n; ++i) {
+        uint8_t v = cells[i];
+        if (v == 2) { inv[i] = true; continue; }
+        if (v == 1) {
+          const double t = cell_times[i];
+          inv[i] = (t > 0.0 && (now_sec - t) <= ttl_sec);
+        }
       }
 
-      // FOV + 视线检查
-      Eigen::Vector3d p_in_cam = R_cam_inv * (p - cam_p);
-      if (p_in_cam.z() > 0.1 && p_in_cam.z() < cam_max_range_) {
-        double u = p_in_cam.x() * cam_fx_ / p_in_cam.z() + cam_cx_;
-        double v = p_in_cam.y() * cam_fy_ / p_in_cam.z() + cam_cy_;
-        if (u >= 0 && u <= cam_width_ && v >= 0 && v <= cam_height_) {
-          // 在FOV内，检查视线
-          if (los_check_fn_ && los_check_fn_(cam_p, p)) {
-            result.neg_obs_indices.push_back(i);
+      // 辅助 lambda：对给定"障碍"标记做 2D 距离变换（Felzenszwalb，Y→X）
+      // 返回每格到最近"障碍"格的欧氏距离（米）
+      auto computeEDT = [&](const std::vector<bool>& obstacle) -> std::vector<double> {
+        std::vector<double> tmp(n, INF);  // 中间结果（Y轴变换后）
+        std::vector<double> out(n, INF);  // 最终结果（X轴变换后）
+
+        // Pass 1: 沿 Y 轴（每列独立）
+        for (int ix = 0; ix < nx; ++ix) {
+          fill1DESDF(
+            [&](int iy) { return obstacle[iy * nx + ix] ? 0.0 : INF; },
+            [&](int iy, double val) { tmp[iy * nx + ix] = val; },
+            0, ny - 1);
+        }
+        // Pass 2: 沿 X 轴（每行独立）
+        for (int iy = 0; iy < ny; ++iy) {
+          fill1DESDF(
+            [&](int ix) { return tmp[iy * nx + ix]; },
+            [&](int ix, double val) { out[iy * nx + ix] = val; },
+            0, nx - 1);
+        }
+        // 平方距离 → 欧氏距离（米）
+        for (int i = 0; i < n; ++i)
+          out[i] = (out[i] < INF * 0.5) ? res * std::sqrt(out[i]) : 1e9;
+        return out;
+      };
+
+      // 到最近无效格的距离（有效格用）
+      std::vector<double> dist_to_inv = computeEDT(inv);
+
+      // 到最近有效格的距离（无效格用）
+      std::vector<bool> valid_mask(n);
+      for (int i = 0; i < n; ++i) valid_mask[i] = !inv[i];
+      std::vector<double> dist_to_valid = computeEDT(valid_mask);
+
+      // 合并：有效格取正距离，无效格取负距离
+      dist_field.resize(n);
+      for (int i = 0; i < n; ++i) {
+        if (inv[i])
+          dist_field[i] = -static_cast<float>(dist_to_valid[i]);
+        else
+          dist_field[i] =  static_cast<float>(dist_to_inv[i]);
+      }
+    }
+
+    // 查询有符号距离（需先调用 computeDistField）
+    float signedDist(double wx, double wy) const {
+      int ix, iy;
+      toCell(wx, wy, ix, iy);
+      if (!inBounds(ix, iy) || dist_field.empty())
+        return static_cast<float>(resolution);
+      return dist_field[iy * nx + ix];
+    }
+
+    void unionWith(const InvalidGrid2D& other, double neg_obs_stamp_sec = -1.0) {
+      if (!other.valid()) return;
+      const bool aligned = (std::abs(origin_x - other.origin_x) < 1e-6 &&
+                            std::abs(origin_y - other.origin_y) < 1e-6 &&
+                            std::abs(resolution - other.resolution) < 1e-6 &&
+                            nx == other.nx && ny == other.ny);
+      if (aligned) {
+        int n = nx * ny;
+        for (int i = 0; i < n; ++i) {
+          uint8_t v = other.cells[i];
+          if (v == 0) continue;
+          if (v == 2) {
+            cells[i] = 2;
+            cell_times[i] = 0.0;
+            continue;
+          }
+          if (cells[i] == 2) continue;
+          const double stamp =
+              (neg_obs_stamp_sec >= 0.0) ? neg_obs_stamp_sec : other.cell_times[i];
+          if (cells[i] != 1 || stamp >= cell_times[i]) {
+            cells[i] = 1;
+            cell_times[i] = stamp;
+          }
+        }
+      } else {
+        for (int iy = 0; iy < other.ny; ++iy) {
+          for (int ix = 0; ix < other.nx; ++ix) {
+            uint8_t v = other.cells[iy * other.nx + ix];
+            if (v == 0) continue;
+            double wx = other.origin_x + (ix + 0.5) * other.resolution;
+            double wy = other.origin_y + (iy + 0.5) * other.resolution;
+            int my_ix, my_iy;
+            toCell(wx, wy, my_ix, my_iy);
+            if (!inBounds(my_ix, my_iy)) continue;
+            int idx = my_iy * nx + my_ix;
+            if (v == 2) {
+              cells[idx] = 2;
+              cell_times[idx] = 0.0;
+              continue;
+            }
+            if (cells[idx] == 2) continue;
+            const int other_idx = iy * other.nx + ix;
+            const double stamp =
+                (neg_obs_stamp_sec >= 0.0) ? neg_obs_stamp_sec : other.cell_times[other_idx];
+            if (cells[idx] != 1 || stamp >= cell_times[idx]) {
+              cells[idx] = 1;
+              cell_times[idx] = stamp;
+            }
           }
         }
       }
     }
-    return result;
+  };
+
+  // === 游程编码 / 解码 ===
+  // 编码 cells（uint8）数组
+  struct RLEGrid {
+    double origin_x, origin_y, resolution;
+    int nx, ny;
+    std::vector<int32_t>  values;  // cells 的游程值
+    std::vector<int32_t>  counts;  // 游程长度
+  };
+
+  static RLEGrid rleEncode(const InvalidGrid2D& grid) {
+    RLEGrid rle;
+    rle.origin_x = grid.origin_x;
+    rle.origin_y = grid.origin_y;
+    rle.resolution = grid.resolution;
+    rle.nx = grid.nx;
+    rle.ny = grid.ny;
+    if (!grid.valid()) return rle;
+    int n = grid.nx * grid.ny;
+    uint8_t  cur_val = grid.cells[0];
+    int32_t  cnt = 1;
+    for (int i = 1; i < n; ++i) {
+      if (grid.cells[i] == cur_val) {
+        ++cnt;
+      } else {
+        rle.values.push_back(static_cast<int32_t>(cur_val));
+        rle.counts.push_back(cnt);
+        cur_val = grid.cells[i];
+        cnt = 1;
+      }
+    }
+    rle.values.push_back(static_cast<int32_t>(cur_val));
+    rle.counts.push_back(cnt);
+    return rle;
   }
 
-  // === 对选定粒子的3D位置拟合GMM（简单EM）===
-  InvalidGMM3D fitGMM3D(const Eigen::MatrixXd& particles,
-                        const std::vector<int>& indices,
-                        int C, int max_iters = 15) {
-    InvalidGMM3D gmm;
-    int N = indices.size();
-    if (N < C || N < 3) {
-      gmm.C = 0;
-      return gmm;
-    }
-    gmm.C = C;
-    gmm.weights.setConstant(C, 1.0 / C);
-    gmm.means.resize(C);
-    gmm.covs.resize(C);
-
-    // 初始化：均匀间隔选取粒子作为初始均值
-    for (int c = 0; c < C; ++c) {
-      int idx = indices[c * N / C];
-      gmm.means[c] = particles.col(idx).head(3);
-      gmm.covs[c] = Eigen::Matrix3d::Identity() * 0.5;
-    }
-
-    // EM迭代
-    Eigen::MatrixXd resp(N, C); // 责任度矩阵
-    for (int iter = 0; iter < max_iters; ++iter) {
-      // E步
-      for (int n = 0; n < N; ++n) {
-        Eigen::Vector3d p = particles.col(indices[n]).head(3);
-        double total = 0.0;
-        for (int c = 0; c < C; ++c) {
-          Eigen::Vector3d diff = p - gmm.means[c];
-          double det = gmm.covs[c].determinant();
-          if (det < 1e-30) det = 1e-30;
-          Eigen::Matrix3d inv = gmm.covs[c].inverse();
-          double exponent = -0.5 * diff.transpose() * inv * diff;
-          double nc = 1.0 / std::sqrt(std::pow(2.0 * M_PI, 3) * det);
-          resp(n, c) = gmm.weights(c) * nc * std::exp(exponent);
-          total += resp(n, c);
-        }
-        if (total > 1e-300) resp.row(n) /= total;
-        else resp.row(n).setConstant(1.0 / C);
-      }
-      // M步
-      for (int c = 0; c < C; ++c) {
-        double Nc = resp.col(c).sum();
-        if (Nc < 1e-10) continue;
-        gmm.weights(c) = Nc / N;
-        gmm.means[c].setZero();
-        for (int n = 0; n < N; ++n) {
-          gmm.means[c] += resp(n, c) * particles.col(indices[n]).head(3);
-        }
-        gmm.means[c] /= Nc;
-        gmm.covs[c].setZero();
-        for (int n = 0; n < N; ++n) {
-          Eigen::Vector3d diff = particles.col(indices[n]).head(3) - gmm.means[c];
-          gmm.covs[c] += resp(n, c) * diff * diff.transpose();
-        }
-        gmm.covs[c] /= Nc;
-        gmm.covs[c] += Eigen::Matrix3d::Identity() * 1e-4; // 正定保证
+  static InvalidGrid2D rleDecode(const RLEGrid& rle) {
+    InvalidGrid2D grid;
+    grid.origin_x   = rle.origin_x;
+    grid.origin_y   = rle.origin_y;
+    grid.resolution = rle.resolution;
+    grid.nx = rle.nx;
+    grid.ny = rle.ny;
+    int total = rle.nx * rle.ny;
+    grid.cells.reserve(total);
+    grid.cell_times.reserve(total);
+    for (size_t i = 0; i < rle.values.size(); ++i) {
+      uint8_t v = static_cast<uint8_t>(rle.values[i]);
+      for (int32_t k = 0; k < rle.counts[i]; ++k) {
+        grid.cells.push_back(v);
+        grid.cell_times.push_back(0.0);
       }
     }
-    // 归一化权重
-    double wsum = gmm.weights.sum();
-    if (wsum > 1e-300) gmm.weights /= wsum;
-    return gmm;
+    return grid;
   }
 
-  // === 用无效区域GMM裁剪粒子权重 ===
-  // 对每个粒子，计算其3D位置在无效GMM下的概率密度，按比例衰减权重
-  // p_threshold: 密度超过此值时权重完全归零
-  void pruneParticlesByInvalidGMM(Eigen::MatrixXd& particles,
-                                   Eigen::VectorXd& weights, int N,
-                                   const InvalidGMM3D& neg_obs_gmm,
-                                   const InvalidGMM3D& obstacle_gmm,
-                                   double p_threshold = -1.0) {
-    // 合并两个无效GMM的所有分量
-    std::vector<Eigen::Vector3d> all_mu;
-    std::vector<Eigen::Matrix3d> all_cov_inv;
-    std::vector<double> all_norm;
-    std::vector<double> all_w;
+  // === 从粒子标记负观测无效格（仅负观测，障碍格由地图初始化负责）===
+  void markInvalidFromParticles(InvalidGrid2D& grid,
+                                const Eigen::MatrixXd& particles, int N,
+                                const Eigen::Vector3d& cam_p,
+                                const Eigen::Quaterniond& cam_q,
+                                double now_sec = 0.0) {
+    if (!grid.valid() || N <= 0) return;
+    Eigen::Matrix3d R_cw = cam_q.toRotationMatrix().transpose();
 
-    auto addComponents = [&](const InvalidGMM3D& gmm) {
-      for (int c = 0; c < gmm.C; ++c) {
-        double det = gmm.covs[c].determinant();
-        if (det < 1e-30) continue;
-        all_mu.push_back(gmm.means[c]);
-        all_cov_inv.push_back(gmm.covs[c].inverse());
-        all_norm.push_back(1.0 / std::sqrt(std::pow(2.0 * M_PI, 3) * det));
-        all_w.push_back(gmm.weights(c));
-      }
-    };
-    addComponents(neg_obs_gmm);
-    addComponents(obstacle_gmm);
-
-    if (all_mu.empty()) return;
-
-    // 自动计算阈值：取所有分量峰值密度的中位数作为参考
-    if (p_threshold <= 0) {
-      std::vector<double> peaks;
-      for (size_t c = 0; c < all_mu.size(); ++c) {
-        peaks.push_back(all_w[c] * all_norm[c]); // 分量中心处的密度
-      }
-      std::sort(peaks.begin(), peaks.end());
-      p_threshold = peaks[peaks.size() / 2] * 0.5; // 峰值中位数的一半
-      if (p_threshold < 1e-10) p_threshold = 1e-10;
-    }
-
-    // 对每个粒子计算无效密度并衰减权重
     for (int i = 0; i < N; ++i) {
       Eigen::Vector3d pos = particles.col(i).head(3);
-      double p_invalid = 0.0;
-      for (size_t c = 0; c < all_mu.size(); ++c) {
-        Eigen::Vector3d diff = pos - all_mu[c];
-        double exponent = -0.5 * diff.transpose() * all_cov_inv[c] * diff;
-        p_invalid += all_w[c] * all_norm[c] * std::exp(exponent);
+      int ix, iy;
+      grid.toCell(pos.x(), pos.y(), ix, iy);
+      if (!grid.inBounds(ix, iy)) continue;
+      if (grid.get(ix, iy) == 2) continue; // 障碍格跳过
+
+      // FOV检查
+      Eigen::Vector3d p_c = R_cw * (pos - cam_p);
+      if (p_c.z() <= 0.1 || p_c.z() >= cam_max_range_) continue;
+      double u = p_c.x() * cam_fx_ / p_c.z() + cam_cx_;
+      double v = p_c.y() * cam_fy_ / p_c.z() + cam_cy_;
+      if (u < 0 || u > cam_width_ || v < 0 || v > cam_height_) continue;
+
+      // 视线检查
+      if (los_check_fn_ && !los_check_fn_(cam_p, pos)) continue;
+
+      grid.set(ix, iy, 1, now_sec);
+    }
+  }
+
+  // === 用无效栅格更新粒子权重（论文2.2式，分段线性衰减）===
+  // phi_min: 深无效区最小衰减因子
+  // phi_mid: 无效边界处衰减因子（r=0）
+  // r_occ:   无效区内截断距离（米，<0）
+  // r_safe:  有效区外侧安全距离（米，>0）
+  void pruneParticlesByInvalidGrid(Eigen::MatrixXd& particles,
+                                   Eigen::VectorXd& weights, int N,
+                                   InvalidGrid2D& grid,
+                                   double now_sec, double ttl_sec,
+                                   double phi_min = 0.0,
+                                   double phi_mid = 0.5,
+                                   double r_occ   = -0.5,
+                                   double r_safe  =  0.5) {
+    if (!grid.valid() || N <= 0 || weights.size() < N) return;
+
+    phi_min = std::max(0.0, std::min(1.0, phi_min));
+    phi_mid = std::max(phi_min, std::min(1.0, phi_mid));
+    if (!(r_occ < 0.0)) r_occ = -std::max(1e-3, grid.resolution);
+    if (!(r_safe > 0.0)) r_safe =  std::max(1e-3, grid.resolution);
+
+    // 每帧基于当前TTL有效无效域重建有符号距离场，供权重衰减使用
+    grid.computeDistField(now_sec, ttl_sec);
+
+    auto decayFactor = [&](double r) -> double {
+      if (r <= r_occ) {
+        return phi_min;
       }
-      double ratio = p_invalid / p_threshold;
-      double factor = std::max(0.0, 1.0 - ratio);
-      weights(i) *= factor;
+      if (r < 0.0) {
+        // 公式: phi_min - (phi_mid - phi_min) * (r - r_occ) / r_occ, r_occ<0
+        return phi_min - (phi_mid - phi_min) * (r - r_occ) / r_occ;
+      }
+      if (r < r_safe) {
+        // 公式: phi_mid + (1 - phi_mid) * r / r_safe
+        return phi_mid + (1.0 - phi_mid) * r / r_safe;
+      }
+      return 1.0;
+    };
+
+    for (int i = 0; i < N; ++i) {
+      double wx = particles(0, i), wy = particles(1, i);
+      int ix, iy;
+      grid.toCell(wx, wy, ix, iy);
+      if (!grid.inBounds(ix, iy)) continue;
+
+      const double r = static_cast<double>(grid.signedDist(wx, wy));
+      const double phi = std::max(phi_min, std::min(1.0, decayFactor(r)));
+      weights(i) *= phi;
     }
 
-    // 归一化权重
     double wsum = weights.sum();
-    if (wsum > 1e-300) {
-      weights /= wsum;
-    } else {
-      weights.setConstant(N, 1.0 / N);
-    }
+    if (wsum > 1e-300) weights /= wsum;
+    else               weights.setConstant(N, 1.0 / N);
   }
 
   // === 6D全粒子共识 ===
@@ -1044,17 +1187,16 @@ public:
   }
 
   // === 基于当前粒子云提取前沿热点 ===
-  // 目标：优先选择远离无人机且不在高无效密度区域内的热点
+  // 目标：优先选择远离无人机且不在无效栅格区域内的热点
   std::vector<SearchHotspot> extractFrontierHotspotsFromParticles(
       const Eigen::MatrixXd& particles,
       const Eigen::VectorXd& weights,
       int N, int K,
       const std::vector<Eigen::Vector3d>& drone_positions,
-      const InvalidGMM3D& neg_obs_gmm,
-      const InvalidGMM3D& obstacle_gmm,
+      const InvalidGrid2D& invalid_grid,
       double min_drone_dist = 2.0,
       double seed_radius = 1.5,
-      double invalid_reject_ratio = 1.0) const {
+      double /*invalid_reject_ratio*/ = 1.0) const {
     std::vector<SearchHotspot> hotspots;
     if (N <= 0 || K <= 0 || particles.cols() <= 0 || weights.size() <= 0) {
       return hotspots;
@@ -1063,38 +1205,8 @@ public:
     const int n = std::min<int>(N, std::min<int>(particles.cols(), weights.size()));
     const double min_dist = std::max(0.0, min_drone_dist);
     const double radius = std::max(0.1, seed_radius);
-    const double reject_ratio = std::max(1e-6, invalid_reject_ratio);
 
-    // 组装无效GMM分量（与 pruneParticlesByInvalidGMM 一致的密度定义）
-    std::vector<Eigen::Vector3d> all_mu;
-    std::vector<Eigen::Matrix3d> all_cov_inv;
-    std::vector<double> all_norm;
-    std::vector<double> all_w;
-    auto add_components = [&](const InvalidGMM3D& gmm) {
-      for (int c = 0; c < gmm.C; ++c) {
-        double det = gmm.covs[c].determinant();
-        if (det < 1e-30) continue;
-        all_mu.push_back(gmm.means[c]);
-        all_cov_inv.push_back(gmm.covs[c].inverse());
-        all_norm.push_back(1.0 / std::sqrt(std::pow(2.0 * M_PI, 3) * det));
-        all_w.push_back(gmm.weights(c));
-      }
-    };
-    add_components(neg_obs_gmm);
-    add_components(obstacle_gmm);
-
-    double p_threshold = 1e-10;
-    const bool use_invalid_filter = !all_mu.empty();
-    if (use_invalid_filter) {
-      std::vector<double> peaks;
-      peaks.reserve(all_mu.size());
-      for (size_t c = 0; c < all_mu.size(); ++c) {
-        peaks.push_back(all_w[c] * all_norm[c]);
-      }
-      std::sort(peaks.begin(), peaks.end());
-      p_threshold = peaks[peaks.size() / 2] * 0.5;
-      if (p_threshold < 1e-10) p_threshold = 1e-10;
-    }
+    const bool use_invalid_filter = invalid_grid.valid();
 
     struct Candidate {
       int idx = -1;
@@ -1110,16 +1222,9 @@ public:
 
       const Eigen::Vector3d pos = particles.col(i).head(3);
       if (use_invalid_filter) {
-        double p_invalid = 0.0;
-        for (size_t c = 0; c < all_mu.size(); ++c) {
-          Eigen::Vector3d diff = pos - all_mu[c];
-          double exponent = -0.5 * diff.transpose() * all_cov_inv[c] * diff;
-          p_invalid += all_w[c] * all_norm[c] * std::exp(exponent);
-        }
-        double ratio = p_invalid / p_threshold;
-        if (ratio >= reject_ratio) {
-          continue;
-        }
+        int ix, iy;
+        invalid_grid.toCell(pos.x(), pos.y(), ix, iy);
+        if (invalid_grid.inBounds(ix, iy) && invalid_grid.get(ix, iy) != 0) continue;
       }
 
       double nearest_drone_dist = std::numeric_limits<double>::infinity();
@@ -1233,10 +1338,13 @@ public:
   }
 
   double getSearchVmax() const { return search_vmax_; }
+  double getSearchDt() const { return search_dt_; }
+  void setSearchDt(double dt) {
+    if (std::isfinite(dt) && dt > 0.0) search_dt_ = dt;
+  }
 
   /*// Setter methods
   void setDroneId(int drone_id) { drone_id_ = drone_id; }
-  void setSearchDt(double dt) { search_dt_ = dt; }
   double getSearchVmax() const { return search_vmax_; }
   void setSearchVMax(double vmax) { search_vmax_ = vmax; }
   void setSearchVMin(double vmin) { search_vmin_ = vmin; }
@@ -1251,151 +1359,6 @@ public:
   // 设置视线检查函数
   void setLineOfSightCheckFn(std::function<bool(const Eigen::Vector3d&, const Eigen::Vector3d&)> fn) {
     los_check_fn_ = fn;
-  }
-
-  // === 初始化单标签的粒子群（新方法：无共识） ===
-  // 只有掌管者才初始化粒子群，根据反推的平均位置和速度，按意图动力学步进
-  void initializeSingleLabelParticles(const Eigen::Vector3d& mean_pos,
-                                      const Eigen::Vector3d& mean_vel,
-                                      int num_frames_back,
-                                      int num_particles = 300) {
-    if (!is_label_master_) {
-      ROS_INFO("[sp_mgr%d] Not a label master for %s, skip initialization",
-               drone_id_, getLabelName(my_label_));
-      return;
-    }
-
-    // 清空现有粒子，重置帧计数
-    search_particles_.clear();
-    search_particles_.reserve(num_particles);
-    frames_since_init_ = 0;
-
-    // 只为本无人机负责的标签创建粒子群
-    for (int i = 0; i < num_particles; ++i) {
-      SearchParticle particle;
-      particle.state.setZero(9);
-      particle.state.head(3) = mean_pos;
-      particle.state.segment(3, 3) = mean_vel;
-      particle.state(8) = std::atan2(mean_vel.y(), mean_vel.x());  // yaw
-      particle.weight = 1.0 / num_particles;
-      particle.intent = my_label_;  // 初始都是本标签
-      particle.particle_id = i;
-      search_particles_.push_back(particle);
-    }
-
-    double v_horiz = mean_vel.head(2).norm();
-    double yaw_init = std::atan2(mean_vel.y(), mean_vel.x());
-    ROS_INFO("[sp_mgr%d] Initialized %d particles for label %s, mean_vel=(%.3f,%.3f,%.3f), v_horiz=%.3f, yaw=%.3f deg",
-             drone_id_, num_particles, getLabelName(my_label_),
-             mean_vel.x(), mean_vel.y(), mean_vel.z(), v_horiz, yaw_init * 180.0 / M_PI);
-
-    // 记录初始位置
-    Eigen::Vector3d init_pos = mean_pos;
-
-    // 步进 num_frames_back 步（初始化阶段不切换意图）
-    for (int step = 0; step < num_frames_back; ++step) {
-      for (auto& particle : search_particles_) {
-        updateSearchParticleState(particle);
-      }
-    }
-
-    search_particles_initialized_ = true;
-
-    // 计算步进后的均值位置
-    Eigen::Vector3d final_mean_pos = getSingleLabelMeanPosition();
-    Eigen::Vector3d displacement = final_mean_pos - init_pos;
-    double disp_angle = std::atan2(displacement.y(), displacement.x()) * 180.0 / M_PI;
-    double vel_angle = yaw_init * 180.0 / M_PI;
-
-    ROS_INFO("[sp_mgr%d] Label %s: %d particles stepped %d frames, displacement=(%.3f,%.3f,%.3f), disp_angle=%.1f deg, vel_angle=%.1f deg, diff=%.1f deg",
-             drone_id_, getLabelName(my_label_), num_particles, num_frames_back,
-             displacement.x(), displacement.y(), displacement.z(),
-             disp_angle, vel_angle, disp_angle - vel_angle);
-  }
-
-  // === 计算当前保持意图的概率（随帧数衰减：90% -> 60%） ===
-  double computeKeepIntentProb() const {
-    // 初始90%，衰减到60%，衰减时间常数约100帧
-    const double init_prob = 0.90;
-    const double min_prob = 0.60;
-    const double decay_rate = 0.02;  // 每帧衰减率
-
-    double prob = init_prob - decay_rate * frames_since_init_;
-    return std::max(min_prob, prob);
-  }
-
-  // === 意图切换（带衰减概率） ===
-  void switchIntentsWithDecay() {
-    if (!search_particles_initialized_ || search_particles_.empty()) {
-      return;
-    }
-
-    double keep_prob = computeKeepIntentProb();
-    double switch_prob = (1.0 - keep_prob) / 2.0;  // 平均分配给另外两个意图
-
-    std::uniform_real_distribution<double> uniform(0.0, 1.0);
-
-    for (auto& particle : search_particles_) {
-      double rand_val = uniform(rng_);
-      SearchIntent old_intent = particle.intent;
-
-      if (rand_val < keep_prob) {
-        // 保持原意图
-        continue;
-      } else if (rand_val < keep_prob + switch_prob) {
-        // 切换到第一个其他意图
-        if (old_intent == STRAIGHT) particle.intent = LEFT_TURN;
-        else if (old_intent == LEFT_TURN) particle.intent = STRAIGHT;
-        else particle.intent = STRAIGHT;
-      } else {
-        // 切换到第二个其他意图
-        if (old_intent == STRAIGHT) particle.intent = RIGHT_TURN;
-        else if (old_intent == LEFT_TURN) particle.intent = RIGHT_TURN;
-        else particle.intent = LEFT_TURN;
-      }
-    }
-  }
-
-  // === 更新单标签粒子群（新方法：带意图切换） ===
-  void updateSingleLabelParticles() {
-    if (!is_label_master_ || !search_particles_initialized_) {
-      return;
-    }
-
-    // 步骤1：意图切换（带衰减概率）
-    switchIntentsWithDecay();
-
-    // 步骤2：更新粒子状态
-    for (auto& particle : search_particles_) {
-      updateSearchParticleState(particle);
-    }
-
-    // 增加帧计数
-    frames_since_init_++;
-
-    ROS_DEBUG("[sp_mgr%d] Updated %zu particles, keep_prob=%.2f, frame=%d",
-              drone_id_, search_particles_.size(), computeKeepIntentProb(), frames_since_init_);
-  }
-
-  // === 获取单标签粒子群的加权均值位置（用于规划目标点） ===
-  Eigen::Vector3d getSingleLabelMeanPosition() const {
-    if (search_particles_.empty()) {
-      return Eigen::Vector3d::Zero();
-    }
-
-    Eigen::Vector3d mean_pos = Eigen::Vector3d::Zero();
-    double total_weight = 0.0;
-
-    for (const auto& p : search_particles_) {
-      mean_pos += p.weight * p.state.head(3);
-      total_weight += p.weight;
-    }
-
-    if (total_weight > 1e-300) {
-      mean_pos /= total_weight;
-    }
-
-    return mean_pos;
   }
 
   // === 负观测更新：删除在FOV内但未观测到目标的粒子，复制其他粒子补充 ===
@@ -1536,83 +1499,6 @@ public:
                       drone_id_, delete_count, num_to_copy, search_particles_.size());
 
     return delete_count;
-  }
-
-  // === 旧版初始化函数（保留兼容，后续弃用） ===
-  struct SearchTargets {
-    Eigen::Vector3d forward;      // 沿速度方向前进
-    Eigen::Vector3d left_45;      // 左前45度
-    Eigen::Vector3d right_45;     // 右前45度
-    Eigen::Vector3d mean_pos;     // 均值位置（反推后）
-    Eigen::Vector3d mean_vel;     // 均值速度
-  };
-
-  SearchTargets computeSearchTargets(const Eigen::MatrixXd& dpf_particles,
-                                     const Eigen::VectorXd& dpf_weights,
-                                     int num_frames_back,
-                                     double search_distance = 5.0) {
-    SearchTargets targets;
-    int N = dpf_particles.cols();
-    double dt = search_dt_;
-
-    // 步骤1：计算当前粒子的加权均值位置和速度
-    Eigen::Vector3d pos_mean = Eigen::Vector3d::Zero();
-    Eigen::Vector3d vel_mean = Eigen::Vector3d::Zero();
-    double total_weight = 0.0;
-
-    for (int i = 0; i < N; ++i) {
-      pos_mean += dpf_weights(i) * dpf_particles.col(i).head(3);
-      vel_mean += dpf_weights(i) * dpf_particles.col(i).segment(3, 3);
-      total_weight += dpf_weights(i);
-    }
-
-    if (total_weight > 1e-300) {
-      pos_mean /= total_weight;
-      vel_mean /= total_weight;
-    }
-
-    // 步骤2：反推num_frames_back帧前的位置（使用匀速模型）
-    Eigen::Vector3d pos_back = pos_mean - vel_mean * dt * num_frames_back;
-
-    targets.mean_pos = pos_back;
-    targets.mean_vel = vel_mean;
-
-    // 步骤3：计算三个搜索目标点
-    Eigen::Vector3d vel_horiz = vel_mean;
-    vel_horiz.z() = 0.0;
-    double v_horiz = vel_horiz.norm();
-
-    Eigen::Vector3d forward_dir = Eigen::Vector3d::Zero();
-    if (v_horiz > 0.1) {
-      forward_dir = vel_horiz.normalized();
-    } else {
-      forward_dir = Eigen::Vector3d(1.0, 0.0, 0.0);
-    }
-
-    // 左前45度方向：旋转-45度
-    double angle_45 = M_PI / 4.0;
-    Eigen::Vector3d left_45_dir;
-    left_45_dir.x() = forward_dir.x() * std::cos(angle_45) - forward_dir.y() * std::sin(angle_45);
-    left_45_dir.y() = forward_dir.x() * std::sin(angle_45) + forward_dir.y() * std::cos(angle_45);
-    left_45_dir.z() = 0.0;
-
-    // 右前45度方向：旋转+45度
-    Eigen::Vector3d right_45_dir;
-    right_45_dir.x() = forward_dir.x() * std::cos(-angle_45) - forward_dir.y() * std::sin(-angle_45);
-    right_45_dir.y() = forward_dir.x() * std::sin(-angle_45) + forward_dir.y() * std::cos(-angle_45);
-    right_45_dir.z() = 0.0;
-
-    // 三个搜索点
-    targets.forward = pos_back + search_distance * forward_dir;
-    targets.left_45 = pos_back + search_distance * left_45_dir;
-    targets.right_45 = pos_back + search_distance * right_45_dir;
-
-    // 保持z高度
-    targets.forward.z() = pos_back.z();
-    targets.left_45.z() = pos_back.z();
-    targets.right_45.z() = pos_back.z();
-
-    return targets;
   }
 
   // === 初始化三个标签的粒子群（搜索模式入口） ===
@@ -1761,11 +1647,6 @@ private:
   std::vector<SearchParticle> search_particles_;
   bool search_particles_initialized_;
 
-  // 单标签模式：每个无人机只掌管一个标签
-  SearchIntent my_label_;        // 本无人机负责的标签
-  bool is_label_master_;         // 是否是该标签的掌管者（drone_id < 3）
-  int frames_since_init_;        // 初始化后经过的帧数（用于意图切换概率衰减）
-  
   // 搜索粒子动力学参数
   double search_dt_;
   double search_vmax_;
@@ -1808,328 +1689,3 @@ private:
   std::vector<Eigen::MatrixXd> search_zeta_b_;
   bool search_gmm_initialized_ = false;
 };
-
-// ========== 以下为旧的标签化共识滤波实现（已弃用，保留供参考）==========
-#if 0  // 旧代码开始
-
-// ================== 分标签GMM拟合与分布式共识实现 ==================
-// 对每个标签l，单独筛选该标签下的粒子，计算本地统计量
-inline std::vector<LabeledLocalStat> SearchParticlesManager::computeLabeledLocalStats() {
-  std::vector<LabeledLocalStat> labeled_stats;
-  int nx = 9;
-  int C = num_components_;
-
-  // 按标签分组粒子
-  std::map<SearchIntent, std::vector<size_t>> label_to_indices;
-  for (size_t i = 0; i < search_particles_.size(); ++i) {
-    label_to_indices[search_particles_[i].intent].push_back(i);
-  }
-
-  // 对每个标签，严格对齐原DPF的EM-E步计算统计量
-  for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
-    SearchIntent label = static_cast<SearchIntent>(label_int);
-    auto it = label_to_indices.find(label);
-    if (it == label_to_indices.end() || it->second.empty()) continue;
-
-    const std::vector<size_t>& indices = it->second;
-    LabeledLocalStat stat;
-    stat.drone_id = drone_id_;
-    stat.label = label;
-    stat.C = C;
-    stat.nx = nx;
-    stat.has_obs = false;
-    stat.timestamp = ros::Time::now();
-    stat.alpha.setZero(C);
-    stat.a.resize(C);
-    stat.b.resize(C);
-    for (int c = 0; c < C; ++c) {
-      stat.a[c].setZero(nx);
-      stat.b[c].setZero(nx, nx);
-    }
-
-    // 预计算该标签GMM的逆和行列式（对齐原DPF）
-    std::vector<Eigen::MatrixXd> S_inv(C);
-    std::vector<double> S_det(C);
-    for (int c = 0; c < C; ++c) {
-      S_inv[c] = gmm_S_[label][c].inverse();
-      S_det[c] = gmm_S_[label][c].determinant();
-      if (S_det[c] < 1e-300) S_det[c] = 1e-300;
-    }
-
-    // 严格按原论文公式(17)计算责任度，公式(21)累加统计量
-    for (size_t idx : indices) {
-      const SearchParticle& particle = search_particles_[idx];
-      Eigen::VectorXd x_n = particle.state;
-      double w_n = particle.weight;
-
-      // 计算每个高斯分量的责任度
-      Eigen::VectorXd resp(C);
-      double resp_sum = 0.0;
-      for (int c = 0; c < C; ++c) {
-        // 9维状态残差计算（对齐原DPF的stateDiff）
-        Eigen::VectorXd diff(nx);
-        diff.head(3) = x_n.head(3) - gmm_mu_[label][c].head(3);
-        diff.segment(3, 3) = x_n.segment(3, 3) - gmm_mu_[label][c].segment(3, 3);
-        diff(6) = angleDiff(x_n(6), gmm_mu_[label][c](6));
-        diff(7) = angleDiff(x_n(7), gmm_mu_[label][c](7));
-        diff(8) = angleDiff(x_n(8), gmm_mu_[label][c](8));
-
-        double exponent = -0.5 * diff.transpose() * S_inv[c] * diff;
-        double nc = 1.0 / std::sqrt(std::pow(2.0 * M_PI, nx) * S_det[c]);
-        resp(c) = gmm_pi_[label](c) * nc * std::exp(exponent);
-        resp_sum += resp(c);
-      }
-
-      // 归一化责任度
-      if (resp_sum > 1e-300) resp /= resp_sum;
-      else resp.setConstant(1.0 / C);
-
-      // 累加本地统计量（对齐原论文公式21）
-      for (int c = 0; c < C; ++c) {
-        double alpha_nc = w_n * resp(c);
-        stat.alpha(c) += alpha_nc;
-        stat.a[c] += alpha_nc * x_n;
-        Eigen::VectorXd diff_c(nx);
-        diff_c.head(3) = x_n.head(3) - gmm_mu_[label][c].head(3);
-        diff_c.segment(3, 3) = x_n.segment(3, 3) - gmm_mu_[label][c].segment(3, 3);
-        diff_c(6) = angleDiff(x_n(6), gmm_mu_[label][c](6));
-        diff_c(7) = angleDiff(x_n(7), gmm_mu_[label][c](7));
-        diff_c(8) = angleDiff(x_n(8), gmm_mu_[label][c](8));
-        stat.b[c] += alpha_nc * diff_c * diff_c.transpose();
-      }
-    }
-
-    labeled_stats.push_back(stat);
-  }
-
-  return labeled_stats;
-}
-
-// 对每个标签的本地统计量，独立运行平均共识滤波
-inline void SearchParticlesManager::labeledConsensusFilter(const std::vector<LabeledNeighborConsensus>& neighbor_consensus,
-  const std::vector<LabeledLocalStat>& local_stats) {
-// 遍历每个标签，对每个标签独立运行共识滤波
-for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
-SearchIntent label = static_cast<SearchIntent>(label_int);
-
-// 找到该标签对应的本地统计量
-const LabeledLocalStat* local_stat = nullptr;
-for (const auto& stat : local_stats) {
-if (stat.label == label) {
-local_stat = &stat;
-break;
-}
-}
-
-if (local_stat) {
-consensusFilterForLabel(label, neighbor_consensus, *local_stat);
-}
-}
-}
-
-// 对每个标签的本地统计量，独立运行平均共识滤波
-inline void SearchParticlesManager::consensusFilterForLabel(SearchIntent label,
-  const std::vector<LabeledNeighborConsensus>& neighbor_consensus,
-  const LabeledLocalStat& local_stat) {
-  int C = num_components_;
-  int nx = 9;
-
-  int d_max = neighbor_consensus.size() + 1;
-  double adaptive_epsilon = 1.0 / d_max;
-  adaptive_epsilon = std::min(adaptive_epsilon, 0.3);
-
-  for (int iter = 0; iter < 10; ++iter) {
-  for (int c = 0; c < C; ++c) {
-  // 邻居ζ的差值：Σ_j(ζ_j^t - ζ^t)
-  double alpha_diff = 0.0;
-  Eigen::VectorXd a_diff = Eigen::VectorXd::Zero(nx);
-  Eigen::MatrixXd b_diff = Eigen::MatrixXd::Zero(nx, nx);
-
-  for (const auto& nc : neighbor_consensus) {
-  alpha_diff += nc.zeta_alpha(c) - zeta_alpha_[label](c);
-  a_diff += nc.zeta_a[c] - zeta_a_[label][c];
-  b_diff += nc.zeta_b[c] - zeta_b_[label][c];
-  }
-
-  // ✅ 直接用本地u，不做has_obs判断
-  // 这样就是标准论文公式26：ζ += ε * (邻居差值 + (u - ζ))
-  double local_alpha = local_stat.alpha(c);
-  Eigen::VectorXd local_a = local_stat.a[c];
-  Eigen::MatrixXd local_b = local_stat.b[c];
-
-  zeta_alpha_[label](c) += adaptive_epsilon * (alpha_diff + (local_alpha - zeta_alpha_[label](c)));
-  zeta_a_[label][c] += adaptive_epsilon * (a_diff + (local_a - zeta_a_[label][c]));
-  zeta_b_[label][c] += adaptive_epsilon * (b_diff + (local_b - zeta_b_[label][c]));
-  }
-  }
-
-  globalMStepForLabel(label);
-  }
-
-
-// 单标签全局M步
-inline void SearchParticlesManager::globalMStepForLabel(SearchIntent label) {
-  int C = num_components_;
-  int nx = 9;
-  
-  double alpha_sum = zeta_alpha_[label].sum();
-  if (alpha_sum < 1e-300) return;
-  
-  // 对齐原论文公式(30)，用共识后的全局统计量更新GMM参数
-  for (int c = 0; c < C; ++c) {
-    if (zeta_alpha_[label](c) < 1e-300) continue;
-    
-    // 混合权重
-    gmm_pi_[label](c) = zeta_alpha_[label](c) / alpha_sum;
-    // 均值
-    gmm_mu_[label][c] = zeta_a_[label][c] / zeta_alpha_[label](c);
-    // 角度归一化
-    gmm_mu_[label][c](6) = wrapAngle(gmm_mu_[label][c](6));
-    gmm_mu_[label][c](7) = wrapAngle(gmm_mu_[label][c](7));
-    gmm_mu_[label][c](8) = wrapAngle(gmm_mu_[label][c](8));
-    // 协方差
-    gmm_S_[label][c] = zeta_b_[label][c] / zeta_alpha_[label](c);
-    // 保证协方差正定
-    gmm_S_[label][c] += Eigen::MatrixXd::Identity(nx, nx) * 1e-4;
-  }
-  
-  // 归一化混合权重
-  double pi_sum = gmm_pi_[label].sum();
-  if (pi_sum > 1e-300) gmm_pi_[label] /= pi_sum;
-}
-
-// 获取每个标签的GMM参数（用于轨迹规划）
-inline std::map<SearchIntent, std::vector<Eigen::VectorXd>> SearchParticlesManager::getLabeledGMMMeans() const {
-  std::map<SearchIntent, std::vector<Eigen::VectorXd>> labeled_means;
-  for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
-    SearchIntent label = static_cast<SearchIntent>(label_int);
-    labeled_means[label] = gmm_mu_.at(label);
-  }
-  return labeled_means;
-}
-
-inline std::map<SearchIntent, std::vector<Eigen::MatrixXd>> SearchParticlesManager::getLabeledGMMCovs() const {
-  std::map<SearchIntent, std::vector<Eigen::MatrixXd>> labeled_covs;
-  for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
-    SearchIntent label = static_cast<SearchIntent>(label_int);
-    labeled_covs[label] = gmm_S_.at(label);
-  }
-  return labeled_covs;
-}
-
-inline std::map<SearchIntent, Eigen::VectorXd> SearchParticlesManager::getLabeledGMMPis() const {
-  std::map<SearchIntent, Eigen::VectorXd> labeled_pis;
-  for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
-    SearchIntent label = static_cast<SearchIntent>(label_int);
-    labeled_pis[label] = gmm_pi_.at(label);
-  }
-  return labeled_pis;
-}
-
-// 计算有效粒子数（用于判断是否需要重采样）
-inline double SearchParticlesManager::computeEffectiveSampleSize() const {
-  if (search_particles_.empty()) return 0.0;
-  
-  double sum_weights = 0.0;
-  double sum_weight_squares = 0.0;
-  
-  for (const auto& particle : search_particles_) {
-    sum_weights += particle.weight;
-    sum_weight_squares += particle.weight * particle.weight;
-  }
-  
-  if (sum_weights > 1e-300 && sum_weight_squares > 1e-300) {
-    return sum_weights * sum_weights / sum_weight_squares;
-  }
-  
-  return 0.0;
-}
-
-// 从GMM采样新粒子（基于标准DPF实现）
-inline void SearchParticlesManager::sampleParticlesFromGMM() {
-  if (!search_particles_initialized_ || search_particles_.empty()) return;
-  
-  int nx = 9; // 9维状态空间
-  
-  // 按标签分组粒子
-  std::map<SearchIntent, std::vector<size_t>> label_to_indices;
-  for (size_t i = 0; i < search_particles_.size(); ++i) {
-    label_to_indices[search_particles_[i].intent].push_back(i);
-  }
-  
-  // 对每个标签执行GMM采样（类似于标准DPF的实现）
-  for (const auto& pair : label_to_indices) {
-    SearchIntent label = pair.first;
-    const std::vector<size_t>& indices = pair.second;
-    
-    if (indices.empty()) continue;
-    
-    int label_particle_count = indices.size();
-    int C = num_components_;
-    
-    // 从该标签的GMM采样新粒子
-    std::uniform_real_distribution<double> uniform(0.0, 1.0);
-    std::normal_distribution<double> normal(0.0, 1.0);
-    
-    for (int i = 0; i < label_particle_count; ++i) {
-      size_t idx = indices[i];
-      SearchParticle& particle = search_particles_[idx];
-      
-      // 按混合权重选择GMM分量
-      double u = uniform(rng_);
-      double cum = 0.0;
-      int c_sel = C - 1;
-      for (int c = 0; c < C; ++c) {
-        cum += gmm_pi_[label](c);
-        if (u <= cum) { c_sel = c; break; }
-      }
-      
-      // 从GMM采样9维完整状态
-      Eigen::LLT<Eigen::MatrixXd> llt(gmm_S_[label][c_sel]);
-      Eigen::MatrixXd L = llt.matrixL();
-      Eigen::VectorXd noise_x(nx);
-      for (int j = 0; j < nx; ++j) noise_x(j) = normal(rng_);
-      Eigen::VectorXd x_sample = gmm_mu_[label][c_sel] + L * noise_x;
-      
-      // 直接赋值9维完整状态
-      particle.state = x_sample;
-      // 归一化角度
-      particle.state(6) = wrapAngle(particle.state(6));
-      particle.state(7) = wrapAngle(particle.state(7));
-      particle.state(8) = wrapAngle(particle.state(8));
-      // ✅ 重采样后重置权重为均匀分布
-      particle.weight = 1.0 / label_particle_count;
-    }
-  }
-  
-  ROS_DEBUG("[sp_mgr%d] Sampled new particles from GMM", drone_id_);
-}
-inline std::map<SearchIntent, Eigen::VectorXd> SearchParticlesManager::getLabeledZetaAlpha() const {
-  std::map<SearchIntent, Eigen::VectorXd> result;
-  for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
-    SearchIntent label = static_cast<SearchIntent>(label_int);
-     result.insert({label, zeta_alpha_.at(label)});
-  }
-  return result;
-}
-
-inline std::map<SearchIntent, std::vector<Eigen::VectorXd>> SearchParticlesManager::getLabeledZetaA() const {
-  std::map<SearchIntent, std::vector<Eigen::VectorXd>> result;
-  for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
-    SearchIntent label = static_cast<SearchIntent>(label_int);
-    result.insert({label, zeta_a_.at(label)});
-  }
-  return result;
-}
-
-inline std::map<SearchIntent, std::vector<Eigen::MatrixXd>> SearchParticlesManager::getLabeledZetaB() const {
-  std::map<SearchIntent, std::vector<Eigen::MatrixXd>> result;
-  for (int label_int = STRAIGHT; label_int <= RIGHT_TURN; ++label_int) {
-    SearchIntent label = static_cast<SearchIntent>(label_int);
-    result.insert({label, zeta_b_.at(label)});
-  }
-  return result;
-}
-
-#endif  // 旧代码结束
-// ========== 旧的标签化共识滤波实现结束 ==========

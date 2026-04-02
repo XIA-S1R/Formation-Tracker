@@ -15,6 +15,7 @@ find_package(catkin REQUIRED COMPONENTS
   tracking_msgs
   object_detection_msgs
   quadrotor_msgs
+  mapping
   message_filters
   message_generation
   pcl_conversions

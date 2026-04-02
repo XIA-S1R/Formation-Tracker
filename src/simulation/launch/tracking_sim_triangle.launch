@@ -75,7 +75,7 @@
       <param name="plan_hz"          value="20"/>
       <param name="K"                value="8"/>
       <param name="vmax"             value="2.5"/>
-      <param name="amax"             value="5"/>
+      <param name="amax"             value="5.0"/>
       <param name="rhoT"             value="100.0"/>
       <param name="rhoP"             value="10000.0"/>
       <param name="rhoV"             value="1000.0"/>

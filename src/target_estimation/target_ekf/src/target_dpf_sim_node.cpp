@@ -11,6 +11,8 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <quadrotor_msgs/OccMap3d.h>
+#include <mapping/mapping.h>
 #include <unordered_set>
 #include <cmath>
 #include <mutex>
@@ -18,11 +20,10 @@
 #include <target_ekf/target_ekf.hpp>
 #include <target_ekf/target_dpf.hpp>
 #include <target_ekf/LocalStats.h>
-#include <target_ekf/LabeledConsensusState.h>
-#include <target_ekf/SearchLabelInfo.h>
 #include <target_ekf/InvalidRegionGMM.h>
 #include <std_msgs/Bool.h>
 #include <unordered_set>
+#include <unordered_map>
 #include <algorithm>
 #include <numeric>
 #include "target_ekf/search_particles_manager.hpp"
@@ -46,16 +47,14 @@ std::vector<GMMAssignment> assignGMMTasks(const std::vector<Eigen::Vector3d>& dr
 // 发布器
 ros::Publisher target_odom_pub_;
 ros::Publisher local_stats_pub_;
-ros::Publisher labeled_consensus_pub_;
 ros::Publisher search_state_pub_;
 ros::Publisher search_particles_vis_pub_;
 ros::Publisher search_gmm_vis_pub_; // 搜索GMM分布可视化发布器
 ros::Publisher search_pos_gmm_pub_;  // 位置GMM发布器
 ros::Publisher search_targets_pub_;  // 搜索目标点发布器
-ros::Publisher search_label_info_pub_;  // 搜索标签信息发布器
-ros::Publisher invalid_gmm_pub_;       // 无效区域GMM发布器
+ros::Publisher invalid_grid_pub_;      // 无效区域栅格发布器（消息类型沿用InvalidRegionGMM）
 std::vector<ros::Subscriber> stats_subs_;
-std::vector<ros::Subscriber> invalid_gmm_subs_; // 邻居无效区域GMM订阅
+std::vector<ros::Subscriber> invalid_grid_subs_; // 邻居无效区域栅格订阅
 
 // 相机外参
 Eigen::Matrix3d cam2body_R_;
@@ -112,22 +111,32 @@ double current_hotspot_extract_interval_sec_ = 2.0; // 当前生效的承诺持�
 int committed_direction_refresh_count_ = 0;         // 当前搜索阶段内方向重提取次数
 bool has_committed_direction_ = false;
 double search_advance_vmax_ = 2.0; // 搜索模式推进速度，优先使用当前无人机 planning/vmax
-double neg_obs_ttl_sec_ = 8.0;               // 负观测无效区域记忆时长
+double neg_obs_ttl_sec_ = 3.0;               // 负观测无效区域记忆时长（秒）
+double invalid_decay_phi_min_ = 0.08;        // 论文2.2: 深无效区最小权重衰减（推荐初值）
+double invalid_decay_phi_mid_ = 0.60;        // 论文2.2: 边界处权重衰减（推荐初值）
+double invalid_decay_r_occ_ = -0.50;         // 论文2.2: 无效区内截断距离(m, <0)（推荐初值）
+double invalid_decay_r_safe_ = 1.00;         // 论文2.2: 有效区安全距离(m, >0)（推荐初值）
 double hotspot_min_drone_dist_ = 2.0;        // 热点与最近无人机最小期望距离
 double hotspot_seed_radius_ = 1.5;           // 热点局部融合半径
 double hotspot_invalid_reject_ratio_ = 1.0;  // 无效密度拒绝阈值（相对prune阈值）
 
-// 无效区域GMM存储（并集共识）
-using InvalidGMM3D = SearchParticlesManager::InvalidGMM3D;
-std::mutex invalid_gmm_mutex_;
-struct TimedInvalidGMM3D {
-  InvalidGMM3D gmm;
-  ros::Time stamp;
+// 无效区域虚拟栅格存储（并集共识）
+using InvalidGrid2D = SearchParticlesManager::InvalidGrid2D;
+std::mutex invalid_grid_mutex_;
+// 栅格参数（与场景范围对齐，在main中初始化）
+double grid_origin_x_ = -10.0;
+double grid_origin_y_ = -15.0;
+double grid_resolution_ = 0.5;
+int grid_nx_ = 80;
+int grid_ny_ = 80;
+InvalidGrid2D global_invalid_grid_;  // 全局无效区域（本机历史 + 邻机/本机地图增量在搜索主循环中统一并入）
+struct PendingInvalidGridDelta {
+  double recv_stamp_sec = 0.0;
+  InvalidGrid2D frame_grid;
 };
-std::map<int, TimedInvalidGMM3D> received_neg_obs_gmms_;  // 邻居负观测GMM（TTL缓存）
-std::map<int, InvalidGMM3D> received_obstacle_gmms_;   // 邻居的障碍GMM（持久留存）
-InvalidGMM3D global_neg_obs_gmm_;    // 全局负观测GMM（当前帧有效）
-InvalidGMM3D global_obstacle_gmm_;   // 全局障碍GMM（一直留存）
+std::unordered_map<int, PendingInvalidGridDelta> pending_invalid_grid_deltas_;
+std::mutex local_map_cache_mutex_;
+quadrotor_msgs::OccMap3dConstPtr pending_local_occ_map_msg_;
 
 void resetCommittedDirectionState() {
   has_committed_direction_ = false;
@@ -167,6 +176,25 @@ void updateReacquireBoostState() {
   }
 }
 
+// 进入搜索模式时，将当前粒子按普通DPF的匀速项反推h帧
+// 说明：predict() 含过程噪声，严格可逆需要历史噪声；这里按确定性匀速主模型回退。
+Eigen::MatrixXd rollbackParticlesByConstantVelocityModel(
+    const Eigen::MatrixXd& particles, int rollback_frames, double dt) {
+  if (rollback_frames <= 0 || particles.rows() < 6 || particles.cols() <= 0) {
+    return particles;
+  }
+  if (!std::isfinite(dt) || dt <= 0.0) {
+    return particles;
+  }
+
+  Eigen::MatrixXd rolled_particles = particles;
+  const double total_dt = static_cast<double>(rollback_frames) * dt;
+  rolled_particles.row(0).array() -= rolled_particles.row(3).array() * total_dt;
+  rolled_particles.row(1).array() -= rolled_particles.row(4).array() * total_dt;
+  rolled_particles.row(2).array() -= rolled_particles.row(5).array() * total_dt;
+  return rolled_particles;
+}
+
 // 6D搜索共识邻居数据
 using NeighborConsensus6D = SearchParticlesManager::NeighborConsensus6D;
 using LocalStat6D = SearchParticlesManager::LocalStat6D;
@@ -175,15 +203,10 @@ std::mutex search_consensus_mutex_;
 ros::Publisher search_consensus_pub_;
 std::vector<ros::Subscriber> search_consensus_subs_;
 
-// 邻居无人机位置（用于匈牙利分配）
+// 邻居无人机位置（用于搜索热点分配）
 std::map<int, Eigen::Vector3d> neighbor_positions_;
 std::mutex neighbor_odom_mutex_;
 std::vector<ros::Subscriber> neighbor_odom_subs_;
-
-// 标签分配结果
-SearchIntent my_assigned_label_ = STRAIGHT;  // 本机分配到的标签
-bool is_label_master_ = false;               // 是否是该标签的掌管者
-std::map<SearchIntent, std::vector<int>> label_to_drones_;  // 每个标签分配到的无人机ID列表
 
 // 搜索粒子管理器
 std::unique_ptr<SearchParticlesManager> search_particles_manager_;
@@ -191,9 +214,7 @@ std::unique_ptr<SearchParticlesManager> search_particles_manager_;
 // 邻居数据存储
 std::map<int, LocalStat> received_stats_;
 std::map<int, NeighborConsensus> received_consensus_;
-std::map<int, std::vector<LabeledNeighborConsensus>> received_labeled_consensus_;
 std::mutex stats_mutex_;
-std::mutex labeled_stats_mutex_;
 
 // === GMM中心帧间匹配相关 ===
 std::vector<Eigen::Vector3d> prev_pos_gmm_mu_;  // 上一帧的GMM中心
@@ -245,12 +266,19 @@ bool isLineOfSightClear(const Eigen::Vector3d& start, const Eigen::Vector3d& end
   return true;
 }
 
-// === 全局地图回调 ===
+// === 全局地图回调（仅用于LOS检查）===
 void global_map_callback(const sensor_msgs::PointCloud2ConstPtr& msg) {
   pcl::PointCloud<pcl::PointXYZ> cloud;
   pcl::fromROSMsg(*msg, cloud);
   occMap_.fromPointCloud(cloud, 0.3);
   ROS_INFO_ONCE("[dpf%d] Global map received, %zu obstacle points.", drone_id_, cloud.size());
+}
+
+// === 局部地图回调（用于障碍无效栅格标记）===
+void local_map_callback(const quadrotor_msgs::OccMap3dConstPtr& msg) {
+  // 仅缓存本机当前局部地图，统一在搜索主循环中并入global_invalid_grid_
+  std::lock_guard<std::mutex> lock(local_map_cache_mutex_);
+  pending_local_occ_map_msg_ = msg;
 }
 
 // === 发布搜索粒子可视化 ===
@@ -557,108 +585,44 @@ bool tryBootstrapFromNeighborConsensus(Eigen::Vector3d& seed_pos,
   return found;
 }
 
-// === 无效区域GMM消息转换 ===
-target_ekf::InvalidRegionGMM toInvalidGMMMsg(const InvalidGMM3D& gmm, int drone_id, int type) {
+// === 无效区域栅格消息转换 ===
+target_ekf::InvalidRegionGMM toInvalidGridMsg(const InvalidGrid2D& grid, int drone_id) {
   target_ekf::InvalidRegionGMM msg;
   msg.header.stamp = ros::Time::now();
   msg.drone_id = drone_id;
-  msg.type = type;
-  msg.num_components = gmm.C;
-  msg.weights.resize(gmm.C);
-  msg.means.resize(gmm.C * 3);
-  msg.covs.resize(gmm.C * 9);
-  for (int c = 0; c < gmm.C; ++c) {
-    msg.weights[c] = gmm.weights(c);
-    for (int i = 0; i < 3; ++i) msg.means[c * 3 + i] = gmm.means[c](i);
-    for (int i = 0; i < 3; ++i)
-      for (int j = 0; j < 3; ++j)
-        msg.covs[c * 9 + i * 3 + j] = gmm.covs[c](i, j);
-  }
+  msg.origin_x = grid.origin_x;
+  msg.origin_y = grid.origin_y;
+  msg.resolution = grid.resolution;
+  msg.nx = grid.nx;
+  msg.ny = grid.ny;
+  auto rle = SearchParticlesManager::rleEncode(grid);
+  msg.rle_values = rle.values;
+  msg.rle_counts = rle.counts;
+  msg.rle_frames.clear();  // 兼容旧消息字段，当前实现不再使用帧号
   return msg;
 }
 
-InvalidGMM3D fromInvalidGMMMsg(const target_ekf::InvalidRegionGMM::ConstPtr& msg) {
-  InvalidGMM3D gmm;
-  gmm.C = msg->num_components;
-  if (gmm.C <= 0) return gmm;
-  gmm.weights = Eigen::Map<const Eigen::VectorXd>(msg->weights.data(), gmm.C);
-  gmm.means.resize(gmm.C);
-  gmm.covs.resize(gmm.C);
-  for (int c = 0; c < gmm.C; ++c) {
-    gmm.means[c] = Eigen::Map<const Eigen::Vector3d>(msg->means.data() + c * 3);
-    gmm.covs[c] = Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(msg->covs.data() + c * 9);
-  }
-  return gmm;
+InvalidGrid2D fromInvalidGridMsg(const target_ekf::InvalidRegionGMM::ConstPtr& msg) {
+  SearchParticlesManager::RLEGrid rle;
+  rle.origin_x = msg->origin_x;
+  rle.origin_y = msg->origin_y;
+  rle.resolution = msg->resolution;
+  rle.nx = msg->nx;
+  rle.ny = msg->ny;
+  rle.values = msg->rle_values;
+  rle.counts = msg->rle_counts;
+  return SearchParticlesManager::rleDecode(rle);
 }
 
-// === 收到邻居无效区域GMM的回调 ===
-void invalid_gmm_callback(const target_ekf::InvalidRegionGMM::ConstPtr& msg) {
+// === 收到邻居无效区域栅格增量的回调 ===
+void invalid_grid_callback(const target_ekf::InvalidRegionGMM::ConstPtr& msg) {
   if (msg->drone_id == drone_id_) return;
-  std::lock_guard<std::mutex> lock(invalid_gmm_mutex_);
-  InvalidGMM3D gmm = fromInvalidGMMMsg(msg);
-  if (msg->type == 0) {
-    TimedInvalidGMM3D timed;
-    timed.gmm = gmm;
-    timed.stamp = msg->header.stamp.isZero() ? ros::Time::now() : msg->header.stamp;
-    received_neg_obs_gmms_[msg->drone_id] = timed;
-  } else {
-    received_obstacle_gmms_[msg->drone_id] = gmm;
-  }
-}
-
-// === 并集共识：合并所有无人机的GMM分量 ===
-InvalidGMM3D unionGMMs(const InvalidGMM3D& local, const std::map<int, InvalidGMM3D>& received) {
-  // 1. 收集所有分量
-  std::vector<Eigen::Vector3d> all_means;
-  std::vector<Eigen::Matrix3d> all_covs;
-  if (local.C > 0) {
-    for (int c = 0; c < local.C; ++c) {
-      all_means.push_back(local.means[c]);
-      all_covs.push_back(local.covs[c]);
-    }
-  }
-  for (auto& kv : received) {
-    for (int c = 0; c < kv.second.C; ++c) {
-      all_means.push_back(kv.second.means[c]);
-      all_covs.push_back(kv.second.covs[c]);
-    }
-  }
-  if (all_means.empty()) return InvalidGMM3D();
-
-  // 2. 贪心聚类合并：距离小于阈值的分量合并
-  const double merge_dist = 1.0; // 合并距离阈值 (m)
-  int N = all_means.size();
-  std::vector<bool> merged(N, false);
-  std::vector<Eigen::Vector3d> merged_means;
-  std::vector<Eigen::Matrix3d> merged_covs;
-  std::vector<int> merged_counts;
-
-  for (int i = 0; i < N; ++i) {
-    if (merged[i]) continue;
-    Eigen::Vector3d sum_mu = all_means[i];
-    Eigen::Matrix3d sum_cov = all_covs[i];
-    int count = 1;
-    for (int j = i + 1; j < N; ++j) {
-      if (merged[j]) continue;
-      if ((all_means[i] - all_means[j]).norm() < merge_dist) {
-        sum_mu += all_means[j];
-        sum_cov += all_covs[j];
-        count++;
-        merged[j] = true;
-      }
-    }
-    merged_means.push_back(sum_mu / count);
-    merged_covs.push_back(sum_cov / count);
-    merged_counts.push_back(count);
-  }
-
-  // 3. 构建结果，等权重
-  InvalidGMM3D result;
-  result.C = merged_means.size();
-  result.weights.setConstant(result.C, 1.0 / result.C);
-  result.means = merged_means;
-  result.covs = merged_covs;
-  return result;
+  std::lock_guard<std::mutex> lock(invalid_grid_mutex_);
+  // 回调中只缓存邻机增量；在搜索主循环按帧统一融合，保证时序一致性
+  PendingInvalidGridDelta delta;
+  delta.recv_stamp_sec = ros::Time::now().toSec();
+  delta.frame_grid = fromInvalidGridMsg(msg);
+  pending_invalid_grid_deltas_[msg->drone_id] = delta;
 }
 
 // === 6D搜索共识消息转换（复用LocalStats消息，state_dim=6）===
@@ -717,207 +681,13 @@ void search_consensus_callback(const target_ekf::LocalStats::ConstPtr& msg) {
   received_search_consensus_[msg->drone_id] = nc;
 }
 
-// === 收到其他无人机标签化共识状态的回调 ===
-void labeled_consensus_callback(const target_ekf::LabeledConsensusState::ConstPtr& msg) {
-  std::lock_guard<std::mutex> lock(labeled_stats_mutex_);
-  
-  LabeledNeighborConsensus nc; 
-  nc.label = static_cast<SearchIntent>(msg->label);
-  nc.zeta_alpha.resize(msg->alpha.size());
-  for (size_t i = 0; i < msg->alpha.size(); ++i) {
-    nc.zeta_alpha(i) = msg->alpha[i];
-  }
-  
-  nc.zeta_a.resize(msg->num_components);
-  nc.zeta_b.resize(msg->num_components);
-  
-  for (int c = 0; c < msg->num_components; ++c) {
-    nc.zeta_a[c].resize(msg->state_dim);
-    nc.zeta_b[c].resize(msg->state_dim, msg->state_dim);
-    
-    // 从数组填充a向量
-    int a_start = c * msg->state_dim;
-    for (int i = 0; i < msg->state_dim; ++i) {
-      nc.zeta_a[c](i) = msg->a[a_start + i];
-    }
-    
-    // 从数组填充b矩阵
-    int b_start = c * msg->state_dim * msg->state_dim;
-    for (int i = 0; i < msg->state_dim; ++i) {
-      for (int j = 0; j < msg->state_dim; ++j) {
-        nc.zeta_b[c](i, j) = msg->b[b_start + i * msg->state_dim + j];
-      }
-    }
-  }
-  
-  nc.has_obs = msg->has_obs;
-  nc.timestamp = msg->header.stamp;
-  
-  // 存储该标签的共识状态（追加而非覆盖）
-  received_labeled_consensus_[msg->drone_id].push_back(nc);
-}
-
-// === 邻居无人机odom回调：存储邻居位置用于匈牙利分配 ===
+// === 邻居无人机odom回调：存储邻居位置用于搜索热点分配 ===
 void neighbor_odom_callback(const nav_msgs::OdometryConstPtr& msg, int neighbor_id) {
   std::lock_guard<std::mutex> lock(neighbor_odom_mutex_);
   neighbor_positions_[neighbor_id] = Eigen::Vector3d(
       msg->pose.pose.position.x,
       msg->pose.pose.position.y,
       msg->pose.pose.position.z);
-}
-
-// === 匈牙利算法分配标签 ===
-// 输入：各无人机位置，三个搜索目标点
-// 输出：每个无人机分配到的标签，以及谁是掌管者
-void hungarianAssignLabels(const std::vector<Eigen::Vector3d>& search_targets) {
-  // 收集所有无人机位置（包括自己）
-  std::vector<std::pair<int, Eigen::Vector3d>> drone_positions;
-
-  // 添加自己的位置
-  {
-    std::lock_guard<std::mutex> lock(odom_mutex_);
-    drone_positions.push_back({drone_id_, latest_odom_pos_});
-  }
-
-  // 添加邻居位置
-  {
-    std::lock_guard<std::mutex> lock(neighbor_odom_mutex_);
-    for (const auto& kv : neighbor_positions_) {
-      drone_positions.push_back({kv.first, kv.second});
-    }
-  }
-
-  // 按drone_id排序
-  std::sort(drone_positions.begin(), drone_positions.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
-
-  int n_drones = drone_positions.size();
-  int n_labels = 3;  // STRAIGHT, LEFT_TURN, RIGHT_TURN
-
-  ROS_INFO("[dpf%d] Hungarian assignment: %d drones, 3 labels", drone_id_, n_drones);
-
-  // 打印所有无人机位置
-  for (int d = 0; d < n_drones; ++d) {
-    ROS_INFO("[dpf%d]   drone%d pos: (%.2f, %.2f, %.2f)",
-             drone_id_, drone_positions[d].first,
-             drone_positions[d].second.x(), drone_positions[d].second.y(), drone_positions[d].second.z());
-  }
-
-  // 打印搜索目标点
-  const char* target_names[] = {"STRAIGHT", "LEFT_TURN", "RIGHT_TURN"};
-  for (int l = 0; l < n_labels; ++l) {
-    ROS_INFO("[dpf%d]   target %s: (%.2f, %.2f, %.2f)",
-             drone_id_, target_names[l],
-             search_targets[l].x(), search_targets[l].y(), search_targets[l].z());
-  }
-
-  // 构建代价矩阵：drone到各搜索目标点的距离
-  Eigen::MatrixXd cost_matrix(n_drones, n_labels);
-  for (int d = 0; d < n_drones; ++d) {
-    for (int l = 0; l < n_labels; ++l) {
-      cost_matrix(d, l) = (drone_positions[d].second - search_targets[l]).norm();
-    }
-  }
-
-  // 贪心匈牙利分配（保证每个标签至少有一个无人机）
-  std::vector<int> assignments(n_drones, -1);  // drone -> label
-  std::vector<int> label_masters(n_labels, -1); // label -> master drone_id
-
-  if (n_drones <= n_labels) {
-    // 无人机数 <= 3：一对一分配
-    std::vector<bool> label_assigned(n_labels, false);
-
-    // 按距离排序所有(drone, label)对
-    std::vector<std::tuple<double, int, int>> dist_pairs;
-    for (int d = 0; d < n_drones; ++d) {
-      for (int l = 0; l < n_labels; ++l) {
-        dist_pairs.push_back({cost_matrix(d, l), d, l});
-      }
-    }
-    std::sort(dist_pairs.begin(), dist_pairs.end());
-
-    std::vector<bool> drone_assigned(n_drones, false);
-    for (const auto& [dist, d, l] : dist_pairs) {
-      if (!drone_assigned[d] && !label_assigned[l]) {
-        assignments[d] = l;
-        label_masters[l] = drone_positions[d].first;
-        drone_assigned[d] = true;
-        label_assigned[l] = true;
-      }
-    }
-  } else {
-    // 无人机数 > 3：先分配前3个掌管者，再分配剩余
-    std::vector<bool> label_assigned(n_labels, false);
-    std::vector<bool> drone_assigned(n_drones, false);
-
-    // 第一轮：为每个标签找最近的无人机作为掌管者
-    for (int l = 0; l < n_labels; ++l) {
-      int best_d = -1;
-      double best_dist = 1e9;
-      for (int d = 0; d < n_drones; ++d) {
-        if (!drone_assigned[d] && cost_matrix(d, l) < best_dist) {
-          best_d = d;
-          best_dist = cost_matrix(d, l);
-        }
-      }
-      if (best_d >= 0) {
-        assignments[best_d] = l;
-        label_masters[l] = drone_positions[best_d].first;
-        drone_assigned[best_d] = true;
-        label_assigned[l] = true;
-      }
-    }
-
-    // 第二轮：剩余无人机分配到最近的标签
-    for (int d = 0; d < n_drones; ++d) {
-      if (!drone_assigned[d]) {
-        int best_l = 0;
-        double best_dist = cost_matrix(d, 0);
-        for (int l = 1; l < n_labels; ++l) {
-          if (cost_matrix(d, l) < best_dist) {
-            best_l = l;
-            best_dist = cost_matrix(d, l);
-          }
-        }
-        assignments[d] = best_l;
-      }
-    }
-  }
-
-  // 找到本机的分配结果
-  for (int d = 0; d < n_drones; ++d) {
-    if (drone_positions[d].first == drone_id_) {
-      my_assigned_label_ = static_cast<SearchIntent>(assignments[d]);
-      is_label_master_ = (label_masters[assignments[d]] == drone_id_);
-      break;
-    }
-  }
-
-  const char* label_names[] = {"STRAIGHT", "LEFT_TURN", "RIGHT_TURN"};
-  ROS_WARN("[dpf%d] Assigned to label %s, is_master=%d",
-           drone_id_, label_names[my_assigned_label_], is_label_master_);
-
-  // 构建每个标签分配到的无人机列表
-  label_to_drones_.clear();
-  for (int l = 0; l < n_labels; ++l) {
-    label_to_drones_[static_cast<SearchIntent>(l)] = std::vector<int>();
-  }
-  for (int d = 0; d < n_drones; ++d) {
-    SearchIntent label = static_cast<SearchIntent>(assignments[d]);
-    label_to_drones_[label].push_back(drone_positions[d].first);
-  }
-  // 对每个标签内的无人机ID排序
-  for (auto& kv : label_to_drones_) {
-    std::sort(kv.second.begin(), kv.second.end());
-  }
-
-  // 打印完整分配结果
-  for (int d = 0; d < n_drones; ++d) {
-    ROS_INFO("  drone%d -> %s %s",
-             drone_positions[d].first,
-             label_names[assignments[d]],
-             (label_masters[assignments[d]] == drone_positions[d].first) ? "(master)" : "");
-  }
 }
 
 // === 【关键修复】无人机odom回调：仅保存最新位姿，不执行核心逻辑 ===
@@ -1117,6 +887,10 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       dpf_reset_suppress_count_ = 3;
       search_mode_active_ = false;
       consecutive_no_obs_count_ = 0;
+      {
+        std::lock_guard<std::mutex> lock(invalid_grid_mutex_);
+        pending_invalid_grid_deltas_.clear();
+      }
       resetCommittedDirectionState();
       activateReacquireBoost("self_reacquired");
       ROS_WARN("[dpf%d] EXITING SEARCH MODE: Target reacquired, resetting from direct observation!", drone_id_);
@@ -1125,10 +899,6 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       LocalStat local_stat = dpfPtr_->computeLocalStatsOnly(drone_id_, true);
       local_stats_pub_.publish(toMsg(local_stat, *dpfPtr_));
 
-      {
-        std::lock_guard<std::mutex> lock(labeled_stats_mutex_);
-        received_labeled_consensus_.clear();
-      }
       std_msgs::Bool search_state_msg;
       search_state_msg.data = false;
       search_state_pub_.publish(search_state_msg);
@@ -1145,6 +915,10 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
         if (time_diff < 0.5 && kv.second.has_obs) {
           search_mode_active_ = false;
           consecutive_no_obs_count_ = 0;
+          {
+            std::lock_guard<std::mutex> lock(invalid_grid_mutex_);
+            pending_invalid_grid_deltas_.clear();
+          }
           resetCommittedDirectionState();
           activateReacquireBoost("neighbor_reacquired");
           ROS_WARN("[dpf%d] EXITING SEARCH MODE: Neighbor drone %d reacquired target!", drone_id_, kv.first);
@@ -1153,10 +927,6 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       }
     }
     if (!search_mode_active_) {
-      {
-        std::lock_guard<std::mutex> lock(labeled_stats_mutex_);
-        received_labeled_consensus_.clear();
-      }
       std_msgs::Bool search_state_msg;
       search_state_msg.data = false;
       search_state_pub_.publish(search_state_msg);
@@ -1164,14 +934,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     }
 
     // ===== 新搜索方案 =====
-    // 搜索模式下降频到5Hz
-    static ros::Time last_search_update = ros::Time(0);
-    double search_dt = (ros::Time::now() - last_search_update).toSec();
-    if (search_dt < 0.2) {
-      // 未到5Hz周期，跳过本次
-      return;
-    }
-    last_search_update = ros::Time::now();
+    // 搜索模式更新频率与普通DPF主循环一致（dpf_rate）
 
     // 从6D共识GMM采样新粒子（高权重区域粒子多，已观测区域粒子被淘汰）
     search_particles_manager_->sampleParticlesFromSearchGMM(
@@ -1180,59 +943,77 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     // 粒子动力学更新
     search_particles_manager_->searchParticlesDynamicsUpdate(dpfPtr_->particles_, dpfPtr_->N_);
 
-    // 粒子分类：负观测无效 + 障碍无效
-    auto classification = search_particles_manager_->classifyInvalidParticles(
-        dpfPtr_->particles_, dpfPtr_->N_, cam_p, cam_q,
-        [](const Eigen::Vector3d& p) { return occMap_.isOccupied(p); });
-
-    // 拟合本地3D无效区域GMM（每类最多3个分量）
-    auto local_neg_obs_gmm = search_particles_manager_->fitGMM3D(
-        dpfPtr_->particles_, classification.neg_obs_indices, 3);
-    auto local_obstacle_gmm = search_particles_manager_->fitGMM3D(
-        dpfPtr_->particles_, classification.obstacle_indices, 3);
-
-    // 发布本地无效区域GMM给邻居
-    if (local_neg_obs_gmm.C > 0)
-      invalid_gmm_pub_.publish(toInvalidGMMMsg(local_neg_obs_gmm, drone_id_, 0));
-    if (local_obstacle_gmm.C > 0)
-      invalid_gmm_pub_.publish(toInvalidGMMMsg(local_obstacle_gmm, drone_id_, 1));
-
-    // 并集共识
+    // 用FOV扫描增量更新全局无效栅格
     {
-      std::lock_guard<std::mutex> lock(invalid_gmm_mutex_);
-      // 负观测GMM：TTL缓存内有效，超时自动清理
-      std::map<int, InvalidGMM3D> fresh_neg_obs_gmms;
-      const ros::Time now = ros::Time::now();
-      for (auto it = received_neg_obs_gmms_.begin(); it != received_neg_obs_gmms_.end();) {
-        const double age = (now - it->second.stamp).toSec();
-        if (age <= neg_obs_ttl_sec_) {
-          fresh_neg_obs_gmms[it->first] = it->second.gmm;
-          ++it;
-        } else {
-          it = received_neg_obs_gmms_.erase(it);
+      std::lock_guard<std::mutex> lock(invalid_grid_mutex_);
+
+      const double now_sec = ros::Time::now().toSec();
+
+      // 1. 先清理全局中过期负观测格，保持global只含有效信息
+      global_invalid_grid_.clearExpiredNegObs(now_sec, neg_obs_ttl_sec_);
+
+      // 2. 融合邻机待处理增量（按搜索主循环节拍统一并入）
+      for (const auto& kv : pending_invalid_grid_deltas_) {
+        const auto& delta = kv.second;
+        global_invalid_grid_.unionWith(delta.frame_grid, delta.recv_stamp_sec);
+      }
+      pending_invalid_grid_deltas_.clear();
+
+      // 3. 融合本机局部地图障碍增量（与邻机增量一样在主循环节拍统一并入）
+      quadrotor_msgs::OccMap3dConstPtr local_map_msg;
+      {
+        std::lock_guard<std::mutex> map_lock(local_map_cache_mutex_);
+        local_map_msg = pending_local_occ_map_msg_;
+        pending_local_occ_map_msg_.reset();
+      }
+      if (local_map_msg) {
+        mapping::OccGridMap localMap;
+        localMap.from_msg(*local_map_msg);
+        const double z_sample = 3.0;
+        for (int iy = 0; iy < global_invalid_grid_.ny; ++iy) {
+          for (int ix = 0; ix < global_invalid_grid_.nx; ++ix) {
+            if (global_invalid_grid_.get(ix, iy) == 2) continue;
+            double wx = global_invalid_grid_.origin_x + (ix + 0.5) * global_invalid_grid_.resolution;
+            double wy = global_invalid_grid_.origin_y + (iy + 0.5) * global_invalid_grid_.resolution;
+            if (localMap.isOccupied(Eigen::Vector3d(wx, wy, z_sample))) {
+              global_invalid_grid_.set(ix, iy, 2, 0.0);
+            }
+          }
         }
       }
-      global_neg_obs_gmm_ = unionGMMs(local_neg_obs_gmm, fresh_neg_obs_gmms);
 
-      // 障碍GMM：持久留存，更新本机的，保留历史邻居的
-      received_obstacle_gmms_[drone_id_] = local_obstacle_gmm;
-      global_obstacle_gmm_ = unionGMMs(InvalidGMM3D(), received_obstacle_gmms_);
+      // 4. 本帧增量：写入临时栅格
+      InvalidGrid2D frame_grid;
+      frame_grid.origin_x = grid_origin_x_;
+      frame_grid.origin_y = grid_origin_y_;
+      frame_grid.resolution = grid_resolution_;
+      frame_grid.nx = grid_nx_;
+      frame_grid.ny = grid_ny_;
+      frame_grid.cells.assign(grid_nx_ * grid_ny_, 0);
+      frame_grid.cell_times.assign(grid_nx_ * grid_ny_, 0.0);
+      search_particles_manager_->markInvalidFromParticles(
+          frame_grid, dpfPtr_->particles_, dpfPtr_->N_, cam_p, cam_q,
+          now_sec);
+
+      // 5. OR 进全局栅格（本机历史累积）
+      global_invalid_grid_.unionWith(frame_grid);
+
+      // 6. 发布本帧增量给邻居（RLE压缩，通信量小）
+      invalid_grid_pub_.publish(toInvalidGridMsg(frame_grid, drone_id_));
     }
 
-    ROS_INFO_THROTTLE(1.0, "[dpf%d] Search: neg_obs=%zu obs=%zu | global_neg_C=%d global_obs_C=%d",
-        drone_id_, classification.neg_obs_indices.size(), classification.obstacle_indices.size(),
-        global_neg_obs_gmm_.C, global_obstacle_gmm_.C);
+    ROS_INFO_THROTTLE(1.0, "[dpf%d] Search: invalid_grid cells marked", drone_id_);
 
-    // 发布全局无效GMM（用于bag录制）
-    if (global_neg_obs_gmm_.C > 0)
-      invalid_gmm_pub_.publish(toInvalidGMMMsg(global_neg_obs_gmm_, drone_id_, 0));
-    if (global_obstacle_gmm_.C > 0)
-      invalid_gmm_pub_.publish(toInvalidGMMMsg(global_obstacle_gmm_, drone_id_, 1));
-
-    // 用全局无效GMM裁剪粒子权重
-    search_particles_manager_->pruneParticlesByInvalidGMM(
-        dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_,
-        global_neg_obs_gmm_, global_obstacle_gmm_);
+    // 用全局无效栅格裁剪粒子权重（时间TTL）
+    {
+      std::lock_guard<std::mutex> lock(invalid_grid_mutex_);
+      const double now_sec = ros::Time::now().toSec();
+      search_particles_manager_->pruneParticlesByInvalidGrid(
+          dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_,
+          global_invalid_grid_, now_sec, neg_obs_ttl_sec_,
+          invalid_decay_phi_min_, invalid_decay_phi_mid_,
+          invalid_decay_r_occ_, invalid_decay_r_safe_);
+    }
 
     // === 方向承诺式搜索：定期提取热点确定方向，中间沿方向推进 ===
     const ros::Time now = ros::Time::now();
@@ -1258,7 +1039,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       for (auto& kv : drone_positions) dp_vec.push_back(kv.second);
       auto hotspots = search_particles_manager_->extractFrontierHotspotsFromParticles(
           dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_,
-          num_drones_, dp_vec, global_neg_obs_gmm_, global_obstacle_gmm_,
+          num_drones_, dp_vec, global_invalid_grid_,
           hotspot_min_drone_dist_, hotspot_seed_radius_, hotspot_invalid_reject_ratio_);
       if (hotspots.empty()) {
         hotspots = search_particles_manager_->extractHotspots(num_drones_, dp_vec);
@@ -1472,44 +1253,32 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       if (consecutive_no_obs_count_ >= enter_search_threshold && !search_mode_active_) {
         // 立即进入搜索模式并进行初始化
         search_mode_active_ = true;
+        {
+          std::lock_guard<std::mutex> lock(invalid_grid_mutex_);
+          pending_invalid_grid_deltas_.clear();
+        }
         reacquire_boost_active_ = false;
         last_global_obs_time_ = ros::Time::now();
         resetCommittedDirectionState();
         ROS_WARN("[dpf%d] ENTERING SEARCH MODE: All drones lost target for %d consecutive frames (threshold=%d)!",
                  drone_id_, consecutive_no_obs_count_, enter_search_threshold);
 
-        // 初始化6D搜索共识GMM（C = 2*num_drones）
+        // 回退到丢失观测时刻，再按搜索动力学重步进h帧，得到当前时刻搜索粒子
         auto pw = dpfPtr_->getParticlesAndWeights();
-        search_particles_manager_->initSearchGMM6D(
-            pw.first, pw.second, dpfPtr_->N_, 2 * num_drones_);
+        const int rollback_frames = std::max(0, consecutive_no_obs_count_);
+        Eigen::MatrixXd replay_particles = rollbackParticlesByConstantVelocityModel(
+            pw.first, rollback_frames, dpfPtr_->dt_);
 
-        // 计算三个搜索目标点（反推位置）
-        auto particles_and_weights = dpfPtr_->getParticlesAndWeights();
-        auto search_targets = search_particles_manager_->computeSearchTargets(
-            particles_and_weights.first,
-            particles_and_weights.second,
-            consecutive_no_obs_count_);
-
-        // 构建搜索目标点向量用于匈牙利分配
-        std::vector<Eigen::Vector3d> target_points = {
-            search_targets.forward,
-            search_targets.left_45,
-            search_targets.right_45
-        };
-
-        // 匈牙利算法分配标签
-        hungarianAssignLabels(target_points);
-
-        // 更新搜索粒子管理器的标签信息
-        search_particles_manager_->setLabelAssignment(my_assigned_label_, is_label_master_);
-
-        // 只有掌管者才初始化粒子群
-        if (is_label_master_) {
-          search_particles_manager_->initializeSingleLabelParticles(
-              search_targets.mean_pos,
-              search_targets.mean_vel,
-              consecutive_no_obs_count_);
+        for (int k = 0; k < rollback_frames; ++k) {
+          search_particles_manager_->searchParticlesDynamicsUpdate(replay_particles, dpfPtr_->N_);
         }
+
+        dpfPtr_->particles_ = replay_particles;
+        ROS_WARN("[dpf%d] Search init replay: rollback=%d frames (dt=%.3f), then search-dynamics replay=%d frames",
+                 drone_id_, rollback_frames, dpfPtr_->dt_,
+                 rollback_frames);
+        search_particles_manager_->initSearchGMM6D(
+            replay_particles, pw.second, dpfPtr_->N_, 2 * num_drones_);
 
         // 发布搜索状态
         std_msgs::Bool search_state_msg;
@@ -1760,7 +1529,15 @@ int main(int argc, char** argv) {
   nh.param("reacquire_boost_miss_min", reacquire_boost_miss_min_, 0);
   reacquire_boost_duration_sec_ = std::max(0.0, reacquire_boost_duration_sec_);
   reacquire_boost_miss_scale_ = std::max(1.0, reacquire_boost_miss_scale_);
-  nh.param("neg_obs_ttl_sec", neg_obs_ttl_sec_, 8.0);
+  nh.param("neg_obs_ttl_sec", neg_obs_ttl_sec_, 3.0);
+  nh.param("invalid_decay_phi_min", invalid_decay_phi_min_, 0.08);
+  nh.param("invalid_decay_phi_mid", invalid_decay_phi_mid_, 0.60);
+  nh.param("invalid_decay_r_occ", invalid_decay_r_occ_, -0.50);
+  nh.param("invalid_decay_r_safe", invalid_decay_r_safe_, 1.00);
+  invalid_decay_phi_min_ = std::max(0.0, std::min(1.0, invalid_decay_phi_min_));
+  invalid_decay_phi_mid_ = std::max(invalid_decay_phi_min_, std::min(1.0, invalid_decay_phi_mid_));
+  if (!(invalid_decay_r_occ_ < 0.0)) invalid_decay_r_occ_ = -0.50;
+  if (!(invalid_decay_r_safe_ > 0.0)) invalid_decay_r_safe_ = 1.00;
   nh.param("hotspot_min_drone_dist", hotspot_min_drone_dist_, 2.0);
   nh.param("hotspot_seed_radius", hotspot_seed_radius_, 1.5);
   nh.param("hotspot_invalid_reject_ratio", hotspot_invalid_reject_ratio_, 1.0);
@@ -1777,8 +1554,10 @@ int main(int argc, char** argv) {
   }
   current_hotspot_extract_interval_sec_ = hotspot_extract_interval_base_sec_;
 
-  ROS_INFO("[dpf%d] Search frontier params: neg_obs_ttl=%.1fs, min_drone_dist=%.2fm, seed_radius=%.2fm, invalid_reject_ratio=%.2f",
-           drone_id_, neg_obs_ttl_sec_, hotspot_min_drone_dist_, hotspot_seed_radius_, hotspot_invalid_reject_ratio_);
+  ROS_INFO("[dpf%d] Search frontier params: neg_obs_ttl=%.1fs, phi_min=%.2f, phi_mid=%.2f, r_occ=%.2fm, r_safe=%.2fm, min_drone_dist=%.2fm, seed_radius=%.2fm, invalid_reject_ratio=%.2f",
+           drone_id_, neg_obs_ttl_sec_, invalid_decay_phi_min_, invalid_decay_phi_mid_,
+           invalid_decay_r_occ_, invalid_decay_r_safe_,
+           hotspot_min_drone_dist_, hotspot_seed_radius_, hotspot_invalid_reject_ratio_);
   ROS_INFO("[dpf%d] Reacquire boost: hold=%.2fs, miss_scale=%.2f, miss_min=%d, base_miss=%d",
            drone_id_, reacquire_boost_duration_sec_, reacquire_boost_miss_scale_,
            reacquire_boost_miss_min_, miss_detection_num_);
@@ -1798,6 +1577,30 @@ int main(int argc, char** argv) {
   
   // 创建搜索粒子管理器
   search_particles_manager_ = std::make_unique<SearchParticlesManager>(drone_id_, num_components, &nh);
+  search_particles_manager_->setSearchDt(dpfPtr_->dt_);
+  ROS_INFO("[dpf%d] Align search_dt to dpf dt: %.3fs (%.1fHz)",
+           drone_id_, dpfPtr_->dt_, 1.0 / std::max(1e-6, dpfPtr_->dt_));
+
+  // 初始化无效区域虚拟栅格
+  nh.param("grid_origin_x", grid_origin_x_, -10.0);
+  nh.param("grid_origin_y", grid_origin_y_, -15.0);
+  nh.param("grid_resolution", grid_resolution_, 1.0);
+  nh.param("grid_nx", grid_nx_, 80);
+  nh.param("grid_ny", grid_ny_, 80);
+  {
+    auto initGrid = [&](InvalidGrid2D& g) {
+      g.origin_x = grid_origin_x_;
+      g.origin_y = grid_origin_y_;
+      g.resolution = grid_resolution_;
+      g.nx = grid_nx_;
+      g.ny = grid_ny_;
+      g.cells.assign(grid_nx_ * grid_ny_, 0);
+      g.cell_times.assign(grid_nx_ * grid_ny_, 0.0);
+    };
+    initGrid(global_invalid_grid_);
+  }
+  ROS_INFO("[dpf%d] Invalid grid: origin=(%.1f,%.1f) res=%.2f nx=%d ny=%d",
+           drone_id_, grid_origin_x_, grid_origin_y_, grid_resolution_, grid_nx_, grid_ny_);
 
   // 搜索推进速度：优先使用当前无人机 planning/vmax；找不到时回退到原搜索速度参数
   std::string ns = ros::this_node::getNamespace();
@@ -1827,19 +1630,18 @@ int main(int argc, char** argv) {
   // 订阅/发布
   target_odom_pub_ = nh.advertise<nav_msgs::Odometry>("target_odom", 1);
   local_stats_pub_ = nh.advertise<target_ekf::LocalStats>("local_stats", 1);
-  labeled_consensus_pub_ = nh.advertise<target_ekf::LabeledConsensusState>("labeled_consensus", 1);
   search_state_pub_ = nh.advertise<std_msgs::Bool>("search_state", 1);
   search_gmm_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>("search_gmm_vis", 1);
   search_pos_gmm_pub_ = nh.advertise<target_ekf::LocalStats>("search_pos_gmm", 1);
   search_gmm_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>("search_gmm_vis", 1);
   search_particles_vis_pub_ = nh.advertise<sensor_msgs::PointCloud2>("search_particles_vis", 1);
   search_targets_pub_ = nh.advertise<geometry_msgs::PoseArray>("search_targets", 1);
-  search_label_info_pub_ = nh.advertise<target_ekf::SearchLabelInfo>("search_label_info", 1);
-  invalid_gmm_pub_ = nh.advertise<target_ekf::InvalidRegionGMM>("invalid_region_gmm", 1);
+  invalid_grid_pub_ = nh.advertise<target_ekf::InvalidRegionGMM>("invalid_region_gmm", 1);
   search_consensus_pub_ = nh.advertise<target_ekf::LocalStats>("search_consensus", 1);
   
   // 地图订阅
   ros::Subscriber global_map_sub = nh.subscribe("global_map", 10, &global_map_callback);
+  ros::Subscriber local_map_sub = nh.subscribe<quadrotor_msgs::OccMap3d>("gridmap_inflate", 1, &local_map_callback, ros::TransportHints().tcpNoDelay());
   // 无人机位姿订阅（单独订阅，不再同步）
   ros::Subscriber odom_sub = nh.subscribe("odom", 100, &odom_callback, ros::TransportHints().tcpNoDelay());
   // YOLO目标订阅（单独订阅，不再同步）
@@ -1849,19 +1651,17 @@ int main(int argc, char** argv) {
     if (i == drone_id_) continue;
     std::string topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/local_stats";
     stats_subs_.push_back(nh.subscribe(topic, 10, &stats_callback));
-    std::string labeled_topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/labeled_consensus";
-    stats_subs_.push_back(nh.subscribe(labeled_topic, 10, &labeled_consensus_callback));
 
-    // 订阅邻居无人机的odom（用于匈牙利分配）
+    // 订阅邻居无人机的odom（用于搜索热点分配）
     std::string odom_topic = "/drone" + std::to_string(i) + "/odom";
     neighbor_odom_subs_.push_back(
         nh.subscribe<nav_msgs::Odometry>(odom_topic, 10,
             boost::bind(&neighbor_odom_callback, _1, i)));
-    ROS_INFO("[dpf%d] Subscribing to neighbor %d: stats, labeled_consensus, odom (%s)", drone_id_, i, odom_topic.c_str());
+    ROS_INFO("[dpf%d] Subscribing to neighbor %d: stats, odom (%s)", drone_id_, i, odom_topic.c_str());
 
-    // 订阅邻居的无效区域GMM
-    std::string invalid_gmm_topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/invalid_region_gmm";
-    invalid_gmm_subs_.push_back(nh.subscribe(invalid_gmm_topic, 10, &invalid_gmm_callback));
+    // 订阅邻居的无效区域栅格增量（消息类型沿用InvalidRegionGMM）
+    std::string invalid_grid_topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/invalid_region_gmm";
+    invalid_grid_subs_.push_back(nh.subscribe(invalid_grid_topic, 10, &invalid_grid_callback));
 
     // 订阅邻居的6D搜索共识
     std::string search_cons_topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/search_consensus";

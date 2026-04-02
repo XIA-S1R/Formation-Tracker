@@ -960,10 +960,13 @@ def draw_scene(
         seed=7,
     )
     if len(obs_draw) > 0:
+        obs_vmin = float(obs_draw[:, 2].min())
+        obs_vmax = float(obs_draw[:, 2].max())
         obs_sc = ax.scatter(
             obs_draw[:, 0], obs_draw[:, 1], obs_draw[:, 2],
             c=obs_draw[:, 2],
             cmap='plasma',
+            vmin=obs_vmin, vmax=obs_vmax,
             s=float(obstacle_point_size),
             alpha=0.70,
             linewidths=0.0,
@@ -972,30 +975,78 @@ def draw_scene(
             rasterized=True,
         )
         cbar = plt.colorbar(obs_sc, ax=ax, fraction=0.022, pad=0.01)
-        cbar.set_label('障碍高度 z (m)', fontsize=10)
+        cbar.set_label('高度 z (m)', fontsize=10)
+    else:
+        obs_vmin, obs_vmax = 0.0, 5.0
 
-    # Smooth trend curve: from current target marker through evasion waypoints.
-    trend_curve = build_smooth_trend_curve_from_waypoints(
-        best_tgt=best_tgt,
-        waypoint_xy=(evasion_waypoints or []),
-        waypoint_z=float(best_tgt[2]),
-        ctrl_count=12,
-    )
+    # 轨迹：waypoints Catmull-Rom 平滑，起点加幽灵点保证切线自然
+    trend_curve = np.empty((0, 3), dtype=np.float64)
+    if evasion_waypoints:
+        z_tgt = float(best_tgt[2])
+        wp = np.array([[float(x), float(y), z_tgt] for x, y in evasion_waypoints],
+                      dtype=np.float64)
+        start = np.asarray(best_tgt, dtype=np.float64)
+        anchors = [start]
+        for p in wp:
+            if np.linalg.norm(p - anchors[-1]) > 1e-6:
+                anchors.append(p)
+        if len(anchors) >= 2:
+            # 幽灵点：起点沿反方向延伸，让曲线在起点处切线平滑
+            ghost = anchors[0] - (anchors[1] - anchors[0]) * 0.4
+            anchors_ext = np.array([ghost] + anchors, dtype=np.float64)
+            trend_curve = catmull_rom_chain(anchors_ext, samples_per_seg=40)
+            if len(trend_curve) > 0:
+                trend_curve[0] = start  # 强制起点精确
+
     if len(trend_curve) < 2:
-        trend_curve = build_smooth_trend_curve_from_traj(traj_arr, render_ts, best_tgt, ctrl_count=7)
-    trend_arrow_count = 0
+        # fallback：真实轨迹降采样平滑
+        ctrl_idx = np.linspace(0, len(traj_arr) - 1, min(14, len(traj_arr)), dtype=int)
+        trend_curve = catmull_rom_chain(traj_arr[ctrl_idx, 1:4], samples_per_seg=40)
+
+    traj_xyz = trend_curve
+    if len(traj_xyz) >= 2:
+        nc = len(traj_xyz)
+        cmap_traj = plt.get_cmap('cool')
+        for i in range(nc - 1):
+            t_frac = i / max(1, nc - 2)
+            ax.plot(traj_xyz[i:i+2, 0], traj_xyz[i:i+2, 1], traj_xyz[i:i+2, 2],
+                    color=cmap_traj(t_frac), lw=2.0, alpha=0.90, zorder=4,
+                    solid_capstyle='round')
+
+        n_arrows = 7
+        arr_idx = np.linspace(int(nc * 0.05), int(nc * 0.90), n_arrows, dtype=int)
+        step = max(1, nc // (n_arrows * 3))
+        for i in arr_idx:
+            j = min(i + step, nc - 1)
+            p0, p1 = traj_xyz[i], traj_xyz[j]
+            d = p1 - p0
+            norm = np.linalg.norm(d)
+            if norm < 0.02:
+                continue
+            d_unit = d / norm
+            t_frac = i / max(1, nc - 2)
+            col = cmap_traj(t_frac)
+            tip = p0 + d_unit * 0.50
+            ax.plot([p0[0], tip[0]], [p0[1], tip[1]], [p0[2], tip[2]],
+                    color=col, lw=2.2, alpha=0.95, zorder=5, solid_capstyle='round')
+            ax.quiver(tip[0], tip[1], tip[2],
+                      d_unit[0], d_unit[1], d_unit[2],
+                      length=0.28, color=col,
+                      arrow_length_ratio=1.0, linewidth=0,
+                      alpha=0.95, zorder=5)
+    trend_arrow_count = n_arrows if len(traj_xyz) >= 2 else 0
 
     # Target marker at snapshot
     draw_quad_marker(
         ax,
         best_tgt[0], best_tgt[1], best_tgt[2],
-        arm=0.62, rotor_r=0.13, color='#e74c3c', lw=1.6, alpha=1.0
+        arm=0.62, rotor_r=0.13, color='#7B3F00', lw=1.6, alpha=1.0
     )
 
-    # Trackers as blue quad markers
+    # Trackers as black quad markers
     for did in drone_ids:
         p = best_pos[did]
-        draw_quad_marker(ax, p[0], p[1], p[2], arm=0.52, rotor_r=0.10, color='#1f77b4', lw=1.35, alpha=1.0)
+        draw_quad_marker(ax, p[0], p[1], p[2], arm=0.52, rotor_r=0.10, color='#111111', lw=1.35, alpha=1.0)
 
     # FOV from bag snapshot pose/orientation (light blue, near transparent)
     if show_fov and (camera_model is not None):
@@ -1005,8 +1056,7 @@ def draw_scene(
                 drone_pos=best_pos[did],
                 drone_quat_xyzw=best_quat[did],
                 camera_model=camera_model,
-                color=(0.56, 0.82, 0.99, 0.10),
-                range_scale=float(fov_range_scale),
+                color=(0.56, 0.82, 0.99, 0.10),                range_scale=float(fov_range_scale),
                 size_scale=float(fov_size_scale),
                 forward_offset=float(fov_forward_offset),
             )
@@ -1060,18 +1110,37 @@ def draw_scene(
 
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
-    frame_c = (0.78, 0.78, 0.78, 1.0)
-    grid_c = (0.88, 0.88, 0.88, 1.0)
-    ax.plot([xmin, xmax, xmax, xmin, xmin], [ymin, ymin, ymax, ymax, ymin], [z0] * 5, color=frame_c, linewidth=1.2)
-    for xv in np.linspace(xmin, xmax, 9):
-        ax.plot([xv, xv], [ymin, ymax], [z0, z0], color=grid_c, linewidth=0.7)
-    for yv in np.linspace(ymin, ymax, 9):
-        ax.plot([xmin, xmax], [yv, yv], [z0, z0], color=grid_c, linewidth=0.7)
+
+    # 地板点云：与障碍物完全相同的点大小、密度、colormap
+    floor_res = 260
+    gx, gy = np.meshgrid(np.linspace(xmin, xmax, floor_res),
+                         np.linspace(ymin, ymax, floor_res))
+    floor_base = np.column_stack([gx.ravel(), gy.ravel(),
+                                  np.full(floor_res * floor_res, z0)])
+    floor_pts = densify_obstacle_points_np(
+        floor_base,
+        max_base_points=len(floor_base),
+        densify_factor=float(obstacle_densify_factor),
+        jitter_xy=float((xmax - xmin) / floor_res) * 0.5,
+        jitter_z=0.0,
+        seed=11,
+    )
+    ax.scatter(floor_pts[:, 0], floor_pts[:, 1], floor_pts[:, 2],
+               c=floor_pts[:, 2], cmap='plasma',
+               vmin=obs_vmin, vmax=obs_vmax,
+               s=float(obstacle_point_size),
+               alpha=0.70, linewidths=0,
+               depthshade=False, zorder=0, rasterized=True)
+
+    # 地板边框
+    ax.plot([xmin, xmax, xmax, xmin, xmin],
+            [ymin, ymin, ymax, ymax, ymin],
+            [z0] * 5, color=(0.65, 0.65, 0.65, 0.8), linewidth=0.9)
 
     legend_handles = [
-        DroneLegendHandle(color='#1f77b4', count=3),
-        DroneLegendHandle(color='#e74c3c', count=1),
-        TrendLegendHandle(),
+        DroneLegendHandle(color='#111111', count=3),
+        DroneLegendHandle(color='#7B3F00', count=1),
+        Line2D([0], [0], color='#00ccff', lw=1.8, label='目标运动路线'),
         Line2D([0], [0], marker='o', markersize=6.6, markerfacecolor='#42a5f5',
                markeredgecolor='none', linestyle='none', alpha=0.70, label='Obstacles'),
     ]
@@ -1093,7 +1162,6 @@ def draw_scene(
         prop=legend_font,
         handler_map={
             DroneLegendHandle: HandlerDroneLegend(),
-            TrendLegendHandle: HandlerTrendLegend(),
         },
     )
 
@@ -1101,11 +1169,6 @@ def draw_scene(
     ax.view_init(elev=60, azim=236)
 
     fig.tight_layout(pad=0.05)
-    # 强制最上层显示：将箭头投影成2D叠加图层，不受3D遮挡。
-    fig.canvas.draw()
-    trend_arrow_count = draw_trend_overlay_on_top(
-        fig, ax, trend_curve, arrow_count=int(max(2, path_arrows))
-    )
     fig.savefig(out_path, dpi=380)
     return {
         'best_snapshot_time_sec': render_ts - start_ts,
