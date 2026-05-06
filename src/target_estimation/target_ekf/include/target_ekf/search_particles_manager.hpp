@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <ros/time.h>
 #include <ros/node_handle.h>
 #include <map>
@@ -501,21 +502,122 @@ public:
   }
 
   // 新搜索方案：粒子动力学更新
-  // 水平速度方向加扰动，速度大小从[0.5*vmax, vmax]均匀采样，步进dt
+  // 水平速度方向加扰动，速度大小从[0.5*vmax, vmax]按递增密度采样（高速度更高概率），步进dt
   void searchParticlesDynamicsUpdate(Eigen::MatrixXd& particles, int N) {
     const double sigma_theta = 30.0 * M_PI / 180.0;
     const double dt = search_dt_;
     std::normal_distribution<double> theta_dist(0.0, sigma_theta);
-    std::uniform_real_distribution<double> speed_dist(0.5 * search_vmax_, search_vmax_);
+    std::uniform_real_distribution<double> unit01(0.0, 1.0);
+    const double v_min = 0.5 * search_vmax_;
+    const double v_span = 0.5 * search_vmax_;
 
     for (int i = 0; i < N; ++i) {
       double vx = particles(3, i);
       double vy = particles(4, i);
       double theta_old = std::atan2(vy, vx);
       double theta_new = theta_old + theta_dist(rng_);
-      double v_new = speed_dist(rng_);
+      const double u = unit01(rng_);
+      const double v_new = v_min + v_span * std::sqrt(u);  // p(v) \propto (v - v_min)
       particles(3, i) = v_new * std::cos(theta_new);
       particles(4, i) = v_new * std::sin(theta_new);
+      particles(0, i) += particles(3, i) * dt;
+      particles(1, i) += particles(4, i) * dt;
+    }
+  }
+
+  // 搜索常规阶段混合更新：多数粒子稳定更新，少数粒子激进更新（每帧随机重选）
+  // aggressive_ratio: 激进粒子比例 [0,1]
+  // aggressive_theta_sigma_deg: 激进粒子航向噪声标准差（度）
+  // aggressive_speed_min_ratio: 激进粒子速度下界比例（相对search_vmax）
+  // aggressive_count_out: 返回本帧激进粒子数量（可选）
+  void searchParticlesMixedUpdate(Eigen::MatrixXd& particles, int N,
+                                  double aggressive_ratio,
+                                  double aggressive_theta_sigma_deg,
+                                  double aggressive_speed_min_ratio,
+                                  int* aggressive_count_out = nullptr) {
+    if (N <= 0) {
+      if (aggressive_count_out) *aggressive_count_out = 0;
+      return;
+    }
+
+    const double dt = search_dt_;
+    const double stable_sigma_theta = 30.0 * M_PI / 180.0;
+    const double aggressive_sigma_theta =
+        std::max(0.0, aggressive_theta_sigma_deg) * M_PI / 180.0;
+    const double ratio = clamp(aggressive_ratio, 0.0, 1.0);
+    const double aggressive_speed_min =
+        clamp(aggressive_speed_min_ratio, 0.0, 1.0) * search_vmax_;
+    const double stable_v_min = 0.5 * search_vmax_;
+    const double stable_v_span = 0.5 * search_vmax_;
+    const double aggressive_v_span = std::max(0.0, search_vmax_ - aggressive_speed_min);
+    const int k = std::max(0, std::min(N, (int)std::round(ratio * (double)N)));
+
+    std::normal_distribution<double> stable_theta_dist(0.0, stable_sigma_theta);
+    std::normal_distribution<double> aggressive_theta_dist(0.0, aggressive_sigma_theta);
+    std::uniform_real_distribution<double> unit01(0.0, 1.0);
+
+    std::vector<int> indices(N);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::shuffle(indices.begin(), indices.end(), rng_);
+    std::vector<uint8_t> is_aggressive(N, 0);
+    for (int j = 0; j < k; ++j) {
+      is_aggressive[indices[j]] = 1;
+    }
+
+    for (int i = 0; i < N; ++i) {
+      const bool aggressive = (is_aggressive[i] != 0);
+      const double theta_noise =
+          aggressive ? aggressive_theta_dist(rng_) : stable_theta_dist(rng_);
+      const double vx = particles(3, i);
+      const double vy = particles(4, i);
+      const double theta_old = std::atan2(vy, vx);
+      const double theta_new = theta_old + theta_noise;
+
+      double v_new = 0.0;
+      if (aggressive) {
+        v_new = aggressive_speed_min + aggressive_v_span * unit01(rng_);
+      } else {
+        const double u = unit01(rng_);
+        v_new = stable_v_min + stable_v_span * std::sqrt(u);  // p(v) ∝ (v-v_min)
+      }
+
+      particles(3, i) = v_new * std::cos(theta_new);
+      particles(4, i) = v_new * std::sin(theta_new);
+      particles(0, i) += particles(3, i) * dt;
+      particles(1, i) += particles(4, i) * dt;
+    }
+
+    if (aggressive_count_out) *aggressive_count_out = k;
+  }
+
+  // 搜索初期分散更新：强制粒子在水平面全向散开（与原有速度方向解耦）
+  // spread_step_idx/total_steps 用于跨帧旋转扇区，避免每帧都落在同一组角度
+  void searchParticlesWideSpreadUpdate(Eigen::MatrixXd& particles, int N,
+                                       int spread_step_idx, int spread_total_steps,
+                                       double speed_min_ratio = 0.8,
+                                       double theta_jitter_deg = 10.0) {
+    if (N <= 0) return;
+    const double dt = search_dt_;
+    const int total_steps = std::max(1, spread_total_steps);
+    const double ratio = clamp(speed_min_ratio, 0.0, 1.0);
+    const double v_min = ratio * search_vmax_;
+    const double v_max = search_vmax_;
+    const double theta_jitter = std::max(0.0, theta_jitter_deg) * M_PI / 180.0;
+
+    std::uniform_real_distribution<double> unit01(0.0, 1.0);
+    std::normal_distribution<double> theta_noise(0.0, theta_jitter);
+    const double global_phase = 2.0 * M_PI * unit01(rng_) +
+                                2.0 * M_PI * (double)std::max(0, spread_step_idx) / (double)total_steps;
+
+    for (int i = 0; i < N; ++i) {
+      // 按粒子索引均匀铺满[0, 2pi)，再叠加小抖动，形成各向分散
+      const double frac = ((double)i + 0.5) / (double)N;
+      const double theta = global_phase + 2.0 * M_PI * frac + theta_noise(rng_);
+
+      // 初期尽量高速度扩张
+      const double v = v_min + (v_max - v_min) * unit01(rng_);
+      particles(3, i) = v * std::cos(theta);
+      particles(4, i) = v * std::sin(theta);
       particles(0, i) += particles(3, i) * dt;
       particles(1, i) += particles(4, i) * dt;
     }
@@ -1343,19 +1445,15 @@ public:
     if (std::isfinite(dt) && dt > 0.0) search_dt_ = dt;
   }
 
-  /*// Setter methods
-  void setDroneId(int drone_id) { drone_id_ = drone_id; }
-  double getSearchVmax() const { return search_vmax_; }
-  void setSearchVMax(double vmax) { search_vmax_ = vmax; }
-  void setSearchVMin(double vmin) { search_vmin_ = vmin; }
-  void setIntentKeepProb(double prob) { intent_keep_prob_ = prob; }
+  // Setter methods
   void setCameraParams(double fx, double fy, double cx, double cy,
                        double width, double height, double max_range = 5.0) {
     cam_fx_ = fx; cam_fy_ = fy;
     cam_cx_ = cx; cam_cy_ = cy;
     cam_width_ = width; cam_height_ = height;
     cam_max_range_ = max_range;
-  }*/
+  }
+
   // 设置视线检查函数
   void setLineOfSightCheckFn(std::function<bool(const Eigen::Vector3d&, const Eigen::Vector3d&)> fn) {
     los_check_fn_ = fn;
