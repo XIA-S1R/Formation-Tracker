@@ -16,3 +16,4 @@ arm_length: 0.26
 motor_time_constant: 0.03333
 max_rpm: 35000.0
 min_rpm: 1200.0
+max_speed: 3.0

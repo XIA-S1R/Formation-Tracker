@@ -1,4 +1,5 @@
 #pragma once
+#include <cmath>
 #include "so3_quadrotor/geometry_utils.hpp"
 
 namespace so3_quadrotor {
@@ -14,6 +15,7 @@ struct Config {
   double          motor_time_constant; // unit: sec
   double          max_rpm;
   double          min_rpm;
+  double          max_speed;          // hard translational speed cap
 };
 struct Control {
   double rpm[4];
@@ -135,13 +137,22 @@ class Quadrotor {
     return state_dot;
   }
   // Runs the actual dynamics simulation with a time step of dt
-  inline void step(const double &dt) {
+  inline bool step(const double &dt) {
     // Runge–Kutta
     State k1 = diff(state_);
     State k2 = diff(state_+k1*dt/2);
     State k3 = diff(state_+k2*dt/2);
     State k4 = diff(state_+k3*dt);
     state_ = state_ + (k1+k2*2+k3*2+k4) * dt/6;
+
+    if (std::isfinite(config_.max_speed) && config_.max_speed > 0.0) {
+      const double speed = state_.v.norm();
+      if (speed > config_.max_speed && speed > 1e-9) {
+        state_.v *= (config_.max_speed / speed);
+        return true;
+      }
+    }
+    return false;
   }
   // get control from cmd
   inline Control getControl(const Cmd& cmd) {

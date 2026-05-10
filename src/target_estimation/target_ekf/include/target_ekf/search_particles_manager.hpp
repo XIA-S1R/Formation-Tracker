@@ -11,6 +11,7 @@
 #include <ros/time.h>
 #include <ros/node_handle.h>
 #include <map>
+#include <array>
 
 // 【修复1】删除重复定义的wrapAngle和angleDiff，直接使用target_dpf.hpp中的版本
 
@@ -38,7 +39,7 @@ public:
       num_components_(num_components),
       search_particles_initialized_(false),
       search_dt_(0.2),  // 搜索模式更新周期，5Hz
-      search_vmax_(2),        // 最大速度 m/s (默认值)
+      search_vmax_(2),        // 粒子扩展速度上限（默认值，后续可由 /target/planning/vmax 覆盖）
       search_vmin_(0.5),        // 最小速度 m/s
       search_amax_(4),        // 最大加速度 m/s² (默认值)
       intent_keep_prob_(0.8),   // 意图保持概率 80%
@@ -250,8 +251,98 @@ public:
 
   // 【修复3】手动实现clamp函数，兼容C++11
   template<typename T>
-  T clamp(const T& val, const T& min_val, const T& max_val) {
+  T clamp(const T& val, const T& min_val, const T& max_val) const {
     return std::max(min_val, std::min(val, max_val));
+  }
+
+  inline bool inSearchXYBounds(double x, double y) const {
+    if (!search_bounds_enabled_) return true;
+    return (x >= search_x_min_ && x <= search_x_max_ &&
+            y >= search_y_min_ && y <= search_y_max_);
+  }
+
+  // 若第k帧更新后越界，则回退到k-1位置并重定向（优先±90°）重新生成k帧粒子。
+  // 仅当候选方向都不可行时退化到贴边。
+  inline void enforceBoundsForMatrixParticle(Eigen::MatrixXd& particles, int i) const {
+    if (!search_bounds_enabled_) return;
+    if (particles.rows() < 5 || i < 0 || i >= particles.cols()) return;
+    if (inSearchXYBounds(particles(0, i), particles(1, i))) return;
+
+    const double dt = std::max(1e-6, search_dt_);
+    const double vx_k = particles(3, i);
+    const double vy_k = particles(4, i);
+    const double speed = std::hypot(vx_k, vy_k);
+    const double x_prev = particles(0, i) - vx_k * dt;
+    const double y_prev = particles(1, i) - vy_k * dt;
+
+    if (speed > 1e-6) {
+      const double theta0 = std::atan2(vy_k, vx_k);
+      const std::array<double, 6> candidates = {
+          M_PI / 2.0, -M_PI / 2.0, 3.0 * M_PI / 4.0,
+          -3.0 * M_PI / 4.0, M_PI, 0.0};
+      for (double dtheta : candidates) {
+        const double th = theta0 + dtheta;
+        const double vx_new = speed * std::cos(th);
+        const double vy_new = speed * std::sin(th);
+        const double x_new = x_prev + vx_new * dt;
+        const double y_new = y_prev + vy_new * dt;
+        if (inSearchXYBounds(x_new, y_new)) {
+          particles(0, i) = x_new;
+          particles(1, i) = y_new;
+          particles(3, i) = vx_new;
+          particles(4, i) = vy_new;
+          return;
+        }
+      }
+    }
+
+    // 候选方向均不可行时，退化到贴边并尽量保持速度连续。
+    const double x_clip = clamp(particles(0, i), search_x_min_, search_x_max_);
+    const double y_clip = clamp(particles(1, i), search_y_min_, search_y_max_);
+    particles(0, i) = x_clip;
+    particles(1, i) = y_clip;
+    particles(3, i) = (x_clip - x_prev) / dt;
+    particles(4, i) = (y_clip - y_prev) / dt;
+  }
+
+  inline void enforceBoundsForSearchParticle(SearchParticle& particle) const {
+    if (!search_bounds_enabled_ || particle.state.size() < 5) return;
+    if (inSearchXYBounds(particle.state(0), particle.state(1))) return;
+
+    const double dt = std::max(1e-6, search_dt_);
+    const double vx_k = particle.state(3);
+    const double vy_k = particle.state(4);
+    const double speed = std::hypot(vx_k, vy_k);
+    const double x_prev = particle.state(0) - vx_k * dt;
+    const double y_prev = particle.state(1) - vy_k * dt;
+
+    if (speed > 1e-6) {
+      const double theta0 = std::atan2(vy_k, vx_k);
+      const std::array<double, 6> candidates = {
+          M_PI / 2.0, -M_PI / 2.0, 3.0 * M_PI / 4.0,
+          -3.0 * M_PI / 4.0, M_PI, 0.0};
+      for (double dtheta : candidates) {
+        const double th = theta0 + dtheta;
+        const double vx_new = speed * std::cos(th);
+        const double vy_new = speed * std::sin(th);
+        const double x_new = x_prev + vx_new * dt;
+        const double y_new = y_prev + vy_new * dt;
+        if (inSearchXYBounds(x_new, y_new)) {
+          particle.state(0) = x_new;
+          particle.state(1) = y_new;
+          particle.state(3) = vx_new;
+          particle.state(4) = vy_new;
+          return;
+        }
+      }
+    }
+
+    const double x_clip = clamp(particle.state(0), search_x_min_, search_x_max_);
+    const double y_clip = clamp(particle.state(1), search_y_min_, search_y_max_);
+    particle.state(0) = x_clip;
+    particle.state(1) = y_clip;
+    particle.state(3) = (x_clip - x_prev) / dt;
+    particle.state(4) = (y_clip - y_prev) / dt;
   }
 
   // 更新单个粒子的状态
@@ -360,6 +451,7 @@ public:
     // 更新粒子状态
     particle.state.segment(0, 3) = pos;
     particle.state.segment(3, 3) = vel;
+    enforceBoundsForSearchParticle(particle);
     // 更新yaw：与速度方向一致
     if (v_horiz > search_vmin_) {
       particle.state(8) = std::atan2(vel.y(), vel.x());
@@ -522,83 +614,81 @@ public:
       particles(4, i) = v_new * std::sin(theta_new);
       particles(0, i) += particles(3, i) * dt;
       particles(1, i) += particles(4, i) * dt;
+      enforceBoundsForMatrixParticle(particles, i);
     }
   }
 
-  // 搜索常规阶段混合更新：多数粒子稳定更新，少数粒子激进更新（每帧随机重选）
-  // aggressive_ratio: 激进粒子比例 [0,1]
-  // aggressive_theta_sigma_deg: 激进粒子航向噪声标准差（度）
-  // aggressive_speed_min_ratio: 激进粒子速度下界比例（相对search_vmax）
-  // aggressive_count_out: 返回本帧激进粒子数量（可选）
+  // 搜索常规阶段混合更新：
+  // 每隔 mixed_hold_steps 帧，重选一批 turn_ratio 比例的粒子赋予持续角速度 omega；
+  // 其余粒子 omega=0，维持当前方向。
+  // turn_ratio: 赋予 omega 的粒子比例 [0,1]
+  // turn_theta_sigma_deg: 每个重选周期累计转角的标准差（度）
+  // mixed_hold_steps: 每组 omega 持续的帧数
+  // turning_count_out: 返回本次重选中被赋予 omega 的粒子数（可选）
   void searchParticlesMixedUpdate(Eigen::MatrixXd& particles, int N,
-                                  double aggressive_ratio,
-                                  double aggressive_theta_sigma_deg,
-                                  double aggressive_speed_min_ratio,
-                                  int* aggressive_count_out = nullptr) {
+                                  int mixed_step_idx,
+                                  int mixed_hold_steps,
+                                  double turn_ratio,
+                                  double turn_theta_sigma_deg,
+                                  int* turning_count_out = nullptr) {
     if (N <= 0) {
-      if (aggressive_count_out) *aggressive_count_out = 0;
+      if (turning_count_out) *turning_count_out = 0;
       return;
     }
 
     const double dt = search_dt_;
-    const double stable_sigma_theta = 30.0 * M_PI / 180.0;
-    const double aggressive_sigma_theta =
-        std::max(0.0, aggressive_theta_sigma_deg) * M_PI / 180.0;
-    const double ratio = clamp(aggressive_ratio, 0.0, 1.0);
-    const double aggressive_speed_min =
-        clamp(aggressive_speed_min_ratio, 0.0, 1.0) * search_vmax_;
-    const double stable_v_min = 0.5 * search_vmax_;
-    const double stable_v_span = 0.5 * search_vmax_;
-    const double aggressive_v_span = std::max(0.0, search_vmax_ - aggressive_speed_min);
+    const int hold_steps = std::max(1, mixed_hold_steps);
+    const double ratio = clamp(turn_ratio, 0.0, 1.0);
     const int k = std::max(0, std::min(N, (int)std::round(ratio * (double)N)));
 
-    std::normal_distribution<double> stable_theta_dist(0.0, stable_sigma_theta);
-    std::normal_distribution<double> aggressive_theta_dist(0.0, aggressive_sigma_theta);
-    std::uniform_real_distribution<double> unit01(0.0, 1.0);
+    const bool size_changed = ((int)mixed_turn_omegas_.size() != N);
+    if (size_changed) {
+      mixed_turn_omegas_.assign(N, 0.0);
+    }
 
-    std::vector<int> indices(N);
-    std::iota(indices.begin(), indices.end(), 0);
-    std::shuffle(indices.begin(), indices.end(), rng_);
-    std::vector<uint8_t> is_aggressive(N, 0);
-    for (int j = 0; j < k; ++j) {
-      is_aggressive[indices[j]] = 1;
+    const bool reselection_needed =
+        size_changed || (mixed_step_idx <= 0) || (mixed_step_idx % hold_steps == 0);
+    if (reselection_needed) {
+      std::fill(mixed_turn_omegas_.begin(), mixed_turn_omegas_.end(), 0.0);
+
+      std::vector<int> indices(N);
+      std::iota(indices.begin(), indices.end(), 0);
+      std::shuffle(indices.begin(), indices.end(), rng_);
+
+      const double turn_sigma = std::max(0.0, turn_theta_sigma_deg) * M_PI / 180.0;
+      const double omega_sigma = turn_sigma / (std::max(1e-6, dt) * (double)hold_steps);
+      std::normal_distribution<double> omega_dist(0.0, omega_sigma);
+
+      for (int j = 0; j < k; ++j) {
+        mixed_turn_omegas_[indices[j]] = omega_dist(rng_);
+      }
     }
 
     for (int i = 0; i < N; ++i) {
-      const bool aggressive = (is_aggressive[i] != 0);
-      const double theta_noise =
-          aggressive ? aggressive_theta_dist(rng_) : stable_theta_dist(rng_);
       const double vx = particles(3, i);
       const double vy = particles(4, i);
-      const double theta_old = std::atan2(vy, vx);
-      const double theta_new = theta_old + theta_noise;
-
-      double v_new = 0.0;
-      if (aggressive) {
-        v_new = aggressive_speed_min + aggressive_v_span * unit01(rng_);
-      } else {
-        const double u = unit01(rng_);
-        v_new = stable_v_min + stable_v_span * std::sqrt(u);  // p(v) ∝ (v-v_min)
-      }
+      const double v_new = std::hypot(vx, vy);
+      const double theta_new = std::atan2(vy, vx) + mixed_turn_omegas_[i] * dt;
 
       particles(3, i) = v_new * std::cos(theta_new);
       particles(4, i) = v_new * std::sin(theta_new);
       particles(0, i) += particles(3, i) * dt;
       particles(1, i) += particles(4, i) * dt;
+      enforceBoundsForMatrixParticle(particles, i);
     }
 
-    if (aggressive_count_out) *aggressive_count_out = k;
+    if (turning_count_out) *turning_count_out = k;
   }
 
-  // 搜索初期分散更新：强制粒子在水平面全向散开（与原有速度方向解耦）
-  // spread_step_idx/total_steps 用于跨帧旋转扇区，避免每帧都落在同一组角度
+  // 搜索初期分散更新：
+  // 第一步为每个粒子分配一个初始外扩方向；后续几步沿既有方向继续向外推进，
+  // 仅施加小角度抖动，避免“每帧重抽方向”导致云团只在原地抹开而非形成外扩环。
   void searchParticlesWideSpreadUpdate(Eigen::MatrixXd& particles, int N,
                                        int spread_step_idx, int spread_total_steps,
                                        double speed_min_ratio = 0.8,
                                        double theta_jitter_deg = 10.0) {
     if (N <= 0) return;
     const double dt = search_dt_;
-    const int total_steps = std::max(1, spread_total_steps);
     const double ratio = clamp(speed_min_ratio, 0.0, 1.0);
     const double v_min = ratio * search_vmax_;
     const double v_max = search_vmax_;
@@ -606,20 +696,36 @@ public:
 
     std::uniform_real_distribution<double> unit01(0.0, 1.0);
     std::normal_distribution<double> theta_noise(0.0, theta_jitter);
-    const double global_phase = 2.0 * M_PI * unit01(rng_) +
-                                2.0 * M_PI * (double)std::max(0, spread_step_idx) / (double)total_steps;
+    const bool initialize_directions = (spread_step_idx <= 0);
+    const double global_phase = 2.0 * M_PI * unit01(rng_);
 
     for (int i = 0; i < N; ++i) {
-      // 按粒子索引均匀铺满[0, 2pi)，再叠加小抖动，形成各向分散
-      const double frac = ((double)i + 0.5) / (double)N;
-      const double theta = global_phase + 2.0 * M_PI * frac + theta_noise(rng_);
-
-      // 初期尽量高速度扩张
-      const double v = v_min + (v_max - v_min) * unit01(rng_);
+      double theta = 0.0;
+      double v = 0.0;
+      if (initialize_directions) {
+        // 仅在spread首步按索引均匀铺满[0, 2pi)，建立一圈向外发散的初始方向。
+        const double frac = ((double)i + 0.5) / (double)N;
+        theta = global_phase + 2.0 * M_PI * frac + theta_noise(rng_);
+        v = v_min + (v_max - v_min) * unit01(rng_);
+      } else {
+        const double vx_prev = particles(3, i);
+        const double vy_prev = particles(4, i);
+        const double v_prev = std::hypot(vx_prev, vy_prev);
+        if (v_prev > 1e-6) {
+          theta = std::atan2(vy_prev, vx_prev) + theta_noise(rng_);
+          v = std::max(v_min, std::min(v_max, v_prev));
+        } else {
+          // 极少数异常情况下回退到均匀分向，避免零速度粒子滞留原地。
+          const double frac = ((double)i + 0.5) / (double)N;
+          theta = global_phase + 2.0 * M_PI * frac + theta_noise(rng_);
+          v = v_min + (v_max - v_min) * unit01(rng_);
+        }
+      }
       particles(3, i) = v * std::cos(theta);
       particles(4, i) = v * std::sin(theta);
       particles(0, i) += particles(3, i) * dt;
       particles(1, i) += particles(4, i) * dt;
+      enforceBoundsForMatrixParticle(particles, i);
     }
   }
 
@@ -941,11 +1047,116 @@ public:
     }
   }
 
+  // === 在给定高度平面上，用当前视场覆盖区域直接点亮负观测无效格 ===
+  // 仅遍历当前视场在 plane_z 平面上的投影包围盒，不扫描全图。
+  int markInvalidFromViewFootprint(InvalidGrid2D& grid,
+                                   const Eigen::Vector3d& cam_p,
+                                   const Eigen::Quaterniond& cam_q,
+                                   double plane_z,
+                                   double now_sec = 0.0,
+                                   int border_samples_per_edge = 12) {
+    if (!grid.valid()) return 0;
+    if (!std::isfinite(plane_z)) return 0;
+
+    const double min_depth = 0.1;
+    const double max_depth = cam_max_range_;
+    if (!(max_depth > min_depth)) return 0;
+
+    const Eigen::Matrix3d R_wc = cam_q.toRotationMatrix();
+    const Eigen::Matrix3d R_cw = R_wc.transpose();
+    const int edge_samples = std::max(2, border_samples_per_edge);
+
+    std::vector<Eigen::Vector2d> footprint_pts;
+    footprint_pts.reserve(edge_samples * 4 + 1);
+
+    auto appendPlaneIntersection = [&](double u, double v) {
+      Eigen::Vector3d ray_c((u - cam_cx_) / cam_fx_,
+                            (v - cam_cy_) / cam_fy_,
+                            1.0);
+      Eigen::Vector3d ray_w = R_wc * ray_c;
+      if (std::abs(ray_w.z()) < 1e-6) return;
+
+      const double depth = (plane_z - cam_p.z()) / ray_w.z();
+      if (!std::isfinite(depth) || depth <= min_depth || depth >= max_depth) return;
+
+      Eigen::Vector3d p_w = cam_p + depth * ray_w;
+      if (!std::isfinite(p_w.x()) || !std::isfinite(p_w.y())) return;
+      footprint_pts.emplace_back(p_w.x(), p_w.y());
+    };
+
+    for (int i = 0; i < edge_samples; ++i) {
+      const double alpha = (edge_samples == 1) ? 0.0 : (double)i / (double)(edge_samples - 1);
+      const double u = alpha * cam_width_;
+      const double v = alpha * cam_height_;
+      appendPlaneIntersection(u, 0.0);
+      appendPlaneIntersection(u, cam_height_);
+      appendPlaneIntersection(0.0, v);
+      appendPlaneIntersection(cam_width_, v);
+    }
+    appendPlaneIntersection(cam_cx_, cam_cy_);
+
+    if (footprint_pts.empty()) return 0;
+
+    int min_ix = grid.nx;
+    int max_ix = -1;
+    int min_iy = grid.ny;
+    int max_iy = -1;
+    for (const auto& pt : footprint_pts) {
+      int ix, iy;
+      grid.toCell(pt.x(), pt.y(), ix, iy);
+      min_ix = std::min(min_ix, ix);
+      max_ix = std::max(max_ix, ix);
+      min_iy = std::min(min_iy, iy);
+      max_iy = std::max(max_iy, iy);
+    }
+
+    min_ix = std::max(0, min_ix);
+    max_ix = std::min(grid.nx - 1, max_ix);
+    min_iy = std::max(0, min_iy);
+    max_iy = std::min(grid.ny - 1, max_iy);
+    if (min_ix > max_ix || min_iy > max_iy) return 0;
+
+    int marked = 0;
+    for (int iy = min_iy; iy <= max_iy; ++iy) {
+      for (int ix = min_ix; ix <= max_ix; ++ix) {
+        if (grid.get(ix, iy) == 2) continue;
+
+        const double wx = grid.origin_x + (ix + 0.5) * grid.resolution;
+        const double wy = grid.origin_y + (iy + 0.5) * grid.resolution;
+        Eigen::Vector3d pos_w(wx, wy, plane_z);
+        Eigen::Vector3d p_c = R_cw * (pos_w - cam_p);
+
+        if (p_c.z() <= min_depth || p_c.z() >= max_depth) continue;
+
+        const double u = p_c.x() * cam_fx_ / p_c.z() + cam_cx_;
+        const double v = p_c.y() * cam_fy_ / p_c.z() + cam_cy_;
+        if (u < 0.0 || u > cam_width_ || v < 0.0 || v > cam_height_) continue;
+
+        if (los_check_fn_ && !los_check_fn_(cam_p, pos_w)) continue;
+
+        if (grid.get(ix, iy) != 1) ++marked;
+        grid.set(ix, iy, 1, now_sec);
+      }
+    }
+    return marked;
+  }
+
   // === 用无效栅格更新粒子权重（论文2.2式，分段线性衰减）===
   // phi_min: 深无效区最小衰减因子
   // phi_mid: 无效边界处衰减因子（r=0）
   // r_occ:   无效区内截断距离（米，<0）
   // r_safe:  有效区外侧安全距离（米，>0）
+  struct PruneStats {
+    int total_particles = 0;
+    int invalid_cell_particles = 0;
+    int strong_decay_particles = 0;
+    double weight_sum_before = 0.0;
+    double weight_sum_after_raw = 0.0;
+    double weight_sum_after_norm = 0.0;
+    double mean_phi = 1.0;
+    double min_phi = 1.0;
+  };
+
   void pruneParticlesByInvalidGrid(Eigen::MatrixXd& particles,
                                    Eigen::VectorXd& weights, int N,
                                    InvalidGrid2D& grid,
@@ -953,13 +1164,27 @@ public:
                                    double phi_min = 0.0,
                                    double phi_mid = 0.5,
                                    double r_occ   = -0.5,
-                                   double r_safe  =  0.5) {
+                                   double r_safe  =  0.5,
+                                   PruneStats* stats_out = nullptr,
+                                   double strong_phi_threshold = 0.35) {
     if (!grid.valid() || N <= 0 || weights.size() < N) return;
 
     phi_min = std::max(0.0, std::min(1.0, phi_min));
     phi_mid = std::max(phi_min, std::min(1.0, phi_mid));
     if (!(r_occ < 0.0)) r_occ = -std::max(1e-3, grid.resolution);
     if (!(r_safe > 0.0)) r_safe =  std::max(1e-3, grid.resolution);
+    strong_phi_threshold = std::max(0.0, std::min(1.0, strong_phi_threshold));
+
+    if (stats_out) {
+      stats_out->total_particles = N;
+      stats_out->invalid_cell_particles = 0;
+      stats_out->strong_decay_particles = 0;
+      stats_out->weight_sum_before = weights.head(N).sum();
+      stats_out->weight_sum_after_raw = 0.0;
+      stats_out->weight_sum_after_norm = 0.0;
+      stats_out->mean_phi = 0.0;
+      stats_out->min_phi = 1.0;
+    }
 
     // 每帧基于当前TTL有效无效域重建有符号距离场，供权重衰减使用
     grid.computeDistField(now_sec, ttl_sec);
@@ -988,11 +1213,24 @@ public:
       const double r = static_cast<double>(grid.signedDist(wx, wy));
       const double phi = std::max(phi_min, std::min(1.0, decayFactor(r)));
       weights(i) *= phi;
+
+      if (stats_out) {
+        stats_out->weight_sum_after_raw += weights(i);
+        stats_out->mean_phi += phi;
+        stats_out->min_phi = std::min(stats_out->min_phi, phi);
+        if (phi <= strong_phi_threshold) ++stats_out->strong_decay_particles;
+        if (phi < 0.999999) ++stats_out->invalid_cell_particles;
+      }
     }
 
     double wsum = weights.sum();
     if (wsum > 1e-300) weights /= wsum;
     else               weights.setConstant(N, 1.0 / N);
+
+    if (stats_out) {
+      stats_out->weight_sum_after_norm = weights.head(N).sum();
+      stats_out->mean_phi = (N > 0) ? (stats_out->mean_phi / static_cast<double>(N)) : 1.0;
+    }
   }
 
   // === 6D全粒子共识 ===
@@ -1015,6 +1253,14 @@ public:
     std::vector<Eigen::MatrixXd> zeta_b;
     bool has_obs;
     ros::Time timestamp;
+  };
+
+  struct SearchFallbackGMM6D {
+    bool valid = false;
+    int C = 0;
+    Eigen::VectorXd pi;
+    std::vector<Eigen::VectorXd> mu;
+    std::vector<Eigen::MatrixXd> S;
   };
 
   // 初始化6D搜索GMM（进入搜索模式时调用）
@@ -1178,6 +1424,169 @@ public:
       // 写入粒子的前6维（pos+vel），保留后3维（rpy）
       particles.col(i).head(nx6_) = x6;
     }
+    weights.setConstant(N, 1.0 / N);
+  }
+
+  // 从当前粒子云拟合一个跨机接管用的6D GMM快照
+  SearchFallbackGMM6D buildSearchFallbackGMM(const Eigen::MatrixXd& particles,
+                                             const Eigen::VectorXd& weights, int N, int C) const {
+    SearchFallbackGMM6D model;
+    if (N <= 0 || particles.rows() < nx6_ || particles.cols() <= 0 || weights.size() <= 0) {
+      return model;
+    }
+
+    const int n = std::min<int>(N, std::min<int>(particles.cols(), weights.size()));
+    struct Candidate {
+      int idx = -1;
+      double w = 0.0;
+      Eigen::Vector3d pos = Eigen::Vector3d::Zero();
+      Eigen::Vector3d vel = Eigen::Vector3d::Zero();
+    };
+
+    std::vector<Candidate> candidates;
+    candidates.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      const double w = std::max(0.0, weights(i));
+      if (w <= 1e-12) continue;
+      Candidate c;
+      c.idx = i;
+      c.w = w;
+      c.pos = particles.col(i).head(3);
+      c.vel = particles.col(i).segment(3, 3);
+      candidates.push_back(c);
+    }
+    if (candidates.empty()) return model;
+
+    const int K = std::max(1, std::min(C, static_cast<int>(candidates.size())));
+    std::vector<int> seeds;
+    std::vector<bool> selected(candidates.size(), false);
+    seeds.reserve(K);
+
+    int first = -1;
+    double first_score = -1.0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      if (candidates[i].w > first_score) {
+        first_score = candidates[i].w;
+        first = static_cast<int>(i);
+      }
+    }
+    if (first < 0) return model;
+    seeds.push_back(first);
+    selected[first] = true;
+
+    while (static_cast<int>(seeds.size()) < K) {
+      int best = -1;
+      double best_score = -1.0;
+      for (size_t i = 0; i < candidates.size(); ++i) {
+        if (selected[i]) continue;
+        double dmin = std::numeric_limits<double>::infinity();
+        for (int sid : seeds) {
+          dmin = std::min(dmin, (candidates[i].pos - candidates[sid].pos).norm());
+        }
+        const double score = candidates[i].w * std::max(0.1, dmin);
+        if (score > best_score) {
+          best_score = score;
+          best = static_cast<int>(i);
+        }
+      }
+      if (best < 0) break;
+      seeds.push_back(best);
+      selected[best] = true;
+    }
+
+    const double pos_sigma2 = 1.5 * 1.5;
+    const double vel_sigma2 = 1.0 * 1.0;
+    const double eps = 1e-12;
+    model.C = static_cast<int>(seeds.size());
+    model.pi = Eigen::VectorXd::Zero(model.C);
+    model.mu.resize(model.C);
+    model.S.resize(model.C);
+
+    for (int k = 0; k < model.C; ++k) {
+      model.mu[k].setZero(nx6_);
+      model.S[k].setZero(nx6_, nx6_);
+      const Candidate& seed = candidates[seeds[k]];
+      Eigen::VectorXd sum_x = Eigen::VectorXd::Zero(nx6_);
+      double alpha = 0.0;
+      for (const auto& c : candidates) {
+        const Eigen::Vector3d dp = c.pos - seed.pos;
+        const Eigen::Vector3d dv = c.vel - seed.vel;
+        const double dist2 = dp.squaredNorm() / pos_sigma2 + dv.squaredNorm() / vel_sigma2;
+        const double kernel = std::exp(-0.5 * dist2);
+        const double w = c.w * kernel;
+        if (w <= eps) continue;
+        sum_x += w * particles.col(c.idx).head(nx6_);
+        alpha += w;
+      }
+      if (alpha <= eps) {
+        model.mu[k] = particles.col(seed.idx).head(nx6_);
+        model.S[k] = Eigen::MatrixXd::Identity(nx6_, nx6_) * 0.5;
+        model.pi(k) = seed.w;
+        continue;
+      }
+      Eigen::VectorXd mean6 = sum_x / alpha;
+      Eigen::MatrixXd cov6 = Eigen::MatrixXd::Zero(nx6_, nx6_);
+      for (const auto& c : candidates) {
+        const Eigen::Vector3d dp = c.pos - seed.pos;
+        const Eigen::Vector3d dv = c.vel - seed.vel;
+        const double dist2 = dp.squaredNorm() / pos_sigma2 + dv.squaredNorm() / vel_sigma2;
+        const double kernel = std::exp(-0.5 * dist2);
+        const double w = c.w * kernel;
+        if (w <= eps) continue;
+        const Eigen::VectorXd diff = particles.col(c.idx).head(nx6_) - mean6;
+        cov6 += w * diff * diff.transpose();
+      }
+      cov6 /= alpha;
+      cov6 += Eigen::MatrixXd::Identity(nx6_, nx6_) * 1e-4;
+      model.mu[k] = mean6;
+      model.S[k] = cov6;
+      model.pi(k) = alpha;
+    }
+
+    const double pi_sum = model.pi.sum();
+    if (!(pi_sum > 1e-300)) return model;
+    model.pi /= pi_sum;
+    model.valid = true;
+    return model;
+  }
+
+  // 依据外部拟合的6D GMM模型采样粒子
+  void sampleParticlesFromSearchGMMModel(Eigen::MatrixXd& particles,
+                                         Eigen::VectorXd& weights, int N,
+                                         const SearchFallbackGMM6D& model) {
+    if (!model.valid || model.C <= 0 || model.pi.size() != model.C) return;
+    if (particles.rows() < nx6_) return;
+
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    std::normal_distribution<double> normal(0.0, 1.0);
+    Eigen::MatrixXd new_particles(particles.rows(), N);
+
+    const double pi_sum = model.pi.sum();
+    if (!(pi_sum > 1e-300)) return;
+    const Eigen::VectorXd pi = model.pi / pi_sum;
+
+    for (int i = 0; i < N; ++i) {
+      double u = uniform(rng_);
+      double cum = 0.0;
+      int c_sel = model.C - 1;
+      for (int c = 0; c < model.C; ++c) {
+        cum += pi(c);
+        if (u <= cum) { c_sel = c; break; }
+      }
+
+      Eigen::LLT<Eigen::MatrixXd> llt(model.S[c_sel]);
+      Eigen::MatrixXd L = llt.matrixL();
+      Eigen::VectorXd noise(nx6_);
+      for (int j = 0; j < nx6_; ++j) noise(j) = normal(rng_);
+      Eigen::VectorXd x6 = model.mu[c_sel] + L * noise;
+
+      new_particles.col(i) = particles.col(i);
+      new_particles.col(i).head(nx6_) = x6;
+      new_particles(6, i) = wrapAngle(new_particles(6, i));
+      new_particles(7, i) = wrapAngle(new_particles(7, i));
+      new_particles(8, i) = wrapAngle(new_particles(8, i));
+    }
+    particles = new_particles;
     weights.setConstant(N, 1.0 / N);
   }
 
@@ -1444,6 +1853,29 @@ public:
   void setSearchDt(double dt) {
     if (std::isfinite(dt) && dt > 0.0) search_dt_ = dt;
   }
+
+  // 搜索模式粒子边界约束（通常使用无效栅格地图边界）
+  void setSearchXYBounds(double min_x, double max_x,
+                         double min_y, double max_y,
+                         bool enable = true) {
+    if (!enable) {
+      search_bounds_enabled_ = false;
+      return;
+    }
+    if (!std::isfinite(min_x) || !std::isfinite(max_x) ||
+        !std::isfinite(min_y) || !std::isfinite(max_y) ||
+        max_x <= min_x || max_y <= min_y) {
+      search_bounds_enabled_ = false;
+      return;
+    }
+    search_x_min_ = min_x;
+    search_x_max_ = max_x;
+    search_y_min_ = min_y;
+    search_y_max_ = max_y;
+    search_bounds_enabled_ = true;
+  }
+
+  bool searchXYBoundsEnabled() const { return search_bounds_enabled_; }
 
   // Setter methods
   void setCameraParams(double fx, double fy, double cx, double cy,
@@ -1759,8 +2191,16 @@ private:
   double cam_fx_, cam_fy_, cam_cx_, cam_cy_;
   double cam_width_, cam_height_, cam_max_range_;
 
+  // 搜索粒子XY边界
+  bool search_bounds_enabled_ = false;
+  double search_x_min_ = 0.0;
+  double search_x_max_ = 0.0;
+  double search_y_min_ = 0.0;
+  double search_y_max_ = 0.0;
+
   // 随机数生成器
   std::mt19937 rng_;
+  std::vector<double> mixed_turn_omegas_;  // mixed更新中每个粒子的持续角速度(rad/s)
   
   // 按标签存储的共识状态（用于分布式共识）
   std::map<SearchIntent, Eigen::VectorXd> zeta_alpha_;      // 全局alpha共识状态

@@ -20,6 +20,7 @@
 #include <target_ekf/target_ekf.hpp>
 #include <target_ekf/target_dpf.hpp>
 #include <target_ekf/LocalStats.h>
+#include <target_ekf/SearchBranchHealth.h>
 #include <target_ekf/InvalidRegionGMM.h>
 #include <std_msgs/Bool.h>
 #include <unordered_set>
@@ -37,6 +38,16 @@ struct GMMAssignment {
   double distance;
 };
 
+struct SearchCoverageAssignment {
+  int drone_vec_index = -1;
+  int drone_id = -1;
+  int hotspot_index = -1;
+  double utility = -1e9;
+  double distance = 0.0;
+  double overlap_penalty = 0.0;
+  double reuse_penalty = 0.0;
+};
+
 void matchGMMCenters(const std::vector<Eigen::Vector3d>& current_mu,
                      const Eigen::VectorXd& current_pi,
                      double distance_threshold = 2.0);
@@ -44,19 +55,28 @@ std::vector<GMMAssignment> assignGMMTasks(const std::vector<Eigen::Vector3d>& dr
                                           const std::vector<Eigen::Vector3d>& gmm_centers,
                                           const std::vector<int>& gmm_ids,
                                           const Eigen::VectorXd& gmm_weights);
+bool isLineOfSightClear(const Eigen::Vector3d& start, const Eigen::Vector3d& end);
+std::vector<SearchCoverageAssignment> assignSearchHotspotsForCoverage(
+    const std::vector<std::pair<int, Eigen::Vector3d>>& drone_positions,
+    const std::vector<SearchParticlesManager::SearchHotspot>& hotspots);
 
 // === 全局变量 ===
 // 发布器
 ros::Publisher target_odom_pub_;
 ros::Publisher local_stats_pub_;
 ros::Publisher search_state_pub_;
+ros::Publisher search_particles_vis_pre_prune_pub_;
 ros::Publisher search_particles_vis_pub_;
+ros::Publisher search_particles_vis_post_prune_pub_;
+ros::Publisher search_branch_health_pub_;
+ros::Publisher search_fallback_model_pub_;
 ros::Publisher search_gmm_vis_pub_; // 搜索GMM分布可视化发布器
 ros::Publisher search_pos_gmm_pub_;  // 位置GMM发布器
 ros::Publisher search_targets_pub_;  // 搜索目标点发布器
 ros::Publisher invalid_grid_pub_;      // 无效区域栅格发布器（消息类型沿用InvalidRegionGMM）
 std::vector<ros::Subscriber> stats_subs_;
 std::vector<ros::Subscriber> invalid_grid_subs_; // 邻居无效区域栅格订阅
+std::vector<ros::Subscriber> search_branch_health_subs_;
 
 // 相机外参
 Eigen::Matrix3d cam2body_R_;
@@ -131,11 +151,11 @@ int reacquire_boost_miss_min_ = 0;                     // 回搜阈值最小值�
 Eigen::Vector3d committed_search_dir_ = Eigen::Vector3d::Zero();
 Eigen::Vector3d committed_target_pos_ = Eigen::Vector3d::Zero(); // 当前推进目标
 ros::Time last_hotspot_extract_time_ = ros::Time(0);
-double hotspot_extract_interval_base_sec_ = 2.0;   // 承诺方向基础持续时间(秒)
-double hotspot_extract_interval_growth_sec_ = 0.5; // 每次重提取后递增长度(秒)
-double hotspot_extract_interval_max_sec_ = 8.0;    // 承诺方向持续时间上限(秒)
-double current_hotspot_extract_interval_sec_ = 2.0; // 当前生效的承诺持续时间(秒)
-int committed_direction_refresh_count_ = 0;         // 当前搜索阶段内方向重提取次数
+double hotspot_extract_interval_base_sec_ = 2.0;   // 热点重提取固定周期(秒)
+double hotspot_extract_interval_growth_sec_ = 0.0; // 兼容旧参数，当前不再使用
+double hotspot_extract_interval_max_sec_ = 2.0;    // 兼容旧参数，当前固定等于base
+double current_hotspot_extract_interval_sec_ = 2.0; // 当前生效的固定重提取周期(秒)
+int committed_direction_refresh_count_ = 0;         // 当前搜索阶段内热点重提取次数
 bool has_committed_direction_ = false;
 double search_advance_vmax_ = 2.0; // 搜索模式推进速度，优先使用当前无人机 planning/vmax
 double neg_obs_ttl_sec_ = 0.5;               // 负观测无效区域记忆时长（秒）
@@ -143,9 +163,23 @@ int search_mode_frame_count_ = 0;            // 已进入搜索模式后的帧�
 int search_spread_init_frames_ = 8;          // 搜索初期强制分散帧数
 double search_spread_speed_min_ratio_ = 0.8; // 分散阶段速度下界比例（相对search_vmax）
 double search_spread_theta_jitter_deg_ = 10.0; // 分散阶段角度抖动（度）
-double search_aggressive_ratio_ = 0.10;      // 常规搜索阶段：每帧激进更新粒子比例
-double search_aggressive_theta_sigma_deg_ = 120.0; // 激进粒子航向噪声标准差（度）
-double search_aggressive_speed_min_ratio_ = 0.8;   // 激进粒子速度下界比例（相对search_vmax）
+double search_mixed_turn_ratio_ = 0.50;      // 常规搜索阶段：每个重选周期内赋予omega的粒子比例
+double search_mixed_turn_theta_sigma_deg_ = 90.0; // 常规搜索阶段：每个重选周期内累计转角标准差（度）
+int search_mixed_turn_hold_steps_ = 5;       // mixed更新中，每组omega持续的帧数
+double search_ess_resample_ratio_ = 0.50;          // 搜索期ESS重采样阈值比例
+double search_resample_jitter_pos_m_ = 0.15;       // 搜索重采样后位置抖动标准差(m)
+double search_resample_jitter_vel_mps_ = 0.20;     // 搜索重采样后速度抖动标准差(m/s)
+double search_branch_retained_mass_ratio_ = 0.35;   // 分支失效判据：裁剪后保留质量比例下限
+double search_branch_strong_decay_ratio_ = 0.55;    // 分支失效判据：强削权粒子比例上限
+double search_branch_strong_phi_threshold_ = 0.35;  // 强削权判定阈值(phi<=threshold)
+double search_branch_neff_ratio_ = 0.25;            // 分支失效判据：Neff比例下限
+double search_branch_model_age_sec_ = 0.60;          // 可接管模型最大时延(s)
+int search_em_session_target_iters_ = 12;          // 任务重分配前EM会话目标迭代轮数
+double search_em_session_timeout_sec_ = 0.25;      // 任务重分配前EM会话超时(s)
+bool search_em_wait_for_allocation_ = true;        // 是否等待EM会话完成后再重分配
+bool search_em_session_active_ = false;            // 当前是否处于EM会话窗口
+int search_em_session_done_iters_ = 0;             // 当前EM会话已执行轮数
+ros::Time search_em_session_deadline_ = ros::Time(0); // 当前EM会话截止时间
 double invalid_decay_phi_min_ = 0.08;        // 论文2.2: 深无效区最小权重衰减（推荐初值）
 double invalid_decay_phi_mid_ = 0.95;        // 论文2.2: 边界处权重衰减（推荐初值）
 double invalid_decay_r_occ_ = -0.50;         // 论文2.2: 无效区内截断距离(m, <0)（推荐初值）
@@ -153,6 +187,12 @@ double invalid_decay_r_safe_ = 0.05;         // 论文2.2: 有效区安全距离
 double hotspot_min_drone_dist_ = 2.0;        // 热点与最近无人机最小期望距离
 double hotspot_seed_radius_ = 1.5;           // 热点局部融合半径
 double hotspot_invalid_reject_ratio_ = 1.0;  // 无效密度拒绝阈值（相对prune阈值）
+double search_assign_weight_scale_ = 25.0;   // 搜索分配：热点权重收益系数
+double search_assign_distance_cost_ = 1.0;   // 搜索分配：路径距离代价系数
+double search_assign_overlap_radius_m_ = 4.0; // 搜索分配：热点重叠判定半径
+double search_assign_overlap_penalty_ = 6.0; // 搜索分配：与已分配热点重叠惩罚
+double search_assign_reuse_penalty_ = 8.0;   // 搜索分配：热点被重复复用的惩罚
+bool search_hold_assigned_target_ = true;    // 搜索分配后保持当前任务点，交给规划器稳定A*过去
 
 // 无效区域虚拟栅格存储（并集共识）
 using InvalidGrid2D = SearchParticlesManager::InvalidGrid2D;
@@ -163,7 +203,8 @@ double grid_origin_y_ = -15.0;
 double grid_resolution_ = 0.5;
 int grid_nx_ = 80;
 int grid_ny_ = 80;
-double search_local_grid_margin_m_ = -1.0;  // <0:自动最小边界；>=0:手动外扩边界(m)
+double grid_map_size_x_ = -1.0;
+double grid_map_size_y_ = -1.0;
 InvalidGrid2D global_invalid_grid_;  // 全局无效区域（本机历史 + 邻机/本机地图增量在搜索主循环中统一并入）
 struct PendingInvalidGridDelta {
   double recv_stamp_sec = 0.0;
@@ -215,6 +256,34 @@ void updateReacquireBoostState() {
   }
 }
 
+void startSearchEmSession(const ros::Time& now, const char* reason) {
+  search_em_session_active_ = true;
+  search_em_session_done_iters_ = 0;
+  const double timeout = std::max(0.05, search_em_session_timeout_sec_);
+  search_em_session_deadline_ = now + ros::Duration(timeout);
+  ROS_INFO("[dpf%d] Search EM session started (%s): target_iters=%d timeout=%.3fs",
+           drone_id_, reason ? reason : "unknown",
+           std::max(1, search_em_session_target_iters_), timeout);
+}
+
+void clearSearchEmSession(const char* reason) {
+  if (search_em_session_active_ || search_em_session_done_iters_ > 0) {
+    ROS_INFO("[dpf%d] Search EM session cleared (%s): done_iters=%d",
+             drone_id_, reason ? reason : "clear", search_em_session_done_iters_);
+  }
+  search_em_session_active_ = false;
+  search_em_session_done_iters_ = 0;
+  search_em_session_deadline_ = ros::Time(0);
+}
+
+bool isSearchEmSessionFinished(const ros::Time& now) {
+  if (!search_em_session_active_) return true;
+  const bool reached_iters =
+      search_em_session_done_iters_ >= std::max(1, search_em_session_target_iters_);
+  const bool timeout = (search_em_session_deadline_.isValid() && now >= search_em_session_deadline_);
+  return reached_iters || timeout;
+}
+
 struct ParticleKinematicSummary {
   Eigen::Vector3d pos_mean = Eigen::Vector3d::Zero();
   Eigen::Vector3d vel_mean = Eigen::Vector3d::Zero();
@@ -245,146 +314,6 @@ ParticleKinematicSummary computeParticleKinematicSummary(
     s.vel_mean += w * particles.col(i).segment(3, 3);
   }
   return s;
-}
-
-struct GridWindow2D {
-  int ix0 = 0;
-  int iy0 = 0;
-  int ix1 = -1;
-  int iy1 = -1;
-
-  inline bool valid() const {
-    return ix0 <= ix1 && iy0 <= iy1;
-  }
-  inline int width() const {
-    return valid() ? (ix1 - ix0 + 1) : 0;
-  }
-  inline int height() const {
-    return valid() ? (iy1 - iy0 + 1) : 0;
-  }
-};
-
-GridWindow2D fullGridWindow(const InvalidGrid2D& grid) {
-  GridWindow2D w;
-  if (!grid.valid()) return w;
-  w.ix0 = 0;
-  w.iy0 = 0;
-  w.ix1 = grid.nx - 1;
-  w.iy1 = grid.ny - 1;
-  return w;
-}
-
-GridWindow2D clampGridWindow(const GridWindow2D& in, const InvalidGrid2D& grid) {
-  if (!grid.valid()) return GridWindow2D{};
-  GridWindow2D w = in;
-  w.ix0 = std::max(0, std::min(grid.nx - 1, w.ix0));
-  w.ix1 = std::max(0, std::min(grid.nx - 1, w.ix1));
-  w.iy0 = std::max(0, std::min(grid.ny - 1, w.iy0));
-  w.iy1 = std::max(0, std::min(grid.ny - 1, w.iy1));
-  if (!w.valid()) return GridWindow2D{};
-  return w;
-}
-
-GridWindow2D computeActiveParticleWindow(const InvalidGrid2D& grid,
-                                         const Eigen::MatrixXd& particles,
-                                         int N,
-                                         double margin_m) {
-  if (!grid.valid() || N <= 0 || particles.rows() < 2 || particles.cols() < N) {
-    return fullGridWindow(grid);
-  }
-
-  double min_x =  std::numeric_limits<double>::infinity();
-  double min_y =  std::numeric_limits<double>::infinity();
-  double max_x = -std::numeric_limits<double>::infinity();
-  double max_y = -std::numeric_limits<double>::infinity();
-
-  for (int i = 0; i < N; ++i) {
-    const double x = particles(0, i);
-    const double y = particles(1, i);
-    if (!std::isfinite(x) || !std::isfinite(y)) continue;
-    min_x = std::min(min_x, x);
-    min_y = std::min(min_y, y);
-    max_x = std::max(max_x, x);
-    max_y = std::max(max_y, y);
-  }
-
-  if (!std::isfinite(min_x) || !std::isfinite(min_y) ||
-      !std::isfinite(max_x) || !std::isfinite(max_y)) {
-    return fullGridWindow(grid);
-  }
-
-  const double margin = std::max(0.0, margin_m);
-  min_x -= margin;
-  min_y -= margin;
-  max_x += margin;
-  max_y += margin;
-
-  int ix0, iy0, ix1, iy1;
-  grid.toCell(min_x, min_y, ix0, iy0);
-  grid.toCell(max_x, max_y, ix1, iy1);
-  if (ix0 > ix1) std::swap(ix0, ix1);
-  if (iy0 > iy1) std::swap(iy0, iy1);
-
-  GridWindow2D w;
-  w.ix0 = ix0;
-  w.iy0 = iy0;
-  w.ix1 = ix1;
-  w.iy1 = iy1;
-  w = clampGridWindow(w, grid);
-  if (!w.valid()) {
-    return fullGridWindow(grid);
-  }
-  return w;
-}
-
-double resolveLocalGridMarginMeters() {
-  // 自动模式：只保留衰减模型所需的最小边界，尽量逼近“仅涉及栅格”。
-  if (search_local_grid_margin_m_ >= 0.0) {
-    return search_local_grid_margin_m_;
-  }
-  const double support = std::max(invalid_decay_r_safe_, -invalid_decay_r_occ_);
-  return std::max(0.0, support + grid_resolution_);
-}
-
-InvalidGrid2D extractSubGrid(const InvalidGrid2D& src, const GridWindow2D& win) {
-  InvalidGrid2D out;
-  if (!src.valid() || !win.valid()) return out;
-
-  out.origin_x = src.origin_x + win.ix0 * src.resolution;
-  out.origin_y = src.origin_y + win.iy0 * src.resolution;
-  out.resolution = src.resolution;
-  out.nx = win.width();
-  out.ny = win.height();
-  out.cells.assign(out.nx * out.ny, 0);
-  out.cell_times.assign(out.nx * out.ny, 0.0);
-
-  for (int liy = 0; liy < out.ny; ++liy) {
-    const int siy = win.iy0 + liy;
-    for (int lix = 0; lix < out.nx; ++lix) {
-      const int six = win.ix0 + lix;
-      const int src_idx = siy * src.nx + six;
-      const int dst_idx = liy * out.nx + lix;
-      out.cells[dst_idx] = src.cells[src_idx];
-      out.cell_times[dst_idx] = src.cell_times[src_idx];
-    }
-  }
-  return out;
-}
-
-void writeSubGrid(InvalidGrid2D& dst, const GridWindow2D& win, const InvalidGrid2D& sub) {
-  if (!dst.valid() || !win.valid() || !sub.valid()) return;
-  if (sub.nx != win.width() || sub.ny != win.height()) return;
-
-  for (int liy = 0; liy < sub.ny; ++liy) {
-    const int diy = win.iy0 + liy;
-    for (int lix = 0; lix < sub.nx; ++lix) {
-      const int dix = win.ix0 + lix;
-      const int dst_idx = diy * dst.nx + dix;
-      const int src_idx = liy * sub.nx + lix;
-      dst.cells[dst_idx] = sub.cells[src_idx];
-      dst.cell_times[dst_idx] = sub.cell_times[src_idx];
-    }
-  }
 }
 
 void trimReliableSnapshotRing() {
@@ -447,10 +376,24 @@ const SearchInitSnapshot* getFrozenSnapshot() {
 // 6D搜索共识邻居数据
 using NeighborConsensus6D = SearchParticlesManager::NeighborConsensus6D;
 using LocalStat6D = SearchParticlesManager::LocalStat6D;
+struct SearchFallbackModel {
+  target_ekf::LocalStats msg;
+  ros::Time model_stamp;
+  ros::Time health_stamp;
+  bool healthy = false;
+  double retained_mass_ratio = 0.0;
+  double strong_decay_ratio = 0.0;
+  double neff_ratio = 0.0;
+  double mean_phi = 0.0;
+  double health_score = 0.0;
+};
+std::map<int, SearchFallbackModel> received_search_fallback_models_;
+std::mutex search_fallback_mutex_;
 std::map<int, NeighborConsensus6D> received_search_consensus_;
 std::mutex search_consensus_mutex_;
 ros::Publisher search_consensus_pub_;
 std::vector<ros::Subscriber> search_consensus_subs_;
+std::vector<ros::Subscriber> search_fallback_model_subs_;
 
 // 邻居无人机位置（用于搜索热点分配）
 std::map<int, Eigen::Vector3d> neighbor_positions_;
@@ -470,6 +413,249 @@ std::vector<Eigen::Vector3d> prev_pos_gmm_mu_;  // 上一帧的GMM中心
 std::vector<int> gmm_center_ids_;               // 每个中心的持久ID
 int next_gmm_id_ = 0;                           // 下一个可用的ID
 std::mt19937 rng_;                              // 随机数生成器
+
+double computeEffectiveSampleSize(const Eigen::VectorXd& weights) {
+  if (weights.size() <= 0) return 0.0;
+  const double sum_w = weights.sum();
+  if (!(sum_w > 1e-300)) return 0.0;
+  const Eigen::VectorXd wn = weights / sum_w;
+  const double sum_w2 = wn.squaredNorm();
+  if (!(sum_w2 > 1e-300)) return 0.0;
+  return 1.0 / sum_w2;
+}
+
+double computeSearchHotspotOverlap(
+    const SearchParticlesManager::SearchHotspot& a,
+    const SearchParticlesManager::SearchHotspot& b,
+    double radius_m) {
+  const double radius = std::max(1e-3, radius_m);
+  const double d = (a.pos - b.pos).norm();
+  const double kernel = std::exp(-0.5 * d * d / (radius * radius));
+  return kernel * std::min(a.weight, b.weight);
+}
+
+std::vector<SearchCoverageAssignment> assignSearchHotspotsForCoverage(
+    const std::vector<std::pair<int, Eigen::Vector3d>>& drone_positions,
+    const std::vector<SearchParticlesManager::SearchHotspot>& hotspots) {
+  std::vector<SearchCoverageAssignment> assignments;
+  const int nd = static_cast<int>(drone_positions.size());
+  const int nh = static_cast<int>(hotspots.size());
+  if (nd <= 0 || nh <= 0) return assignments;
+
+  std::vector<bool> drone_assigned(nd, false);
+  std::vector<int> hotspot_use_count(nh, 0);
+  // 热点数足够时禁止复用；不足时允许复用，但用显式惩罚压制多机重叠。
+  const bool allow_hotspot_reuse = (nh < nd);
+
+  while (static_cast<int>(assignments.size()) < nd) {
+    SearchCoverageAssignment best;
+    bool found = false;
+    for (int d = 0; d < nd; ++d) {
+      if (drone_assigned[d]) continue;
+      for (int h = 0; h < nh; ++h) {
+        if (!allow_hotspot_reuse && hotspot_use_count[h] > 0) continue;
+
+        const double dist = (drone_positions[d].second - hotspots[h].pos).norm();
+        double overlap_penalty = 0.0;
+        for (const auto& prev : assignments) {
+          if (prev.hotspot_index < 0 || prev.hotspot_index >= nh) continue;
+          overlap_penalty += computeSearchHotspotOverlap(
+              hotspots[h], hotspots[prev.hotspot_index], search_assign_overlap_radius_m_);
+        }
+        const double reuse_penalty =
+            search_assign_reuse_penalty_ * static_cast<double>(hotspot_use_count[h]) *
+            std::max(0.0, hotspots[h].weight);
+        const double utility =
+            search_assign_weight_scale_ * hotspots[h].weight -
+            search_assign_distance_cost_ * dist -
+            search_assign_overlap_penalty_ * overlap_penalty -
+            reuse_penalty;
+
+        if (!found || utility > best.utility) {
+          found = true;
+          best.drone_vec_index = d;
+          best.drone_id = drone_positions[d].first;
+          best.hotspot_index = h;
+          best.utility = utility;
+          best.distance = dist;
+          best.overlap_penalty = overlap_penalty;
+          best.reuse_penalty = reuse_penalty;
+        }
+      }
+    }
+
+    if (!found) break;
+    drone_assigned[best.drone_vec_index] = true;
+    hotspot_use_count[best.hotspot_index]++;
+    assignments.push_back(best);
+  }
+
+  return assignments;
+}
+
+struct ParticleCloudDebugSummary {
+  int N = 0;
+  double neff = 0.0;
+  Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+  double rms = 0.0;
+  double w_max = 0.0;
+};
+
+ParticleCloudDebugSummary summarizeParticleCloud(const Eigen::MatrixXd& particles,
+                                                 const Eigen::VectorXd& weights) {
+  ParticleCloudDebugSummary s;
+  if (particles.rows() < 3) return s;
+  const int N = std::min<int>(particles.cols(), weights.size());
+  if (N <= 0) return s;
+  s.N = N;
+
+  Eigen::VectorXd w = weights.head(N);
+  for (int i = 0; i < N; ++i) {
+    if (!std::isfinite(w(i)) || w(i) < 0.0) w(i) = 0.0;
+  }
+
+  double sum_w = w.sum();
+  if (!(sum_w > 1e-300)) {
+    w.setConstant(1.0 / N);
+    sum_w = 1.0;
+  }
+  w /= sum_w;
+
+  s.neff = computeEffectiveSampleSize(w);
+  s.w_max = w.maxCoeff();
+
+  for (int i = 0; i < N; ++i) {
+    s.mean += w(i) * particles.col(i).head<3>();
+  }
+  double var = 0.0;
+  for (int i = 0; i < N; ++i) {
+    const Eigen::Vector3d diff = particles.col(i).head<3>() - s.mean;
+    var += w(i) * diff.squaredNorm();
+  }
+  s.rms = std::sqrt(std::max(0.0, var));
+  return s;
+}
+
+void publishParticleCloud(const Eigen::MatrixXd& particles,
+                          const Eigen::VectorXd& weights,
+                          ros::Publisher& pub) {
+  if (particles.rows() < 3) return;
+  const int N = std::min<int>(particles.cols(), weights.size());
+  if (N <= 0) return;
+
+  pcl::PointCloud<pcl::PointXYZI> cloud;
+  cloud.header.frame_id = "world";
+  cloud.points.reserve(N);
+
+  double w_max = 0.0;
+  for (int i = 0; i < N; ++i) {
+    const double w = std::isfinite(weights(i)) ? std::max(0.0, weights(i)) : 0.0;
+    w_max = std::max(w_max, w);
+  }
+  if (!(w_max > 1e-12)) w_max = 1.0;
+
+  for (int i = 0; i < N; ++i) {
+    const double x = particles(0, i);
+    const double y = particles(1, i);
+    const double z = particles(2, i);
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+
+    pcl::PointXYZI pt;
+    pt.x = static_cast<float>(x);
+    pt.y = static_cast<float>(y);
+    pt.z = static_cast<float>(z);
+    const double w = std::isfinite(weights(i)) ? std::max(0.0, weights(i)) : 0.0;
+    pt.intensity = static_cast<float>(w / w_max);
+    cloud.points.push_back(pt);
+  }
+
+  sensor_msgs::PointCloud2 cloud_msg;
+  pcl::toROSMsg(cloud, cloud_msg);
+  cloud_msg.header.stamp = ros::Time::now();
+  cloud_msg.header.frame_id = "world";
+  pub.publish(cloud_msg);
+}
+
+void logParticleCloudSummary(const char* stage,
+                             const ParticleCloudDebugSummary& s) {
+  ROS_INFO_THROTTLE(0.5,
+                    "[dpf%d] Search cloud %s: N=%d Neff=%.1f mean=(%.2f,%.2f,%.2f) rms=%.2f wmax=%.3f",
+                    drone_id_, stage ? stage : "unknown",
+                    s.N, s.neff,
+                    s.mean.x(), s.mean.y(), s.mean.z(),
+                    s.rms, s.w_max);
+}
+
+struct SearchVisibilityStats {
+  int total_particles = 0;
+  int in_depth_particles = 0;
+  int in_fov_particles = 0;
+  int los_clear_particles = 0;
+  int los_blocked_particles = 0;
+
+  double in_depth_ratio = 0.0;      // in depth / total
+  double in_fov_ratio = 0.0;        // in FOV / total
+  double los_clear_ratio = 0.0;     // LOS clear / total
+  double los_blocked_in_fov_ratio = 0.0; // LOS blocked / in FOV
+};
+
+SearchVisibilityStats evaluateSearchVisibility(const Eigen::MatrixXd& particles,
+                                               int N,
+                                               const Eigen::Vector3d& cam_p,
+                                               const Eigen::Quaterniond& cam_q) {
+  SearchVisibilityStats s;
+  if (N <= 0 || particles.rows() < 3 || particles.cols() < N) return s;
+  s.total_particles = N;
+
+  const Eigen::Matrix3d R_cw = cam_q.toRotationMatrix().transpose();
+  for (int i = 0; i < N; ++i) {
+    const Eigen::Vector3d p_w = particles.col(i).head<3>();
+    const Eigen::Vector3d p_c = R_cw * (p_w - cam_p);
+    if (!(p_c.z() > 0.1 && p_c.z() < max_obs_depth_)) continue;
+    ++s.in_depth_particles;
+
+    const double u = p_c.x() * fx_ / p_c.z() + cx_;
+    const double v = p_c.y() * fy_ / p_c.z() + cy_;
+    if (!(u >= 0.0 && u <= width_ && v >= 0.0 && v <= height_)) continue;
+    ++s.in_fov_particles;
+
+    if (isLineOfSightClear(cam_p, p_w)) {
+      ++s.los_clear_particles;
+    } else {
+      ++s.los_blocked_particles;
+    }
+  }
+
+  const double total = static_cast<double>(std::max(1, s.total_particles));
+  s.in_depth_ratio = static_cast<double>(s.in_depth_particles) / total;
+  s.in_fov_ratio = static_cast<double>(s.in_fov_particles) / total;
+  s.los_clear_ratio = static_cast<double>(s.los_clear_particles) / total;
+  if (s.in_fov_particles > 0) {
+    s.los_blocked_in_fov_ratio =
+        static_cast<double>(s.los_blocked_particles) / static_cast<double>(s.in_fov_particles);
+  }
+  return s;
+}
+
+void applySearchResampleJitter(Eigen::MatrixXd& particles) {
+  if (particles.cols() <= 0 || particles.rows() < 6) return;
+  const double pos_sigma = std::max(0.0, search_resample_jitter_pos_m_);
+  const double vel_sigma = std::max(0.0, search_resample_jitter_vel_mps_);
+  if (pos_sigma <= 0.0 && vel_sigma <= 0.0) return;
+
+  std::normal_distribution<double> pos_noise(0.0, pos_sigma);
+  std::normal_distribution<double> vel_noise(0.0, vel_sigma);
+  for (int i = 0; i < particles.cols(); ++i) {
+    if (pos_sigma > 0.0) {
+      particles(0, i) += pos_noise(rng_);
+      particles(1, i) += pos_noise(rng_);
+    }
+    if (vel_sigma > 0.0) {
+      particles(3, i) += vel_noise(rng_);
+      particles(4, i) += vel_noise(rng_);
+    }
+  }
+}
 
 // === 占据栅格 ===
 struct SimpleOccMap {
@@ -930,6 +1116,167 @@ void search_consensus_callback(const target_ekf::LocalStats::ConstPtr& msg) {
   received_search_consensus_[msg->drone_id] = nc;
 }
 
+SearchParticlesManager::SearchFallbackGMM6D parseSearchFallbackModel(const target_ekf::LocalStats& msg) {
+  SearchParticlesManager::SearchFallbackGMM6D model;
+  if (msg.state_dim != 6 || msg.num_components <= 0) return model;
+
+  const int C = msg.num_components;
+  model.C = C;
+  model.pi = Eigen::VectorXd::Zero(C);
+  model.mu.resize(C);
+  model.S.resize(C);
+  double pi_sum = 0.0;
+  for (int c = 0; c < C; ++c) {
+    const double alpha = (c < (int)msg.zeta_alpha.size()) ? std::max(0.0, msg.zeta_alpha[c]) : 0.0;
+    model.pi(c) = alpha;
+    pi_sum += alpha;
+    model.mu[c].setZero(6);
+    model.S[c].setIdentity(6, 6);
+    if (alpha <= 1e-12) continue;
+    model.mu[c] = Eigen::Map<const Eigen::VectorXd>(msg.zeta_a.data() + c * 6, 6) / alpha;
+    model.S[c] = Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(
+        msg.zeta_b.data() + c * 36, 6, 6) / alpha;
+    model.S[c] += Eigen::MatrixXd::Identity(6, 6) * 1e-4;
+  }
+  if (!(pi_sum > 1e-300)) return model;
+  model.pi /= pi_sum;
+  model.valid = true;
+  return model;
+}
+
+target_ekf::LocalStats toSearchFallbackModelMsg(const SearchParticlesManager::SearchFallbackGMM6D& model,
+                                                int drone_id, int N) {
+  target_ekf::LocalStats msg;
+  msg.header.stamp = ros::Time::now();
+  msg.header.frame_id = "world";
+  msg.drone_id = drone_id;
+  msg.num_components = model.C;
+  msg.state_dim = 6;
+  msg.obs_dim = 0;
+  msg.has_observation = false;
+  msg.alpha_local.resize(model.C);
+  msg.a_local.resize(model.C * 6);
+  msg.b_local.resize(model.C * 36);
+  msg.zeta_alpha.resize(model.C);
+  msg.zeta_a.resize(model.C * 6);
+  msg.zeta_b.resize(model.C * 36);
+  for (int c = 0; c < model.C; ++c) {
+    const double alpha = std::max(1e-12, model.pi(c) * static_cast<double>(std::max(1, N)));
+    msg.alpha_local[c] = alpha;
+    msg.zeta_alpha[c] = alpha;
+    for (int i = 0; i < 6; ++i) {
+      const double val = model.mu[c](i) * alpha;
+      msg.a_local[c * 6 + i] = val;
+      msg.zeta_a[c * 6 + i] = val;
+    }
+    for (int i = 0; i < 6; ++i) {
+      for (int j = 0; j < 6; ++j) {
+        const double val = model.S[c](i, j) * alpha;
+        msg.b_local[c * 36 + i * 6 + j] = val;
+        msg.zeta_b[c * 36 + i * 6 + j] = val;
+      }
+    }
+  }
+  return msg;
+}
+
+void search_branch_health_callback(const target_ekf::SearchBranchHealth::ConstPtr& msg) {
+  if (msg->drone_id == drone_id_) return;
+  std::lock_guard<std::mutex> lock(search_fallback_mutex_);
+  auto& slot = received_search_fallback_models_[msg->drone_id];
+  slot.healthy = msg->healthy;
+  slot.retained_mass_ratio = msg->retained_mass_ratio;
+  slot.strong_decay_ratio = msg->strong_decay_ratio;
+  slot.neff_ratio = msg->neff_ratio;
+  slot.mean_phi = msg->mean_phi;
+  slot.health_score = msg->health_score;
+  slot.health_stamp = msg->header.stamp;
+}
+
+void search_fallback_model_callback(const target_ekf::LocalStats::ConstPtr& msg) {
+  if (msg->drone_id == drone_id_) return;
+  if (msg->state_dim != 6 || msg->num_components <= 0) return;
+  std::lock_guard<std::mutex> lock(search_fallback_mutex_);
+  auto& slot = received_search_fallback_models_[msg->drone_id];
+  slot.msg = *msg;
+  slot.model_stamp = msg->header.stamp;
+}
+
+bool tryRecoverSearchBranchFromHealthyNeighbor() {
+  if (!dpfPtr_ || !dpfPtr_->initialized_) return false;
+  const ros::Time now = ros::Time::now();
+  const double max_age = std::max(0.1, search_branch_model_age_sec_);
+
+  int best_id = -1;
+  SearchParticlesManager::SearchFallbackGMM6D best_model;
+  double best_score = -1.0;
+  double best_retained = 0.0;
+  double best_strong = 0.0;
+  double best_neff = 0.0;
+  double best_mean_phi = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(search_fallback_mutex_);
+    for (const auto& kv : received_search_fallback_models_) {
+      const int neighbor_id = kv.first;
+      const auto& slot = kv.second;
+      const double model_age = slot.model_stamp.isZero() ? 1e9 : (now - slot.model_stamp).toSec();
+      const double health_age = slot.health_stamp.isZero() ? 1e9 : (now - slot.health_stamp).toSec();
+      if (!slot.healthy || model_age > max_age || health_age > max_age) continue;
+      if (slot.msg.state_dim != 6 || slot.msg.num_components <= 0) continue;
+      const double score = std::max(1e-6, slot.health_score);
+      if (score <= best_score) continue;
+      SearchParticlesManager::SearchFallbackGMM6D model = parseSearchFallbackModel(slot.msg);
+      if (!model.valid) continue;
+      best_score = score;
+      best_id = neighbor_id;
+      best_model = std::move(model);
+      best_retained = slot.retained_mass_ratio;
+      best_strong = slot.strong_decay_ratio;
+      best_neff = slot.neff_ratio;
+      best_mean_phi = slot.mean_phi;
+    }
+  }
+
+  if (best_id < 0 || !best_model.valid) return false;
+
+  search_particles_manager_->sampleParticlesFromSearchGMMModel(
+      dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_, best_model);
+  applySearchResampleJitter(dpfPtr_->particles_);
+
+  ROS_WARN("[dpf%d] Search branch recovered from neighbor %d: score=%.3f retained=%.3f strong=%.3f neff=%.3f mean_phi=%.3f",
+           drone_id_, best_id, best_score, best_retained, best_strong, best_neff, best_mean_phi);
+  return true;
+}
+
+void publishSearchBranchHealthMsg(bool healthy,
+                                  double retained_mass_ratio,
+                                  double strong_decay_ratio,
+                                  double neff_ratio,
+                                  double mean_phi) {
+  target_ekf::SearchBranchHealth msg;
+  msg.header.stamp = ros::Time::now();
+  msg.drone_id = drone_id_;
+  msg.healthy = healthy;
+  msg.retained_mass_ratio = retained_mass_ratio;
+  msg.strong_decay_ratio = strong_decay_ratio;
+  msg.neff_ratio = neff_ratio;
+  msg.mean_phi = mean_phi;
+  msg.health_score = std::max(0.0, retained_mass_ratio) *
+                     std::max(0.0, 1.0 - strong_decay_ratio) *
+                     std::max(0.0, neff_ratio);
+  search_branch_health_pub_.publish(msg);
+}
+
+bool publishSearchFallbackModelFromCurrentParticles() {
+  if (!dpfPtr_ || !dpfPtr_->initialized_) return false;
+  const int C = std::max(1, search_particles_manager_->getSearchC());
+  auto model = search_particles_manager_->buildSearchFallbackGMM(
+      dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_, C);
+  if (!model.valid) return false;
+  search_fallback_model_pub_.publish(toSearchFallbackModelMsg(model, drone_id_, dpfPtr_->N_));
+  return true;
+}
+
 // 失锁对比模式：把普通DPF的9D GMM投影为6D(pos+vel)并发布到search_pos_gmm
 void publishSearchPosGMMFromLegacyDPF() {
   if (!dpfPtr_ || !dpfPtr_->initialized_) return;
@@ -974,40 +1321,7 @@ void publishSearchPosGMMFromLegacyDPF() {
 // 发布当前DPF粒子云（真实粒子，不是GMM），用于失锁后直观可视化
 void publishSearchParticlesCloudFromDPF() {
   if (!dpfPtr_ || !dpfPtr_->initialized_) return;
-  const int N = dpfPtr_->N_;
-  if (N <= 0 || dpfPtr_->particles_.rows() < 3 || dpfPtr_->particles_.cols() < N) return;
-
-  pcl::PointCloud<pcl::PointXYZI> cloud;
-  cloud.header.frame_id = "world";
-  cloud.points.reserve(N);
-
-  double w_max = 0.0;
-  if (dpfPtr_->weights_.size() >= N) {
-    w_max = dpfPtr_->weights_.maxCoeff();
-  }
-  if (!(w_max > 1e-12)) w_max = 1.0;
-
-  for (int i = 0; i < N; ++i) {
-    const double x = dpfPtr_->particles_(0, i);
-    const double y = dpfPtr_->particles_(1, i);
-    const double z = dpfPtr_->particles_(2, i);
-    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
-
-    pcl::PointXYZI pt;
-    pt.x = static_cast<float>(x);
-    pt.y = static_cast<float>(y);
-    pt.z = static_cast<float>(z);
-    double w = (dpfPtr_->weights_.size() >= N) ? dpfPtr_->weights_(i) : (1.0 / std::max(1, N));
-    if (!std::isfinite(w)) w = 0.0;
-    pt.intensity = static_cast<float>(std::max(0.0, w / w_max));
-    cloud.points.push_back(pt);
-  }
-
-  sensor_msgs::PointCloud2 cloud_msg;
-  pcl::toROSMsg(cloud, cloud_msg);
-  cloud_msg.header.stamp = ros::Time::now();
-  cloud_msg.header.frame_id = "world";
-  search_particles_vis_pub_.publish(cloud_msg);
+  publishParticleCloud(dpfPtr_->particles_, dpfPtr_->weights_, search_particles_vis_pub_);
 }
 
 // === 邻居无人机odom回调：存储邻居位置用于搜索热点分配 ===
@@ -1056,8 +1370,9 @@ void consensus_timer_callback(const ros::TimerEvent& event) {
   if (!dpfPtr_->initialized_) return;
 
   if (search_mode_active_ && useSearchGmm6DMode()) {
-    // === 搜索模式：6D全粒子共识 ===
+    // === 搜索模式：事件化6D共识（仅EM会话窗口内迭代） ===
     if (!search_particles_manager_->isSearchGMMInitialized()) return;
+    if (!search_em_session_active_) return;
     std::lock_guard<std::mutex> dpf_lock(dpf_mutex_);
 
     // 收集邻居6D共识状态
@@ -1077,9 +1392,21 @@ void consensus_timer_callback(const ros::TimerEvent& event) {
     LocalStat6D ls = search_particles_manager_->emStep6D(
         dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_,
         drone_id_, obs_flag, neighbors);
+    ++search_em_session_done_iters_;
 
     // 发布6D共识状态给邻居
     search_consensus_pub_.publish(toSearchConsensusMsg(ls, *search_particles_manager_));
+    const ros::Time now = ros::Time::now();
+    const bool reached_iters =
+        search_em_session_done_iters_ >= std::max(1, search_em_session_target_iters_);
+    const bool timeout =
+        (search_em_session_deadline_.isValid() && now >= search_em_session_deadline_);
+    if (reached_iters || timeout) {
+      ROS_INFO("[dpf%d] Search EM session completed: done_iters=%d target_iters=%d timeout=%d",
+               drone_id_, search_em_session_done_iters_,
+               std::max(1, search_em_session_target_iters_), timeout ? 1 : 0);
+      search_em_session_active_ = false;
+    }
     return;
   }
 
@@ -1170,7 +1497,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     has_latest_obs_ = false;
   }
   // 加锁保护 dpfPtr_ 的并发访问（与 consensus_timer_callback 互斥）
-  std::lock_guard<std::mutex> dpf_lock(dpf_mutex_);
+  std::unique_lock<std::mutex> dpf_lock(dpf_mutex_);
   // 初始化/重置逻辑
   double update_dt = (ros::Time::now() - last_update_stamp_).toSec();
   bool need_reset = (!dpfPtr_->initialized_ || update_dt > 1.0);
@@ -1231,6 +1558,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       }
       resetCommittedDirectionState();
       activateReacquireBoost("self_reacquired");
+      clearSearchEmSession("search_self_reacquired");
       ROS_WARN("[dpf%d] EXITING SEARCH MODE: Target reacquired, resetting from direct observation!", drone_id_);
 
       // 发布 local_stats（has_obs=true），通知邻居此机已重新观测到目标
@@ -1262,6 +1590,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
           resetCommittedDirectionState();
           activateReacquireBoost("neighbor_reacquired");
           clearFrozenSnapshotRing("search_neighbor_reacquired");
+          clearSearchEmSession("search_neighbor_reacquired");
           ROS_WARN("[dpf%d] EXITING SEARCH MODE: Neighbor drone %d reacquired target!", drone_id_, kv.first);
           break;
         }
@@ -1277,10 +1606,6 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     // ===== 新搜索方案 =====
     // 搜索模式更新频率与普通DPF主循环一致（dpf_rate）
 
-    // 从6D共识GMM采样新粒子（高权重区域粒子多，已观测区域粒子被淘汰）
-    search_particles_manager_->sampleParticlesFromSearchGMM(
-        dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_);
-
     const int spread_frames = std::max(0, search_spread_init_frames_);
     if (search_mode_frame_count_ < spread_frames) {
       // 搜索初期几帧：不沿用当前速度方向，强制粒子在XY平面全向扩散
@@ -1292,47 +1617,54 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
                         drone_id_, search_mode_frame_count_ + 1, spread_frames,
                         search_spread_speed_min_ratio_, search_spread_theta_jitter_deg_);
     } else {
-      // 分散期结束后采用“稳定+激进”混合更新（每帧随机注入小比例激进粒子）
-      int aggressive_count = 0;
+      // 分散期结束后采用“稳定+转向”混合更新（每隔若干帧重选一批持续转向粒子）
+      const int mixed_step = std::max(0, search_mode_frame_count_ - spread_frames);
+      int turning_count = 0;
       search_particles_manager_->searchParticlesMixedUpdate(
           dpfPtr_->particles_, dpfPtr_->N_,
-          search_aggressive_ratio_,
-          search_aggressive_theta_sigma_deg_,
-          search_aggressive_speed_min_ratio_,
-          &aggressive_count);
+          mixed_step,
+          search_mixed_turn_hold_steps_,
+          search_mixed_turn_ratio_,
+          search_mixed_turn_theta_sigma_deg_,
+          &turning_count);
       ROS_INFO_THROTTLE(0.5,
-                        "[dpf%d] Search mixed update: N=%d aggressive=%d (ratio=%.2f, theta_sigma=%.1fdeg, v_min_ratio=%.2f)",
-                        drone_id_, dpfPtr_->N_, aggressive_count,
-                        search_aggressive_ratio_, search_aggressive_theta_sigma_deg_,
-                        search_aggressive_speed_min_ratio_);
+                        "[dpf%d] Search mixed update: step=%d N=%d turning=%d (ratio=%.2f, theta_sigma=%.1fdeg, hold=%d)",
+                        drone_id_, mixed_step, dpfPtr_->N_, turning_count,
+                        search_mixed_turn_ratio_, search_mixed_turn_theta_sigma_deg_,
+                        search_mixed_turn_hold_steps_);
     }
     ++search_mode_frame_count_;
 
-    // 用FOV扫描增量更新全局无效栅格（仅在粒子活跃局部窗口内执行重计算）
+    const SearchVisibilityStats vis_stats = evaluateSearchVisibility(
+        dpfPtr_->particles_, dpfPtr_->N_, cam_p, cam_q);
+    ROS_INFO_THROTTLE(
+        0.5,
+        "[dpf%d] Search visibility: total=%d depth=%.1f%% (%d) fov=%.1f%% (%d) los_clear=%.1f%% (%d) los_blocked_in_fov=%.1f%% (%d)",
+        drone_id_,
+        vis_stats.total_particles,
+        100.0 * vis_stats.in_depth_ratio, vis_stats.in_depth_particles,
+        100.0 * vis_stats.in_fov_ratio, vis_stats.in_fov_particles,
+        100.0 * vis_stats.los_clear_ratio, vis_stats.los_clear_particles,
+        100.0 * vis_stats.los_blocked_in_fov_ratio, vis_stats.los_blocked_particles);
+
+    // 用FOV扫描增量更新全局无效栅格（全图执行，不再使用活跃窗口裁剪）
     {
       std::lock_guard<std::mutex> lock(invalid_grid_mutex_);
 
       const double now_sec = ros::Time::now().toSec();
-      const double local_margin_m = resolveLocalGridMarginMeters();
-      const GridWindow2D active_win = computeActiveParticleWindow(
-          global_invalid_grid_, dpfPtr_->particles_, dpfPtr_->N_, local_margin_m);
-      const GridWindow2D frame_win = active_win.valid() ? active_win : fullGridWindow(global_invalid_grid_);
-      InvalidGrid2D active_grid = extractSubGrid(global_invalid_grid_, frame_win);
-      if (!active_grid.valid()) {
-        active_grid = global_invalid_grid_;
-      }
+      InvalidGrid2D& active_grid = global_invalid_grid_;
 
-      // 1. 先清理局部窗口中过期负观测格，保持active只含有效信息
+      // 1. 先清理过期负观测格，保持active只含有效信息
       active_grid.clearExpiredNegObs(now_sec, neg_obs_ttl_sec_);
 
-      // 2. 融合邻机待处理增量（按搜索主循环节拍统一并入，局部窗口内有效）
+      // 2. 融合邻机待处理增量（按搜索主循环节拍统一并入）
       for (const auto& kv : pending_invalid_grid_deltas_) {
         const auto& delta = kv.second;
         active_grid.unionWith(delta.frame_grid, delta.recv_stamp_sec);
       }
       pending_invalid_grid_deltas_.clear();
 
-      // 3. 融合本机局部地图障碍增量（仅局部窗口）
+      // 3. 融合本机局部地图障碍增量（全图）
       quadrotor_msgs::OccMap3dConstPtr local_map_msg;
       {
         std::lock_guard<std::mutex> map_lock(local_map_cache_mutex_);
@@ -1364,54 +1696,113 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       frame_grid.ny = active_grid.ny;
       frame_grid.cells.assign(frame_grid.nx * frame_grid.ny, 0);
       frame_grid.cell_times.assign(frame_grid.nx * frame_grid.ny, 0.0);
-      search_particles_manager_->markInvalidFromParticles(
-          frame_grid, dpfPtr_->particles_, dpfPtr_->N_, cam_p, cam_q,
-          now_sec);
+      const double invalid_plane_z = dpfPtr_->pos().z();
+      const int marked_cells = search_particles_manager_->markInvalidFromViewFootprint(
+          frame_grid, cam_p, cam_q, invalid_plane_z, now_sec);
 
-      // 5. OR 进局部窗口栅格并写回全局
+      // 5. OR 进全局栅格
       active_grid.unionWith(frame_grid);
-      if (active_win.valid() && active_grid.valid()) {
-        writeSubGrid(global_invalid_grid_, active_win, active_grid);
-      } else if (active_grid.valid()) {
-        global_invalid_grid_ = active_grid;
-      }
 
       // 6. 发布本帧增量给邻居（RLE压缩，通信量小）
       invalid_grid_pub_.publish(toInvalidGridMsg(frame_grid, drone_id_));
 
       ROS_INFO_THROTTLE(1.0,
-                        "[dpf%d] Active invalid window: ix=[%d,%d] iy=[%d,%d] (%dx%d), margin=%.1fm",
+                        "[dpf%d] Full-grid invalid update: nx=%d ny=%d res=%.2f plane_z=%.2f marked=%d",
                         drone_id_,
-                        active_win.ix0, active_win.ix1,
-                        active_win.iy0, active_win.iy1,
-                        active_win.width(), active_win.height(),
-                        local_margin_m);
+                        active_grid.nx, active_grid.ny, active_grid.resolution,
+                        invalid_plane_z, marked_cells);
     }
 
     ROS_INFO_THROTTLE(1.0, "[dpf%d] Search: invalid_grid cells marked", drone_id_);
 
-    // 用全局无效栅格裁剪粒子权重（时间TTL）
+    // 裁剪前快照：用于区分“没跟上”还是“被裁掉”
+    {
+      const ParticleCloudDebugSummary pre_summary =
+          summarizeParticleCloud(dpfPtr_->particles_, dpfPtr_->weights_);
+      logParticleCloudSummary("pre-prune", pre_summary);
+      publishParticleCloud(dpfPtr_->particles_, dpfPtr_->weights_,
+                           search_particles_vis_pre_prune_pub_);
+    }
+
+    // 搜索期分支健康判定：若多数粒子被强削权，则优先用健康邻机模型接管
+    SearchParticlesManager::PruneStats prune_stats;
     {
       std::lock_guard<std::mutex> lock(invalid_grid_mutex_);
       const double now_sec = ros::Time::now().toSec();
-      const double local_margin_m = resolveLocalGridMarginMeters();
-      const GridWindow2D active_win = computeActiveParticleWindow(
-          global_invalid_grid_, dpfPtr_->particles_, dpfPtr_->N_, local_margin_m);
-      const GridWindow2D frame_win = active_win.valid() ? active_win : fullGridWindow(global_invalid_grid_);
-      InvalidGrid2D active_grid = extractSubGrid(global_invalid_grid_, frame_win);
-      if (!active_grid.valid()) {
-        active_grid = global_invalid_grid_;
-      }
       search_particles_manager_->pruneParticlesByInvalidGrid(
           dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_,
-          active_grid, now_sec, neg_obs_ttl_sec_,
+          global_invalid_grid_, now_sec, neg_obs_ttl_sec_,
           invalid_decay_phi_min_, invalid_decay_phi_mid_,
-          invalid_decay_r_occ_, invalid_decay_r_safe_);
-      if (active_win.valid() && active_grid.valid()) {
-        writeSubGrid(global_invalid_grid_, active_win, active_grid);
-      } else if (active_grid.valid()) {
-        global_invalid_grid_ = active_grid;
+          invalid_decay_r_occ_, invalid_decay_r_safe_,
+          &prune_stats, std::max(0.0, std::min(1.0, search_branch_strong_phi_threshold_)));
+    }
+
+    // 裁剪后、重采样前快照：观察负观测与距离场是否真的把粒子压下去
+    {
+      const ParticleCloudDebugSummary post_summary =
+          summarizeParticleCloud(dpfPtr_->particles_, dpfPtr_->weights_);
+      logParticleCloudSummary("post-prune", post_summary);
+      publishParticleCloud(dpfPtr_->particles_, dpfPtr_->weights_,
+                           search_particles_vis_post_prune_pub_);
+    }
+
+    const double neff = computeEffectiveSampleSize(dpfPtr_->weights_);
+    const double neff_ratio = (dpfPtr_->N_ > 0) ? neff / static_cast<double>(dpfPtr_->N_) : 0.0;
+    const double retained_mass_ratio =
+        (prune_stats.weight_sum_before > 1e-300)
+            ? (prune_stats.weight_sum_after_raw / prune_stats.weight_sum_before)
+            : 0.0;
+    const double strong_decay_ratio =
+        (prune_stats.total_particles > 0)
+            ? (static_cast<double>(prune_stats.strong_decay_particles) /
+               static_cast<double>(prune_stats.total_particles))
+            : 0.0;
+    const bool branch_unhealthy =
+        (retained_mass_ratio < search_branch_retained_mass_ratio_) ||
+        (strong_decay_ratio > search_branch_strong_decay_ratio_) ||
+        (neff_ratio < search_branch_neff_ratio_);
+
+    publishSearchBranchHealthMsg(!branch_unhealthy, retained_mass_ratio,
+                                 strong_decay_ratio, neff_ratio, prune_stats.mean_phi);
+    ROS_INFO_THROTTLE(0.5,
+                      "[dpf%d] Search branch health: healthy=%d retained=%.3f strong=%.3f neff_ratio=%.3f mean_phi=%.3f",
+                      drone_id_, branch_unhealthy ? 0 : 1,
+                      retained_mass_ratio, strong_decay_ratio, neff_ratio, prune_stats.mean_phi);
+
+    bool branch_reseeded_from_neighbor = false;
+    if (branch_unhealthy) {
+      branch_reseeded_from_neighbor = tryRecoverSearchBranchFromHealthyNeighbor();
+      if (!branch_reseeded_from_neighbor) {
+        ROS_WARN_THROTTLE(0.5,
+                          "[dpf%d] Search branch unhealthy but no healthy neighbor model found; fall back to local ESS resample if needed",
+                          drone_id_);
       }
+    }
+
+    // 搜索期ESS退化抑制：仅在本机分支仍可用时做本地重采样
+    const double neff_thr = std::max(0.0, std::min(1.0, search_ess_resample_ratio_)) * dpfPtr_->N_;
+    if (!branch_unhealthy || !branch_reseeded_from_neighbor) {
+      if (neff > 0.0 && neff < neff_thr) {
+        dpfPtr_->systematicResample();
+        applySearchResampleJitter(dpfPtr_->particles_);
+        ROS_INFO_THROTTLE(0.5,
+                          "[dpf%d] Search ESS resample triggered: Neff=%.1f thr=%.1f jitter(pos=%.2f,vel=%.2f)",
+                          drone_id_, neff, neff_thr,
+                          search_resample_jitter_pos_m_, search_resample_jitter_vel_mps_);
+      } else {
+        ROS_INFO_THROTTLE(1.0,
+                          "[dpf%d] Search ESS monitor: Neff=%.1f thr=%.1f (trigger=%d)",
+                          drone_id_, neff, neff_thr,
+                          (neff > 0.0 && neff < neff_thr) ? 1 : 0);
+      }
+    } else {
+      ROS_INFO_THROTTLE(0.5,
+                        "[dpf%d] Search branch replaced by healthy neighbor model; skip local ESS resample",
+                        drone_id_);
+    }
+
+    if (!branch_unhealthy || branch_reseeded_from_neighbor) {
+      publishSearchFallbackModelFromCurrentParticles();
     }
 
     // === 方向承诺式搜索：定期提取热点确定方向，中间沿方向推进 ===
@@ -1433,6 +1824,21 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     }
 
     if (need_extract) {
+      // 任务重分配前：触发一次短时EM共识会话，并可选择等待完成
+      startSearchEmSession(now, "need_extract");
+      if (search_em_wait_for_allocation_) {
+        const ros::Duration wait_step(0.002);
+        dpf_lock.unlock();  // 允许consensus_timer获取锁并执行EM迭代
+        while (ros::ok() && !isSearchEmSessionFinished(ros::Time::now())) {
+          wait_step.sleep();
+        }
+        dpf_lock.lock();
+        search_em_session_active_ = false;
+        ROS_INFO("[dpf%d] Search EM allocation wait done: done_iters=%d target_iters=%d",
+                 drone_id_, search_em_session_done_iters_,
+                 std::max(1, search_em_session_target_iters_));
+      }
+
       // 提取热点（优先基于当前粒子云前沿提取），传入无人机位置做排斥
       std::vector<Eigen::Vector3d> dp_vec;
       for (auto& kv : drone_positions) dp_vec.push_back(kv.second);
@@ -1461,58 +1867,64 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       search_targets_pub_.publish(hotspot_msg);
 
       if (!hotspots.empty()) {
-        int nd = drone_positions.size();
-        int nh = hotspots.size();
+        // 覆盖率驱动分配：
+        // 目标不是“谁离哪个热点最近”，而是让三机尽量覆盖不同高权重模态，
+        // 因此显式惩罚热点间重叠和热点重复复用。
+        const auto assignments = assignSearchHotspotsForCoverage(drone_positions, hotspots);
 
-        // 最近距离贪心分配：每架无人机分配到最近的热点
-        std::vector<int> assign(nd, -1);
-        std::vector<bool> h_used(nh, false), d_used(nd, false);
-        std::vector<std::pair<double, std::pair<int, int>>> edges;
-        for (int d = 0; d < nd; ++d)
-          for (int h = 0; h < nh; ++h)
-            edges.push_back({(drone_positions[d].second - hotspots[h].pos).norm(), {d, h}});
-        std::sort(edges.begin(), edges.end());
-        for (auto& e : edges) {
-          int d = e.second.first, h = e.second.second;
-          if (!d_used[d] && !h_used[h]) {
-            assign[d] = h; d_used[d] = true; h_used[h] = true;
-          }
+        for (const auto& a : assignments) {
+          if (a.hotspot_index < 0 || a.hotspot_index >= static_cast<int>(hotspots.size())) continue;
+          const auto& h = hotspots[a.hotspot_index];
+          ROS_INFO("[dpf%d] Search assign: drone=%d hotspot=%d pos=(%.2f,%.2f,%.2f) w=%.3f utility=%.3f dist=%.2f overlap=%.3f reuse=%.3f",
+                   drone_id_, a.drone_id, a.hotspot_index,
+                   h.pos.x(), h.pos.y(), h.pos.z(), h.weight,
+                   a.utility, a.distance, a.overlap_penalty, a.reuse_penalty);
         }
 
-        // 确定本机的搜索方向
-        for (int d = 0; d < nd; ++d) {
-          if (drone_positions[d].first == drone_id_ && assign[d] >= 0 && assign[d] < nh) {
-            Eigen::Vector3d my_pos = drone_positions[d].second;
-            Eigen::Vector3d hotspot_pos = hotspots[assign[d]].pos;
-            Eigen::Vector3d dir = hotspot_pos - my_pos;
-            dir.z() = 0; // 水平方向
-            if (dir.norm() > 0.5) {
-              committed_search_dir_ = dir.normalized();
-            }
-            committed_target_pos_ = hotspot_pos; // 初始目标就是热点
-            has_committed_direction_ = true;
-            last_hotspot_extract_time_ = now;
-            if (committed_direction_refresh_count_ == 0) {
-              // 首次建立承诺方向：先保持基础时间
-              committed_direction_refresh_count_ = 1;
-            } else {
-              // 后续每次重提取后，递增下一轮承诺持续时间
-              committed_direction_refresh_count_++;
-              current_hotspot_extract_interval_sec_ = std::min(
-                  hotspot_extract_interval_max_sec_,
-                  hotspot_extract_interval_base_sec_ +
-                      hotspot_extract_interval_growth_sec_ * (committed_direction_refresh_count_ - 1));
-            }
-            ROS_WARN("[dpf%d] Committed search dir=(%.2f,%.2f) toward hotspot (%.2f,%.2f,%.2f) w=%.3f, hold=%.1fs (refresh=%d)",
-                drone_id_, committed_search_dir_.x(), committed_search_dir_.y(),
-                hotspot_pos.x(), hotspot_pos.y(), hotspot_pos.z(), hotspots[assign[d]].weight,
-                current_hotspot_extract_interval_sec_, committed_direction_refresh_count_);
-            break;
+        // 确定本机的搜索任务点。
+        // committed_target_pos_ 现在表示“当前覆盖任务点”，交给规划器做A*连接和轨迹优化，
+        // 而不是继续沿某个方向无限外推。
+        for (const auto& a : assignments) {
+          if (a.drone_id != drone_id_ || a.hotspot_index < 0 ||
+              a.hotspot_index >= static_cast<int>(hotspots.size())) {
+            continue;
           }
+          Eigen::Vector3d my_pos = Eigen::Vector3d::Zero();
+          for (const auto& dp : drone_positions) {
+            if (dp.first == drone_id_) {
+              my_pos = dp.second;
+              break;
+            }
+          }
+
+          const Eigen::Vector3d hotspot_pos = hotspots[a.hotspot_index].pos;
+          Eigen::Vector3d dir = hotspot_pos - my_pos;
+          dir.z() = 0.0;
+          if (dir.norm() > 0.5) {
+            committed_search_dir_ = dir.normalized();
+          }
+          committed_target_pos_ = hotspot_pos;
+          has_committed_direction_ = true;
+          last_hotspot_extract_time_ = now;
+          committed_direction_refresh_count_++;
+          const double planar_dist = std::max(0.0, dir.head<2>().norm());
+          const double vmax = std::max(0.1, search_advance_vmax_);
+          const double eta_to_reach_sec = planar_dist / vmax;
+          // 热点离得近时，不要把整段固定周期都耗在单个热点上；
+          // 允许更快重提取，让无人机持续覆盖粒子云的不同区域。
+          current_hotspot_extract_interval_sec_ =
+              std::max(0.5, std::min(hotspot_extract_interval_base_sec_, 0.8 * eta_to_reach_sec));
+          ROS_WARN("[dpf%d] Search task committed: target=(%.2f,%.2f,%.2f) dir=(%.2f,%.2f) w=%.3f dist=%.2f eta=%.2fs hold=%.1fs refresh=%d",
+                   drone_id_, hotspot_pos.x(), hotspot_pos.y(), hotspot_pos.z(),
+                   committed_search_dir_.x(), committed_search_dir_.y(),
+                   hotspots[a.hotspot_index].weight,
+                   planar_dist, eta_to_reach_sec,
+                   current_hotspot_extract_interval_sec_, committed_direction_refresh_count_);
+          break;
         }
       }
-    } else if (has_committed_direction_) {
-      // 沿承诺方向持续推进目标：每帧向前推 vmax * dt
+    } else if (has_committed_direction_ && !search_hold_assigned_target_) {
+      // 兼容旧行为：只有显式关闭“持有任务点”时，才继续沿方向推进虚拟目标。
       double vmax = search_advance_vmax_;
       committed_target_pos_ += committed_search_dir_ * vmax * 0.2; // 5Hz, dt=0.2s
     }
@@ -1661,6 +2073,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
         }
         resetCommittedDirectionState();
         activateReacquireBoost("self_reacquired_legacy");
+        clearSearchEmSession("legacy_self_reacquired");
         clearFrozenSnapshotRing("legacy_self_reacquired");
         cacheReliableSnapshotFromDPF("legacy_self_reacquired");
         ROS_WARN("[dpf%d] EXIT LEGACY SEARCH MODE: self reacquired.", drone_id_);
@@ -1677,6 +2090,7 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
             }
             resetCommittedDirectionState();
             activateReacquireBoost("neighbor_reacquired_legacy");
+            clearSearchEmSession("legacy_neighbor_reacquired");
             clearFrozenSnapshotRing("legacy_neighbor_reacquired");
             ROS_WARN("[dpf%d] EXIT LEGACY SEARCH MODE: neighbor reacquired.", drone_id_);
             break;
@@ -1746,6 +2160,26 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
           Eigen::MatrixXd init_particles = frozen->particles;
           Eigen::VectorXd init_weights = frozen->weights;
 
+          // 用最后一次可靠观测对冻结快照做一次锚定：
+          // frozen ring 里保存的是DPF后验，不一定等于“失锁时真实目标位置”。
+          // 如果目标发生急停/急转，这里把粒子云整体平移到 loss_ref 附近，
+          // 至少保证搜索初态不会长期停留在明显滞后的估计上。
+          if (rollback_validation_enable_ && rollback_loss_ref_valid_) {
+            const auto frozen_summary = computeParticleKinematicSummary(init_particles, init_weights);
+            const Eigen::Vector3d pos_delta = rollback_loss_ref_pos_ - frozen_summary.pos_mean;
+            const Eigen::Vector3d vel_delta = rollback_loss_ref_vel_ - frozen_summary.vel_mean;
+            const double pos_err = pos_delta.norm();
+            const double vel_err = vel_delta.norm();
+            if (pos_err > 0.25 || vel_err > 0.25) {
+              init_particles.topRows(3).colwise() += pos_delta;
+              if (init_particles.rows() >= 6) {
+                init_particles.block(3, 0, 3, init_particles.cols()).colwise() += vel_delta;
+              }
+              ROS_WARN("[dpf%d][search-init-align] anchor frozen snapshot to loss_ref: pos_err=%.3f vel_err=%.3f",
+                       drone_id_, pos_err, vel_err);
+            }
+          }
+
           const int spread_frames = std::max(0, search_spread_init_frames_);
           const int replay_spread_steps = std::min(h_frames, spread_frames);
           const int replay_mixed_steps = std::max(0, h_frames - replay_spread_steps);
@@ -1758,9 +2192,10 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
           for (int step = 0; step < replay_mixed_steps; ++step) {
             search_particles_manager_->searchParticlesMixedUpdate(
                 init_particles, dpfPtr_->N_,
-                search_aggressive_ratio_,
-                search_aggressive_theta_sigma_deg_,
-                search_aggressive_speed_min_ratio_,
+                step,
+                search_mixed_turn_hold_steps_,
+                search_mixed_turn_ratio_,
+                search_mixed_turn_theta_sigma_deg_,
                 nullptr);
           }
 
@@ -2064,16 +2499,37 @@ int main(int argc, char** argv) {
   nh.param("reliable_snapshot_history_size", reliable_snapshot_history_size_, 12);
   nh.param("search_spread_speed_min_ratio", search_spread_speed_min_ratio_, 0.8);
   nh.param("search_spread_theta_jitter_deg", search_spread_theta_jitter_deg_, 10.0);
-  nh.param("search_aggressive_ratio", search_aggressive_ratio_, 0.10);
-  nh.param("search_aggressive_theta_sigma_deg", search_aggressive_theta_sigma_deg_, 120.0);
-  nh.param("search_aggressive_speed_min_ratio", search_aggressive_speed_min_ratio_, 0.8);
+  nh.param("search_aggressive_ratio", search_mixed_turn_ratio_, 0.50);
+  nh.param("search_aggressive_theta_sigma_deg", search_mixed_turn_theta_sigma_deg_, 90.0);
+  nh.param("search_mixed_turn_hold_steps", search_mixed_turn_hold_steps_, 5);
+  nh.param("search_ess_resample_ratio", search_ess_resample_ratio_, 1.00);
+  nh.param("search_resample_jitter_pos_m", search_resample_jitter_pos_m_, 0.15);
+  nh.param("search_resample_jitter_vel_mps", search_resample_jitter_vel_mps_, 0.20);
+  nh.param("search_branch_retained_mass_ratio", search_branch_retained_mass_ratio_, 0.35);
+  nh.param("search_branch_strong_decay_ratio", search_branch_strong_decay_ratio_, 0.55);
+  nh.param("search_branch_strong_phi_threshold", search_branch_strong_phi_threshold_, 0.35);
+  nh.param("search_branch_neff_ratio", search_branch_neff_ratio_, 0.25);
+  nh.param("search_branch_model_age_sec", search_branch_model_age_sec_, 0.60);
+  nh.param("search_em_session_iters", search_em_session_target_iters_, 12);
+  nh.param("search_em_session_timeout_sec", search_em_session_timeout_sec_, 0.25);
+  nh.param("search_em_wait_for_allocation", search_em_wait_for_allocation_, true);
   search_spread_init_frames_ = std::max(0, search_spread_init_frames_);
   reliable_snapshot_history_size_ = std::max(1, reliable_snapshot_history_size_);
   search_spread_speed_min_ratio_ = std::max(0.0, std::min(1.0, search_spread_speed_min_ratio_));
   search_spread_theta_jitter_deg_ = std::max(0.0, search_spread_theta_jitter_deg_);
-  search_aggressive_ratio_ = std::max(0.0, std::min(1.0, search_aggressive_ratio_));
-  search_aggressive_theta_sigma_deg_ = std::max(0.0, search_aggressive_theta_sigma_deg_);
-  search_aggressive_speed_min_ratio_ = std::max(0.0, std::min(1.0, search_aggressive_speed_min_ratio_));
+  search_mixed_turn_ratio_ = std::max(0.0, std::min(1.0, search_mixed_turn_ratio_));
+  search_mixed_turn_theta_sigma_deg_ = std::max(0.0, search_mixed_turn_theta_sigma_deg_);
+  search_mixed_turn_hold_steps_ = std::max(1, search_mixed_turn_hold_steps_);
+  search_ess_resample_ratio_ = std::max(0.0, std::min(1.0, search_ess_resample_ratio_));
+  search_resample_jitter_pos_m_ = std::max(0.0, search_resample_jitter_pos_m_);
+  search_resample_jitter_vel_mps_ = std::max(0.0, search_resample_jitter_vel_mps_);
+  search_branch_retained_mass_ratio_ = std::max(0.0, std::min(1.0, search_branch_retained_mass_ratio_));
+  search_branch_strong_decay_ratio_ = std::max(0.0, std::min(1.0, search_branch_strong_decay_ratio_));
+  search_branch_strong_phi_threshold_ = std::max(0.0, std::min(1.0, search_branch_strong_phi_threshold_));
+  search_branch_neff_ratio_ = std::max(0.0, std::min(1.0, search_branch_neff_ratio_));
+  search_branch_model_age_sec_ = std::max(0.1, search_branch_model_age_sec_);
+  search_em_session_target_iters_ = std::max(1, search_em_session_target_iters_);
+  search_em_session_timeout_sec_ = std::max(0.05, search_em_session_timeout_sec_);
   nh.param("neg_obs_ttl_sec", neg_obs_ttl_sec_, 0.5);
   nh.param("rollback_validation_enable", rollback_validation_enable_, true);
   nh.param("invalid_decay_phi_min", invalid_decay_phi_min_, 0.08);
@@ -2091,13 +2547,9 @@ int main(int argc, char** argv) {
     // 兼容旧参数名
     nh.param("hotspot_extract_interval", hotspot_extract_interval_base_sec_, hotspot_extract_interval_base_sec_);
   }
-  nh.param("hotspot_extract_interval_growth_sec", hotspot_extract_interval_growth_sec_, 0.5);
-  nh.param("hotspot_extract_interval_max_sec", hotspot_extract_interval_max_sec_, 8.0);
   if (hotspot_extract_interval_base_sec_ < 0.2) hotspot_extract_interval_base_sec_ = 0.2;
-  if (hotspot_extract_interval_growth_sec_ < 0.0) hotspot_extract_interval_growth_sec_ = 0.0;
-  if (hotspot_extract_interval_max_sec_ < hotspot_extract_interval_base_sec_) {
-    hotspot_extract_interval_max_sec_ = hotspot_extract_interval_base_sec_;
-  }
+  hotspot_extract_interval_growth_sec_ = 0.0;
+  hotspot_extract_interval_max_sec_ = hotspot_extract_interval_base_sec_;
   current_hotspot_extract_interval_sec_ = hotspot_extract_interval_base_sec_;
 
   ROS_INFO("[dpf%d] Search frontier params: neg_obs_ttl=%.1fs, phi_min=%.2f, phi_mid=%.2f, r_occ=%.2fm, r_safe=%.2fm, min_drone_dist=%.2fm, seed_radius=%.2fm, invalid_reject_ratio=%.2f",
@@ -2108,17 +2560,22 @@ int main(int argc, char** argv) {
   ROS_INFO("[dpf%d] Reacquire boost: hold=%.2fs, miss_scale=%.2f, miss_min=%d, base_miss=%d",
            drone_id_, reacquire_boost_duration_sec_, reacquire_boost_miss_scale_,
            reacquire_boost_miss_min_, miss_detection_num_);
-  ROS_INFO("[dpf%d] Search commitment interval: base=%.2fs, growth=%.2fs, max=%.2fs",
-           drone_id_, hotspot_extract_interval_base_sec_, hotspot_extract_interval_growth_sec_,
-           hotspot_extract_interval_max_sec_);
+  ROS_INFO("[dpf%d] Search commitment interval: fixed=%.2fs (growth disabled)",
+           drone_id_, hotspot_extract_interval_base_sec_);
   ROS_INFO("[dpf%d] Search spread init: frames=%d, speed_min_ratio=%.2f, theta_jitter=%.1fdeg",
            drone_id_, search_spread_init_frames_, search_spread_speed_min_ratio_,
            search_spread_theta_jitter_deg_);
   ROS_INFO("[dpf%d] Reliable snapshot ring: history_size=%d",
            drone_id_, reliable_snapshot_history_size_);
-  ROS_INFO("[dpf%d] Search mixed update: aggressive_ratio=%.2f, theta_sigma=%.1fdeg, speed_min_ratio=%.2f",
-           drone_id_, search_aggressive_ratio_, search_aggressive_theta_sigma_deg_,
-           search_aggressive_speed_min_ratio_);
+  ROS_INFO("[dpf%d] Search mixed update: turn_ratio=%.2f, theta_sigma=%.1fdeg, hold_steps=%d",
+           drone_id_, search_mixed_turn_ratio_, search_mixed_turn_theta_sigma_deg_,
+           search_mixed_turn_hold_steps_);
+  ROS_INFO("[dpf%d] Search ESS resample: ratio=%.2f, jitter_pos=%.2fm, jitter_vel=%.2fm/s",
+           drone_id_, search_ess_resample_ratio_,
+           search_resample_jitter_pos_m_, search_resample_jitter_vel_mps_);
+  ROS_INFO("[dpf%d] Search EM session: iters=%d timeout=%.3fs wait_for_allocation=%d",
+           drone_id_, search_em_session_target_iters_,
+           search_em_session_timeout_sec_, search_em_wait_for_allocation_ ? 1 : 0);
   ROS_WARN("[dpf%d] search_estimation_mode=%s",
            drone_id_, useSearchGmm6DMode() ? "search_gmm6d" : "legacy_dpf");
   // DPF参数
@@ -2143,12 +2600,20 @@ int main(int argc, char** argv) {
            drone_id_, fx_, fy_, cx_, cy_, width_, height_, max_obs_depth_);
 
   // 初始化无效区域虚拟栅格
+  nh.param("grid_resolution", grid_resolution_, 0.3);
+  nh.param("grid_map_size_x", grid_map_size_x_, -1.0);
+  nh.param("grid_map_size_y", grid_map_size_y_, -1.0);
   nh.param("grid_origin_x", grid_origin_x_, -10.0);
   nh.param("grid_origin_y", grid_origin_y_, -15.0);
-  nh.param("grid_resolution", grid_resolution_, 0.3);
   nh.param("grid_nx", grid_nx_, 80);
   nh.param("grid_ny", grid_ny_, 80);
-  nh.param("search_local_grid_margin_m", search_local_grid_margin_m_, -1.0);
+  if (grid_map_size_x_ > 0.0 && grid_map_size_y_ > 0.0 && grid_resolution_ > 1e-6) {
+    // Full-map mode: cover the known map extents with a single global grid.
+    grid_origin_x_ = -0.5 * grid_map_size_x_;
+    grid_origin_y_ = -0.5 * grid_map_size_y_;
+    grid_nx_ = std::max(1, (int)std::ceil(grid_map_size_x_ / grid_resolution_));
+    grid_ny_ = std::max(1, (int)std::ceil(grid_map_size_y_ / grid_resolution_));
+  }
   {
     auto initGrid = [&](InvalidGrid2D& g) {
       g.origin_x = grid_origin_x_;
@@ -2161,12 +2626,28 @@ int main(int argc, char** argv) {
     };
     initGrid(global_invalid_grid_);
   }
-  ROS_INFO("[dpf%d] Invalid grid: origin=(%.1f,%.1f) res=%.2f nx=%d ny=%d",
-           drone_id_, grid_origin_x_, grid_origin_y_, grid_resolution_, grid_nx_, grid_ny_);
-  ROS_INFO("[dpf%d] Search local invalid window margin: %.1fm",
-           drone_id_, search_local_grid_margin_m_);
+  if (grid_map_size_x_ > 0.0 && grid_map_size_y_ > 0.0) {
+    ROS_INFO("[dpf%d] Invalid grid full-map mode: map_size=(%.1f,%.1f)m origin=(%.1f,%.1f) res=%.2f nx=%d ny=%d",
+             drone_id_, grid_map_size_x_, grid_map_size_y_,
+             grid_origin_x_, grid_origin_y_, grid_resolution_, grid_nx_, grid_ny_);
+  } else {
+    ROS_INFO("[dpf%d] Invalid grid legacy mode: origin=(%.1f,%.1f) res=%.2f nx=%d ny=%d",
+             drone_id_, grid_origin_x_, grid_origin_y_, grid_resolution_, grid_nx_, grid_ny_);
+  }
 
-  // 搜索推进速度：优先使用当前无人机 planning/vmax；找不到时回退到原搜索速度参数
+  // 搜索粒子边界约束：与无效栅格边界一致，避免粒子长期漂移到无裁剪区域之外。
+  {
+    const double eps = std::max(1e-6, 1e-3 * grid_resolution_);
+    const double x_min = grid_origin_x_;
+    const double x_max = grid_origin_x_ + grid_nx_ * grid_resolution_ - eps;
+    const double y_min = grid_origin_y_;
+    const double y_max = grid_origin_y_ + grid_ny_ * grid_resolution_ - eps;
+    search_particles_manager_->setSearchXYBounds(x_min, x_max, y_min, y_max, true);
+    ROS_INFO("[dpf%d] Search particle XY bounds enabled: x=[%.2f, %.2f], y=[%.2f, %.2f]",
+             drone_id_, x_min, x_max, y_min, y_max);
+  }
+
+  // 搜索推进速度：只读取当前无人机自己的 planning/vmax；缺参时保留本地默认值
   std::string ns = ros::this_node::getNamespace();
   if (ns.empty()) {
     ns = "/";
@@ -2176,8 +2657,7 @@ int main(int argc, char** argv) {
   }
   const std::string planning_vmax_param = ns + "planning/vmax";
   if (!ros::param::get(planning_vmax_param, search_advance_vmax_)) {
-    search_advance_vmax_ = search_particles_manager_->getSearchVmax();
-    ROS_WARN("[dpf%d] Param %s not found, fallback search_advance_vmax=%.2f",
+    ROS_WARN("[dpf%d] Param %s not found, keep default search_advance_vmax=%.2f",
              drone_id_, planning_vmax_param.c_str(), search_advance_vmax_);
   } else {
     ROS_INFO("[dpf%d] search_advance_vmax=%.2f from %s",
@@ -2198,10 +2678,14 @@ int main(int argc, char** argv) {
   search_gmm_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>("search_gmm_vis", 1);
   search_pos_gmm_pub_ = nh.advertise<target_ekf::LocalStats>("search_pos_gmm", 1);
   search_gmm_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>("search_gmm_vis", 1);
+  search_particles_vis_pre_prune_pub_ = nh.advertise<sensor_msgs::PointCloud2>("search_particles_vis_pre_prune", 1);
   search_particles_vis_pub_ = nh.advertise<sensor_msgs::PointCloud2>("search_particles_vis", 1);
+  search_particles_vis_post_prune_pub_ = nh.advertise<sensor_msgs::PointCloud2>("search_particles_vis_post_prune", 1);
+  search_branch_health_pub_ = nh.advertise<target_ekf::SearchBranchHealth>("search_branch_health", 1);
   search_targets_pub_ = nh.advertise<geometry_msgs::PoseArray>("search_targets", 1);
   invalid_grid_pub_ = nh.advertise<target_ekf::InvalidRegionGMM>("invalid_region_gmm", 1);
   search_consensus_pub_ = nh.advertise<target_ekf::LocalStats>("search_consensus", 1);
+  search_fallback_model_pub_ = nh.advertise<target_ekf::LocalStats>("search_fallback_model", 1);
   
   // 地图订阅
   ros::Subscriber global_map_sub = nh.subscribe("global_map", 10, &global_map_callback);
@@ -2230,6 +2714,12 @@ int main(int argc, char** argv) {
     // 订阅邻居的6D搜索共识
     std::string search_cons_topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/search_consensus";
     search_consensus_subs_.push_back(nh.subscribe(search_cons_topic, 10, &search_consensus_callback));
+
+    // 订阅邻居的分支健康与fallback模型
+    std::string search_health_topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/search_branch_health";
+    search_branch_health_subs_.push_back(nh.subscribe(search_health_topic, 10, &search_branch_health_callback));
+    std::string search_fallback_topic = "/drone" + std::to_string(i) + "/drone" + std::to_string(i) + "_target_dpf/search_fallback_model";
+    search_fallback_model_subs_.push_back(nh.subscribe(search_fallback_topic, 10, &search_fallback_model_callback));
   }
   // 【核心】观测Timer（20Hz）+ 共识Timer（100Hz）
   ros::Timer dpf_core_timer = nh.createTimer(ros::Duration(1.0 / dpf_rate_), &dpf_core_timer_callback);

@@ -29,6 +29,7 @@ add_message_files(
   LabeledConsensusState.msg
   SearchLabelInfo.msg
   InvalidRegionGMM.msg
+  SearchBranchHealth.msg
 )
 
 generate_messages(

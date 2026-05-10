@@ -29,6 +29,7 @@
       <param name="init_x" value="-16"/>
       <param name="init_y" value="0"/>
       <param name="init_z" value="2"/>
+      <param name="max_speed" value="2.5"/>
       <remap from="~odom"   to="odom"/>
       <remap from="~imu"    to="imu"/>
       <remap from="~so3cmd" to="so3cmd"/>
@@ -139,11 +140,14 @@
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
       <param name="miss_detection_num" value="5"/>
-      <param name="neg_obs_ttl_sec" value="0.6"/>
-      <param name="invalid_decay_phi_min" value="0.08"/>
-      <param name="invalid_decay_phi_mid" value="0.95"/>
-      <param name="invalid_decay_r_occ" value="-0.50"/>
-      <param name="invalid_decay_r_safe" value="0.05"/>
+      <param name="neg_obs_ttl_sec" value="10.0"/>
+      <param name="grid_resolution" value="0.3"/>
+      <param name="grid_map_size_x" value="42.0"/>
+      <param name="grid_map_size_y" value="40.0"/>
+      <param name="invalid_decay_phi_min" value="0.01"/>
+      <param name="invalid_decay_phi_mid" value="0.60"/>
+      <param name="invalid_decay_r_occ" value="-0.02"/>
+      <param name="invalid_decay_r_safe" value="0.60"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
       <param name="hotspot_invalid_reject_ratio" value="1.0"/>
@@ -193,11 +197,14 @@
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
       <param name="miss_detection_num" value="5"/>
-      <param name="neg_obs_ttl_sec" value="0.6"/>
-      <param name="invalid_decay_phi_min" value="0.08"/>
-      <param name="invalid_decay_phi_mid" value="0.95"/>
-      <param name="invalid_decay_r_occ" value="-0.50"/>
-      <param name="invalid_decay_r_safe" value="0.05"/>
+      <param name="neg_obs_ttl_sec" value="10.0"/>
+      <param name="grid_resolution" value="0.3"/>
+      <param name="grid_map_size_x" value="42.0"/>
+      <param name="grid_map_size_y" value="40.0"/>
+      <param name="invalid_decay_phi_min" value="0.01"/>
+      <param name="invalid_decay_phi_mid" value="0.60"/>
+      <param name="invalid_decay_r_occ" value="-0.02"/>
+      <param name="invalid_decay_r_safe" value="0.60"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
       <param name="hotspot_invalid_reject_ratio" value="1.0"/>
@@ -247,11 +254,14 @@
       <param name="num_em_iters" value="10"/>
       <param name="check_fov" value="true"/>
       <param name="miss_detection_num" value="5"/>
-      <param name="neg_obs_ttl_sec" value="0.6"/>
-      <param name="invalid_decay_phi_min" value="0.08"/>
-      <param name="invalid_decay_phi_mid" value="0.95"/>
-      <param name="invalid_decay_r_occ" value="-0.50"/>
-      <param name="invalid_decay_r_safe" value="0.05"/>
+      <param name="neg_obs_ttl_sec" value="10.0"/>
+      <param name="grid_resolution" value="0.3"/>
+      <param name="grid_map_size_x" value="42.0"/>
+      <param name="grid_map_size_y" value="40.0"/>
+      <param name="invalid_decay_phi_min" value="0.01"/>
+      <param name="invalid_decay_phi_mid" value="0.60"/>
+      <param name="invalid_decay_r_occ" value="-0.02"/>
+      <param name="invalid_decay_r_safe" value="0.60"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
       <param name="hotspot_invalid_reject_ratio" value="1.0"/>

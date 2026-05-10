@@ -15,6 +15,30 @@ quadrotor_msgs::PolyTraj trajMsg_, trajMsg_last_;
 Eigen::Vector3d last_p_;
 double last_yaw_ = 0;
 
+double wrap_angle(double angle) {
+  return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+std::pair<double, double> sample_yaw_cmd(const quadrotor_msgs::PolyTraj &trajMsg, double t_rel) {
+  double yaw = trajMsg.yaw;
+  double yaw_dot = 0.0;
+  if (trajMsg.use_yaw_scan) {
+    const double freq = std::max(0.0, (double)trajMsg.yaw_scan_freq);
+    const double arg = 2.0 * M_PI * freq * t_rel + (double)trajMsg.yaw_scan_phase;
+    yaw = (double)trajMsg.yaw_scan_base + (double)trajMsg.yaw_scan_amp * std::sin(arg);
+    yaw_dot = (double)trajMsg.yaw_scan_amp * 2.0 * M_PI * freq * std::cos(arg);
+    yaw = wrap_angle(yaw);
+  }
+
+  double d_yaw = wrap_angle(yaw - last_yaw_);
+  const double max_yaw_step = 0.02;
+  if (std::fabs(d_yaw) >= max_yaw_step) {
+    yaw = wrap_angle(last_yaw_ + d_yaw / std::fabs(d_yaw) * max_yaw_step);
+    yaw_dot = d_yaw / std::fabs(d_yaw) * max_yaw_step / 0.01;
+  }
+  return {yaw, yaw_dot};
+}
+
 void publish_cmd(int traj_id,
                  const Eigen::Vector3d &p,
                  const Eigen::Vector3d &v,
@@ -87,17 +111,9 @@ bool exe_traj(const quadrotor_msgs::PolyTraj &trajMsg) {
     p = traj.getPos(t);
     v = traj.getVel(t);
     a = traj.getAcc(t);
-    // NOTE yaw
-    double yaw = trajMsg.yaw;
-    double d_yaw = yaw - last_yaw_;
-    d_yaw = d_yaw >= M_PI ? d_yaw - 2 * M_PI : d_yaw;
-    d_yaw = d_yaw <= -M_PI ? d_yaw + 2 * M_PI : d_yaw;
-    double d_yaw_abs = fabs(d_yaw);
-    if (d_yaw_abs >= 0.02) {
-      yaw = last_yaw_ + d_yaw / d_yaw_abs * 0.02;
-    }
-    publish_cmd(trajMsg.traj_id, p, v, a, yaw, 0);  // TODO yaw
-    last_yaw_ = yaw;
+    auto yaw_cmd = sample_yaw_cmd(trajMsg, t);
+    publish_cmd(trajMsg.traj_id, p, v, a, yaw_cmd.first, yaw_cmd.second);
+    last_yaw_ = yaw_cmd.first;
     return true;
   }
   return false;

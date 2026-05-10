@@ -214,11 +214,17 @@ def build_default_topics(drone_count):
     for i in range(drone_count):
         topics.append(f'/drone{i}/odom')
     for i in range(drone_count):
+        topics.append(f'/drone{i}/position_cmd')
+    for i in range(drone_count):
+        topics.append(f'/drone{i}/drone{i}_target_dpf/search_particles_vis_pre_prune')
+    for i in range(drone_count):
         topics.append(f'/drone{i}/drone{i}_target_dpf/local_stats')
     for i in range(drone_count):
         topics.append(f'/drone{i}/drone{i}_target_dpf/search_state')
     for i in range(drone_count):
         topics.append(f'/drone{i}/drone{i}_target_dpf/search_pos_gmm')
+    for i in range(drone_count):
+        topics.append(f'/drone{i}/drone{i}_target_dpf/search_particles_vis_post_prune')
     for i in range(drone_count):
         topics.append(f'/drone{i}/drone{i}_target_dpf/invalid_region_gmm')
     for i in range(drone_count):

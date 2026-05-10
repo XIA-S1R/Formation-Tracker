@@ -23,7 +23,7 @@ from nav_msgs.msg import Odometry
 W0_BOT = -6.5   # 墙0下边缘 y=-5, 留余量
 W0_TOP =  6.5   # 墙0上边缘 y=5
 W1_BOT = -3.5   # 墙1下边缘 y=-2
-W1_TOP =  9.5   # 墙1上边缘 y=8
+W1_TOP =  10.5   # 墙1上边缘 y=8
 W2_BOT = -6.5   # 墙2下边缘 y=-5
 W2_TOP =  6.5   # 墙2上边缘 y=5
 

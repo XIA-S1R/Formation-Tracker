@@ -74,6 +74,10 @@ def find_loss_intervals(search_states):
             intervals.append((t0, t, t - t0))
             t0 = None
         prev = cur
+    # Handle the final loss interval that continues until bag end.
+    if prev and t0 is not None and d0:
+        t_end = d0[-1][0]
+        intervals.append((t0, t_end, t_end - t0))
     return intervals
 
 

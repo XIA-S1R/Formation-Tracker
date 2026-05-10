@@ -61,6 +61,8 @@ class Nodelet : public nodelet::Nodelet {
   std::atomic_flag search_label_info_lock_ = ATOMIC_FLAG_INIT;
   Eigen::Vector3d search_target_with_offset_;  // 本机的搜索目标点（含偏置）
   double search_desired_yaw_ = 0.0;            // 搜索模式期望偏航角
+  double search_yaw_scan_range_deg_ = 45.0;    // 搜索模式偏航扫描半幅（度）
+  double search_yaw_scan_freq_hz_ = 0.25;       // 搜索模式偏航扫描频率（Hz）
   double post_reacquire_boost_sec_ = 3.0;      // 退出搜索后的增强跟踪窗口
   bool post_reacquire_boost_active_ = false;   // 增强跟踪是否激活
   ros::Time post_reacquire_boost_end_time_ = ros::Time(0);
@@ -200,6 +202,7 @@ class Nodelet : public nodelet::Nodelet {
   void pub_hover_p(const Eigen::Vector3d& hover_p, const ros::Time& stamp) {
     quadrotor_msgs::PolyTraj traj_msg;
     traj_msg.hover = true;
+    traj_msg.use_yaw_scan = false;
     traj_msg.hover_p.resize(3);
     for (int i = 0; i < 3; ++i) {
       traj_msg.hover_p[i] = hover_p[i];
@@ -261,7 +264,8 @@ class Nodelet : public nodelet::Nodelet {
     traj_poly_ = traj;
     replan_stamp_ = stamp;
   }
-  void pub_traj(const Trajectory& traj, const double& yaw, const ros::Time& stamp) {
+  void pub_traj(const Trajectory& traj, const double& yaw, const ros::Time& stamp,
+                bool use_yaw_scan = false, double yaw_scan_base = 0.0) {
     quadrotor_msgs::PolyTraj traj_msg;
     traj_msg.hover = false;
     traj_msg.order = 5;
@@ -285,6 +289,21 @@ class Nodelet : public nodelet::Nodelet {
     traj_msg.traj_id = traj_id_++;
     // NOTE yaw
     traj_msg.yaw = yaw;
+    traj_msg.use_yaw_scan = use_yaw_scan;
+    if (use_yaw_scan) {
+      const double amp = std::max(0.0, search_yaw_scan_range_deg_) * M_PI / 180.0;
+      const double freq = std::max(0.0, search_yaw_scan_freq_hz_);
+      const double phase_unwrapped = 2.0 * M_PI * freq * stamp.toSec();
+      traj_msg.yaw_scan_base = std::atan2(std::sin(yaw_scan_base), std::cos(yaw_scan_base));
+      traj_msg.yaw_scan_amp = amp;
+      traj_msg.yaw_scan_freq = freq;
+      traj_msg.yaw_scan_phase = std::atan2(std::sin(phase_unwrapped), std::cos(phase_unwrapped));
+    } else {
+      traj_msg.yaw_scan_base = 0.0;
+      traj_msg.yaw_scan_amp = 0.0;
+      traj_msg.yaw_scan_freq = 0.0;
+      traj_msg.yaw_scan_phase = 0.0;
+    }
     traj_msg.drone_id = trajOptPtr_->drone_id_;
     has_published_motion_traj_ = true;
     traj_pub_.publish(traj_msg);
@@ -595,6 +614,8 @@ class Nodelet : public nodelet::Nodelet {
     }
 
     // NOTE just for landing on the car!
+    double search_scan_base_yaw = std::atan2(std::sin(search_desired_yaw_), std::cos(search_desired_yaw_));
+    bool use_search_yaw_scan = false;
     if (land_triger_received_) {//车上着陆逻辑
       if (std::fabs((target_p - odom_p).norm() < 0.1 && odom_v.norm() < 0.1 && target_v.norm() < 0.2)) {
         if (!wait_hover_) {
@@ -616,13 +637,15 @@ class Nodelet : public nodelet::Nodelet {
         if (dir.head<2>().norm() > 1e-2) {
           base_yaw = std::atan2(dir.y(), dir.x());
         }
+        search_scan_base_yaw = std::atan2(std::sin(base_yaw), std::cos(base_yaw));
+        use_search_yaw_scan = true;
 
-        // 连续正弦扫角，避免离散跳变导致抖动
-        const double scan_angle_range = M_PI / 6.0;  // ±30 deg
-        const double scan_freq_hz = 0.35;            // 约 2.86s 一个完整摇头周期
+        // 连续正弦扫角，尽可能扩大搜索期视场覆盖，同时避免离散跳变导致抖动
+        const double scan_angle_range = std::max(0.0, search_yaw_scan_range_deg_) * M_PI / 180.0;
+        const double scan_freq_hz = std::max(0.0, search_yaw_scan_freq_hz_);
         const double t = ros::Time::now().toSec();
         const double yaw_offset = scan_angle_range * std::sin(2.0 * M_PI * scan_freq_hz * t);
-        search_desired_yaw_ = base_yaw + yaw_offset;
+        search_desired_yaw_ = search_scan_base_yaw + yaw_offset;
         search_desired_yaw_ = std::atan2(std::sin(search_desired_yaw_), std::cos(search_desired_yaw_));
         target_p.z() = std::max(2.0, odom_p.z());  // 保持安全高度
 
@@ -977,7 +1000,7 @@ class Nodelet : public nodelet::Nodelet {
         // }
         yaw = std::atan2(dp.y(), dp.x());
       }
-      pub_traj(traj, yaw, replan_stamp);
+      pub_traj(traj, yaw, replan_stamp, use_search_yaw_scan, search_scan_base_yaw);
       traj_poly_ = traj;
       replan_stamp_ = replan_stamp;
       last_hard_replan_stamp_ = ros::Time::now();
@@ -1093,7 +1116,7 @@ class Nodelet : public nodelet::Nodelet {
           double t_yaw = (ros::Time::now() - replan_stamp_).toSec() + t_delta;
           Eigen::Vector3d un_known_p = traj_poly_.getPos(t_yaw);
           Eigen::Vector3d dp = un_known_p - odom_p;
-          double yaw = std::atan2(dp.y(), dp.x());
+          double yaw = search_mode_active_ ? search_desired_yaw_ : std::atan2(dp.y(), dp.x());
           pub_traj(traj_poly_, yaw, replan_stamp_);
           no_need_replan = true;//没有更新的目标，当前轨迹的终点就是最终目标点。并且当前轨迹在剩余时间内都是安全的，那么不重新规划，并且微调轨迹让无人机偏航角正对行进方向
         }
@@ -1414,8 +1437,12 @@ class Nodelet : public nodelet::Nodelet {
     obs_clip_range_ = std::max(0.5, obs_clip_range_);
     obs_clip_margin_ = std::max(0.0, std::min(obs_clip_margin_, obs_clip_range_ - 0.1));
     nh.param("formation_heading_speed_thresh", formation_heading_speed_thresh_, 0.2);
+    nh.param("search_yaw_scan_range_deg", search_yaw_scan_range_deg_, 45.0);
+    nh.param("search_yaw_scan_freq_hz", search_yaw_scan_freq_hz_, 0.25);
     nh.param("post_reacquire_boost_sec", post_reacquire_boost_sec_, 3.0);
     post_reacquire_boost_sec_ = std::max(0.0, post_reacquire_boost_sec_);
+    search_yaw_scan_range_deg_ = std::max(0.0, search_yaw_scan_range_deg_);
+    search_yaw_scan_freq_hz_ = std::max(0.0, search_yaw_scan_freq_hz_);
     nh.getParam("debug", debug_);
     nh.getParam("fake", fake_);
     nh.getParam("vmax", vmax_);

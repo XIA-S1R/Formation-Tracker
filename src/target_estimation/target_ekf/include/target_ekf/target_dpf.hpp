@@ -111,7 +111,7 @@ struct DistributedPF {
     Q_(0, 0) = 0.05 * t2;  Q_(1, 1) = 0.05 * t2;  Q_(2, 2) = 0.02 * t2;
     // 速度噪声（进一步增大，加快对目标变向/变速的粒子覆盖）
     //Q_(3, 3) = 1 * t2;  Q_(4, 4) = 1 * t2;  Q_(5, 5) = 0.4 * t2;
-    Q_(3, 3) = 4.0 * t2;  Q_(4, 4) = 4.0 * t2;  Q_(5, 5) = 1.6 * t2;
+    Q_(3, 3) = 8.0 * t2;  Q_(4, 4) = 8.0 * t2;  Q_(5, 5) = 1.6 * t2;
     // 姿态噪声（提高 yaw 扰动，避免转向时姿态滞后）
     //Q_(6, 6) = 0.05 * t2;  Q_(7, 7) = 0.05 * t2;  Q_(8, 8) = 0.005 * t2;
     Q_(6, 6) = 0.08 * t2;  Q_(7, 7) = 0.08 * t2;  Q_(8, 8) = 0.02 * t2;
@@ -121,7 +121,7 @@ struct DistributedPF {
     //R_(0, 0) = 0.005;  R_(1, 1) = 0.005;  R_(2, 2) = 0.005;
     //R_(3, 3) = 0.005; R_(4, 4) = 0.005; R_(5, 5) = 0.005;
     R_.setIdentity(nz_, nz_);
-    R_(0, 0) = 0.01;  R_(1, 1) = 0.01;  R_(2, 2) = 0.01;
+    R_(0, 0) = 0.001;  R_(1, 1) = 0.001;  R_(2, 2) = 0.001;
     R_(3, 3) = 0.01;  R_(4, 4) = 0.01;  R_(5, 5) = 0.01;
 
     // 粒子和权重初始化
@@ -530,23 +530,21 @@ struct DistributedPF {
     // 低方差重采样
     double sum_w2 = weights_.squaredNorm();
     double Neff = (sum_w2 > 1e-300) ? 1.0 / sum_w2 : 0.0;
-    if (Neff < N_ * 0.5) {
-      std::uniform_real_distribution<double> uniform(0.0, 1.0 / N_);
-      double r = uniform(rng_);
-      Eigen::MatrixXd new_particles(nx_, N_);
-      double c = weights_(0);
-      int idx = 0;
-      for (int i = 0; i < N_; ++i) {
-        double u = r + (double)i / N_;
-        while (u > c && idx < N_ - 1) {
-          idx++;
-          c += weights_(idx);
-        }
-        new_particles.col(i) = particles_.col(idx);
+    std::uniform_real_distribution<double> uniform(0.0, 1.0 / N_);
+    double r = uniform(rng_);
+    Eigen::MatrixXd new_particles(nx_, N_);
+    double c = weights_(0);
+    int idx = 0;
+    for (int i = 0; i < N_; ++i) {
+      double u = r + (double)i / N_;
+      while (u > c && idx < N_ - 1) {
+        idx++;
+        c += weights_(idx);
       }
-      particles_ = new_particles;
-      weights_.setConstant(N_, 1.0 / N_);
+      new_particles.col(i) = particles_.col(idx);
     }
+    particles_ = new_particles;
+    weights_.setConstant(N_, 1.0 / N_);  
   }
 
   // === 数值有效性检查 ===
