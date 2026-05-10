@@ -55,6 +55,9 @@ class Nodelet : public nodelet::Nodelet {
   std_msgs::Bool latest_search_state_;
   geometry_msgs::PoseArray search_targets_;  // 三个搜索目标点
   std::atomic_flag search_targets_lock_ = ATOMIC_FLAG_INIT;
+  bool have_search_target_pose_ = false;
+  Eigen::Vector3d search_target_pose_ = Eigen::Vector3d::Zero();
+  double search_target_pose_yaw_ = 0.0;
 
   // 搜索标签信息（从各掌管者接收）
   std::map<int, target_ekf::SearchLabelInfo> search_label_infos_;  // label -> info
@@ -445,6 +448,7 @@ class Nodelet : public nodelet::Nodelet {
     while (search_targets_lock_.test_and_set())
       ;
     search_targets_ = *msgPtr;
+    have_search_target_pose_ = false;
     search_targets_lock_.clear();
   }
 
@@ -630,27 +634,41 @@ class Nodelet : public nodelet::Nodelet {
       wait_hover_ = false;
     } else {//追踪逻辑
       if (search_mode_active_) {
-        // 搜索模式：target_p 已经是 dpf 节点发布的热点位置，偏航在朝向热点基础上连续摇头扫描
-        Eigen::Vector3d dir = target_p - odom_p;
-        dir.z() = 0.0;
-        double base_yaw = search_desired_yaw_;
-        if (dir.head<2>().norm() > 1e-2) {
-          base_yaw = std::atan2(dir.y(), dir.x());
+        // 搜索模式：从 DPF 发布的热点集合中选一个本机当前最合适的位姿目标。
+        // 这里不再追踪会继续漂移的 target_odom，而是直接面向热点位姿做搜索覆盖。
+        bool have_search_pose = false;
+        {
+          while (search_targets_lock_.test_and_set())
+            ;
+          const int idx = trajOptPtr_->drone_id_;
+          if (idx >= 0 && idx < static_cast<int>(search_targets_.poses.size())) {
+            const auto& sp = search_targets_.poses[idx];
+            target_p.x() = sp.position.x;
+            target_p.y() = sp.position.y;
+            target_p.z() = std::max(2.0, sp.position.z);
+            Eigen::Quaterniond sp_q(sp.orientation.w, sp.orientation.x, sp.orientation.y, sp.orientation.z);
+            if (sp_q.norm() > 1e-6) {
+              sp_q.normalize();
+              const Eigen::Vector3d yaw_vec = sp_q * Eigen::Vector3d::UnitX();
+              search_desired_yaw_ = std::atan2(yaw_vec.y(), yaw_vec.x());
+            }
+            have_search_pose = true;
+          }
+          search_targets_lock_.clear();
         }
-        search_scan_base_yaw = std::atan2(std::sin(base_yaw), std::cos(base_yaw));
-        use_search_yaw_scan = true;
-
-        // 连续正弦扫角，尽可能扩大搜索期视场覆盖，同时避免离散跳变导致抖动
-        const double scan_angle_range = std::max(0.0, search_yaw_scan_range_deg_) * M_PI / 180.0;
-        const double scan_freq_hz = std::max(0.0, search_yaw_scan_freq_hz_);
-        const double t = ros::Time::now().toSec();
-        const double yaw_offset = scan_angle_range * std::sin(2.0 * M_PI * scan_freq_hz * t);
-        search_desired_yaw_ = search_scan_base_yaw + yaw_offset;
-        search_desired_yaw_ = std::atan2(std::sin(search_desired_yaw_), std::cos(search_desired_yaw_));
-        target_p.z() = std::max(2.0, odom_p.z());  // 保持安全高度
-
-        ROS_INFO_THROTTLE(1.0, "[planner drone%d] SEARCH MODE: target=(%.2f,%.2f,%.2f)",
-                          trajOptPtr_->drone_id_, target_p.x(), target_p.y(), target_p.z());
+        if (!have_search_pose) {
+          Eigen::Vector3d dir = target_p - odom_p;
+          dir.z() = 0.0;
+          if (dir.head<2>().norm() > 1e-2) {
+            search_desired_yaw_ = std::atan2(dir.y(), dir.x());
+          }
+          target_p.z() = std::max(2.0, odom_p.z());  // 保持安全高度
+        }
+        search_scan_base_yaw = std::atan2(std::sin(search_desired_yaw_), std::cos(search_desired_yaw_));
+        use_search_yaw_scan = false;
+        ROS_INFO_THROTTLE(1.0, "[planner drone%d] SEARCH MODE: target_pose=(%.2f,%.2f,%.2f) yaw=%.1fdeg",
+                          trajOptPtr_->drone_id_, target_p.x(), target_p.y(), target_p.z(),
+                          search_desired_yaw_ * 180.0 / M_PI);
       } else {
         target_p.z() += 0.3;// 追踪目标定在目标上方1m处
 
@@ -1000,7 +1018,7 @@ class Nodelet : public nodelet::Nodelet {
         // }
         yaw = std::atan2(dp.y(), dp.x());
       }
-      pub_traj(traj, yaw, replan_stamp, use_search_yaw_scan, search_scan_base_yaw);
+      pub_traj(traj, yaw, replan_stamp, false, search_scan_base_yaw);
       traj_poly_ = traj;
       replan_stamp_ = replan_stamp;
       last_hard_replan_stamp_ = ros::Time::now();

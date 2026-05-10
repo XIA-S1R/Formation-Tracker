@@ -119,7 +119,9 @@ def parse_args():
     parser.add_argument("--curve-per-drone", action="store_true",
                         help="when exporting binned curve, split by drone_id")
     parser.add_argument("--curve-png", default="",
-                        help="optional png path for ES/Hit/HPD-vs-time curves")
+                        help="optional png path for combined 4-subplot curve (ES/AvgDev/Hit/HPD)")
+    parser.add_argument("--es-curve-png", default="",
+                        help="optional png path for standalone ES-vs-time curve")
     return parser.parse_args()
 
 
@@ -1036,25 +1038,25 @@ def maybe_plot_curve(rows, per_drone, png_path):
 
     metric_defs = [
         {
-            "key_mean": "es_mean",
+            "key_center": "es_median",
             "key_p25": "es_p25",
             "key_p75": "es_p75",
             "ylabel": "Energy Score (m)",
-            "title": "ES Curve (lower is better)",
+            "title": "ES Curve (median, lower is better)",
             "ylim": None,
             "color": "#2c7fb8",
         },
         {
-            "key_mean": "avg_dev_mean",
+            "key_center": "avg_dev_median",
             "key_p25": "avg_dev_p25",
             "key_p75": "avg_dev_p75",
             "ylabel": "Avg Deviation (m)",
-            "title": "Average Deviation Curve (lower is better)",
+            "title": "Average Deviation Curve (median, lower is better)",
             "ylim": None,
             "color": "#f16913",
         },
         {
-            "key_mean": "hit_prob_mean",
+            "key_center": "hit_prob_mean",
             "key_p25": "hit_prob_p25",
             "key_p75": "hit_prob_p75",
             "ylabel": "Hit Probability",
@@ -1063,7 +1065,7 @@ def maybe_plot_curve(rows, per_drone, png_path):
             "color": "#2ca25f",
         },
         {
-            "key_mean": "hpd_coverage_mean",
+            "key_center": "hpd_coverage_mean",
             "key_p25": "hpd_coverage_p25",
             "key_p75": "hpd_coverage_p75",
             "ylabel": "HPD Coverage",
@@ -1085,30 +1087,75 @@ def maybe_plot_curve(rows, per_drone, png_path):
         if per_drone:
             for d, rs in sorted(by_drone.items()):
                 rs = sorted(rs, key=lambda x: x["t_center_sec"])
+                rs = [r for r in rs if r["t_center_sec"] <= 5.0]
                 x = np.asarray([r["t_center_sec"] for r in rs], dtype=np.float64)
-                y = np.asarray([r.get(md["key_mean"], 0.0) for r in rs], dtype=np.float64)
+                y = np.asarray([r.get(md["key_center"], 0.0) for r in rs], dtype=np.float64)
                 p25 = np.asarray([r.get(md["key_p25"], 0.0) for r in rs], dtype=np.float64)
                 p75 = np.asarray([r.get(md["key_p75"], 0.0) for r in rs], dtype=np.float64)
                 ax.plot(x, y, lw=1.8, label="drone{}".format(d))
                 ax.fill_between(x, p25, p75, alpha=0.15)
         else:
             rs = sorted(rows, key=lambda x: x["t_center_sec"])
+            rs = [r for r in rs if r["t_center_sec"] <= 5.0]
             x = np.asarray([r["t_center_sec"] for r in rs], dtype=np.float64)
-            y = np.asarray([r.get(md["key_mean"], 0.0) for r in rs], dtype=np.float64)
+            y = np.asarray([r.get(md["key_center"], 0.0) for r in rs], dtype=np.float64)
             p25 = np.asarray([r.get(md["key_p25"], 0.0) for r in rs], dtype=np.float64)
             p75 = np.asarray([r.get(md["key_p75"], 0.0) for r in rs], dtype=np.float64)
-            ax.plot(x, y, lw=2.2, color=md["color"], label="all drones")
+            ax.plot(x, y, lw=2.2, color=md["color"], label="all drones (median)")
             ax.fill_between(x, p25, p75, color=md["color"], alpha=0.20, label="p25-p75")
 
         if md["ylim"] is not None:
             ax.set_ylim(md["ylim"])
+        ax.set_xlim(0.0, 5.0)
         ax.set_ylabel(md["ylabel"])
         ax.set_title(md["title"])
         ax.grid(True, linestyle="--", alpha=0.35)
         ax.legend(loc="best")
 
     axes[-1].set_xlabel("Time Since Loss Start (s)")
-    fig.suptitle("Search Estimation Curves")
+    fig.suptitle("Search Estimation Curves (0-5s)")
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_es_only(rows, per_drone, png_path):
+    if not png_path or not rows:
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        print("Warning: matplotlib not available, skip ES-only plot.")
+        return
+
+    ensure_parent_dir(png_path)
+    fig, ax = plt.subplots(1, 1, figsize=(8.0, 4.6))
+
+    color = "#2c7fb8"
+    if per_drone:
+        by_drone = {}
+        for r in rows:
+            by_drone.setdefault(int(r["drone_id"]), []).append(r)
+        for d, rs in sorted(by_drone.items()):
+            rs = sorted(rs, key=lambda x: x["t_center_sec"])
+            rs = [r for r in rs if r["t_center_sec"] <= 5.0]
+            x = np.asarray([r["t_center_sec"] for r in rs], dtype=np.float64)
+            y = np.asarray([r.get("es_median", 0.0) for r in rs], dtype=np.float64)
+            ax.plot(x, y, lw=2.0)
+    else:
+        rs = sorted(rows, key=lambda x: x["t_center_sec"])
+        rs = [r for r in rs if r["t_center_sec"] <= 5.0]
+        x = np.asarray([r["t_center_sec"] for r in rs], dtype=np.float64)
+        y = np.asarray([r.get("es_median", 0.0) for r in rs], dtype=np.float64)
+        ax.plot(x, y, lw=2.4, color=color)
+
+    ax.set_xlim(0.0, 5.0)
+    ax.set_xlabel("Time Since Loss Start (s)")
+    ax.set_ylabel("Energy Score (m)")
+    ax.set_title("Energy Score vs Time Since Loss (median, 0-5s)")
+    ax.grid(True, linestyle="--", alpha=0.35)
     fig.tight_layout()
     fig.savefig(png_path, dpi=180)
     plt.close(fig)
@@ -1248,7 +1295,7 @@ def main():
         print("Wrote: {}".format(curve_samples_csv))
 
     curve_rows = []
-    need_curve = bool(args.curve_binned_csv or args.curve_png)
+    need_curve = bool(args.curve_binned_csv or args.curve_png or args.es_curve_png)
     if need_curve:
         curve_rows = build_curve_binned_rows(
             samples=curve_samples_all,
@@ -1277,6 +1324,10 @@ def main():
     if args.curve_png:
         maybe_plot_curve(curve_rows, args.curve_per_drone, os.path.abspath(args.curve_png))
         print("Wrote: {}".format(os.path.abspath(args.curve_png)))
+
+    if args.es_curve_png:
+        plot_es_only(curve_rows, args.curve_per_drone, os.path.abspath(args.es_curve_png))
+        print("Wrote: {}".format(os.path.abspath(args.es_curve_png)))
 
     return 0
 

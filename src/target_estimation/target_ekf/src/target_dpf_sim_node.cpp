@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cctype>
+#include <cstdint>
 #include <deque>
 #include "target_ekf/search_particles_manager.hpp"
 
@@ -48,6 +49,29 @@ struct SearchCoverageAssignment {
   double reuse_penalty = 0.0;
 };
 
+struct SearchViewCandidate {
+  int hotspot_index = -1;
+  Eigen::Vector3d pos = Eigen::Vector3d::Zero();
+  double yaw = 0.0;
+  double visible_mass = 0.0;
+  std::vector<uint8_t> visible_mask;
+};
+
+struct SearchViewAssignment {
+  int drone_vec_index = -1;
+  int drone_id = -1;
+  int candidate_index = -1;
+  int hotspot_index = -1;
+  double utility = -1e9;
+  double gain_mass = 0.0;
+  double overlap_mass = 0.0;
+  double position_penalty = 0.0;
+  double same_hotspot_penalty = 0.0;
+  double travel_cost = 0.0;
+  double visible_mass = 0.0;
+  double distance = 0.0;
+};
+
 void matchGMMCenters(const std::vector<Eigen::Vector3d>& current_mu,
                      const Eigen::VectorXd& current_pi,
                      double distance_threshold = 2.0);
@@ -59,6 +83,14 @@ bool isLineOfSightClear(const Eigen::Vector3d& start, const Eigen::Vector3d& end
 std::vector<SearchCoverageAssignment> assignSearchHotspotsForCoverage(
     const std::vector<std::pair<int, Eigen::Vector3d>>& drone_positions,
     const std::vector<SearchParticlesManager::SearchHotspot>& hotspots);
+std::vector<SearchViewAssignment> assignSearchViewsForCoverage(
+    const std::vector<std::pair<int, Eigen::Vector3d>>& drone_positions,
+    const std::vector<SearchViewCandidate>& candidates,
+    const std::vector<double>& w_norm);
+std::vector<SearchParticlesManager::SearchHotspot> spreadSearchHotspots(
+    const std::vector<SearchParticlesManager::SearchHotspot>& hotspots,
+    int max_keep,
+    double min_separation_m);
 
 // === 全局变量 ===
 // 发布器
@@ -151,10 +183,10 @@ int reacquire_boost_miss_min_ = 0;                     // 回搜阈值最小值�
 Eigen::Vector3d committed_search_dir_ = Eigen::Vector3d::Zero();
 Eigen::Vector3d committed_target_pos_ = Eigen::Vector3d::Zero(); // 当前推进目标
 ros::Time last_hotspot_extract_time_ = ros::Time(0);
-double hotspot_extract_interval_base_sec_ = 2.0;   // 热点重提取固定周期(秒)
+double hotspot_extract_interval_base_sec_ = 0.5;   // 热点重提取固定周期(秒)
 double hotspot_extract_interval_growth_sec_ = 0.0; // 兼容旧参数，当前不再使用
 double hotspot_extract_interval_max_sec_ = 2.0;    // 兼容旧参数，当前固定等于base
-double current_hotspot_extract_interval_sec_ = 2.0; // 当前生效的固定重提取周期(秒)
+double current_hotspot_extract_interval_sec_ = 0.5; // 当前生效的固定重提取周期(秒)
 int committed_direction_refresh_count_ = 0;         // 当前搜索阶段内热点重提取次数
 bool has_committed_direction_ = false;
 double search_advance_vmax_ = 2.0; // 搜索模式推进速度，优先使用当前无人机 planning/vmax
@@ -193,6 +225,16 @@ double search_assign_overlap_radius_m_ = 4.0; // 搜索分配：热点重叠判�
 double search_assign_overlap_penalty_ = 6.0; // 搜索分配：与已分配热点重叠惩罚
 double search_assign_reuse_penalty_ = 8.0;   // 搜索分配：热点被重复复用的惩罚
 bool search_hold_assigned_target_ = true;    // 搜索分配后保持当前任务点，交给规划器稳定A*过去
+double search_hotspot_min_separation_m_ = 4.0; // 热点最小间距，避免多个热点塌到同一团粒子上
+double search_view_standoff_radius_m_ = 4.0;   // 视位：围绕热点的观测半径
+int search_view_candidate_azimuths_ = 8;       // 视位：每个热点生成的环形候选数
+double search_view_gain_scale_ = 100.0;         // 视位：可见质量收益缩放
+double search_view_overlap_penalty_ = 140.0;    // 视位：重叠质量惩罚
+double search_view_position_penalty_radius_m_ = 6.0; // 视位：空间过近判定半径
+double search_view_position_penalty_ = 80.0;         // 视位：空间过近惩罚
+double search_view_same_hotspot_penalty_ = 120.0;    // 视位：多机围同一热点惩罚
+double search_view_travel_cost_scale_ = 1.0;    // 视位：航程代价缩放
+double search_view_min_visible_mass_ = 0.01;     // 视位：最小可见质量阈值
 
 // 无效区域虚拟栅格存储（并集共识）
 using InvalidGrid2D = SearchParticlesManager::InvalidGrid2D;
@@ -200,7 +242,7 @@ std::mutex invalid_grid_mutex_;
 // 栅格参数（与场景范围对齐，在main中初始化）
 double grid_origin_x_ = -10.0;
 double grid_origin_y_ = -15.0;
-double grid_resolution_ = 0.5;
+double grid_resolution_ = 0.15;
 int grid_nx_ = 80;
 int grid_ny_ = 80;
 double grid_map_size_x_ = -1.0;
@@ -493,6 +535,36 @@ std::vector<SearchCoverageAssignment> assignSearchHotspotsForCoverage(
   return assignments;
 }
 
+std::vector<SearchParticlesManager::SearchHotspot> spreadSearchHotspots(
+    const std::vector<SearchParticlesManager::SearchHotspot>& hotspots,
+    int max_keep,
+    double min_separation_m) {
+  std::vector<SearchParticlesManager::SearchHotspot> selected;
+  if (hotspots.empty() || max_keep <= 0) return selected;
+
+  const double min_sep = std::max(0.0, min_separation_m);
+  selected.reserve(std::min<int>(max_keep, hotspots.size()));
+
+  for (const auto& h : hotspots) {
+    bool too_close = false;
+    for (const auto& prev : selected) {
+      if ((h.pos - prev.pos).norm() < min_sep) {
+        too_close = true;
+        break;
+      }
+    }
+    if (too_close) continue;
+    selected.push_back(h);
+    if (static_cast<int>(selected.size()) >= max_keep) break;
+  }
+
+  if (selected.empty()) {
+    selected.push_back(hotspots.front());
+  }
+
+  return selected;
+}
+
 struct ParticleCloudDebugSummary {
   int N = 0;
   double neff = 0.0;
@@ -635,6 +707,231 @@ SearchVisibilityStats evaluateSearchVisibility(const Eigen::MatrixXd& particles,
         static_cast<double>(s.los_blocked_particles) / static_cast<double>(s.in_fov_particles);
   }
   return s;
+}
+
+struct SearchVisibilityMassEval {
+  double visible_mass = 0.0;
+  int visible_particles = 0;
+  std::vector<uint8_t> visible_mask;
+};
+
+std::vector<double> normalizeParticleWeights(const Eigen::VectorXd& weights, int N) {
+  const int n = std::min<int>(N, weights.size());
+  std::vector<double> w(n, 0.0);
+  double sum_w = 0.0;
+  for (int i = 0; i < n; ++i) {
+    const double v = std::isfinite(weights(i)) ? std::max(0.0, weights(i)) : 0.0;
+    w[i] = v;
+    sum_w += v;
+  }
+  if (!(sum_w > 1e-300)) {
+    if (n > 0) {
+      const double uni = 1.0 / static_cast<double>(n);
+      std::fill(w.begin(), w.end(), uni);
+    }
+    return w;
+  }
+  for (double& v : w) v /= sum_w;
+  return w;
+}
+
+SearchVisibilityMassEval evaluateSearchVisibilityMass(const Eigen::MatrixXd& particles,
+                                                      const Eigen::VectorXd& weights,
+                                                      int N,
+                                                      const Eigen::Vector3d& cam_p,
+                                                      const Eigen::Quaterniond& cam_q) {
+  SearchVisibilityMassEval eval;
+  if (N <= 0 || particles.rows() < 3 || particles.cols() < N || weights.size() < N) return eval;
+  eval.visible_mask.assign(N, 0);
+  const std::vector<double> w_norm = normalizeParticleWeights(weights, N);
+  const Eigen::Matrix3d R_cw = cam_q.toRotationMatrix().transpose();
+  for (int i = 0; i < N; ++i) {
+    const Eigen::Vector3d p_w = particles.col(i).head<3>();
+    const Eigen::Vector3d p_c = R_cw * (p_w - cam_p);
+    if (!(p_c.z() > 0.1 && p_c.z() < max_obs_depth_)) continue;
+    const double u = p_c.x() * fx_ / p_c.z() + cx_;
+    const double v = p_c.y() * fy_ / p_c.z() + cy_;
+    if (!(u >= 0.0 && u <= width_ && v >= 0.0 && v <= height_)) continue;
+    if (!isLineOfSightClear(cam_p, p_w)) continue;
+    eval.visible_mask[i] = 1;
+    eval.visible_mass += w_norm[i];
+    ++eval.visible_particles;
+  }
+  return eval;
+}
+
+double computeVisibilityOverlapMass(const std::vector<uint8_t>& a,
+                                    const std::vector<uint8_t>& b,
+                                    const std::vector<double>& w_norm) {
+  const int n = std::min<int>(std::min<int>(a.size(), b.size()), w_norm.size());
+  double mass = 0.0;
+  for (int i = 0; i < n; ++i) {
+    if (a[i] && b[i]) mass += w_norm[i];
+  }
+  return mass;
+}
+
+std::vector<SearchViewCandidate> buildSearchViewCandidates(
+    const std::vector<SearchParticlesManager::SearchHotspot>& hotspots,
+    const std::vector<std::pair<int, Eigen::Vector3d>>& drone_positions,
+    const Eigen::MatrixXd& particles,
+    const Eigen::VectorXd& weights,
+    int N,
+    const SearchParticlesManager::InvalidGrid2D& invalid_grid) {
+  std::vector<SearchViewCandidate> candidates;
+  if (hotspots.empty() || N <= 0) return candidates;
+
+  const double standoff = std::max(0.5, search_view_standoff_radius_m_);
+  const int az_num = std::max(1, search_view_candidate_azimuths_);
+
+  double nominal_z = 2.5;
+  if (!drone_positions.empty()) {
+    double sum_z = 0.0;
+    for (const auto& dp : drone_positions) sum_z += dp.second.z();
+    nominal_z = std::max(2.0, sum_z / static_cast<double>(drone_positions.size()));
+  }
+
+  for (size_t h = 0; h < hotspots.size(); ++h) {
+    const auto& hs = hotspots[h];
+    std::vector<Eigen::Vector3d> poses;
+    poses.reserve(static_cast<size_t>(az_num) + 1);
+
+    // 先尝试热点中心本身，yaw指向局部密集侧
+    {
+      Eigen::Vector3d center = hs.pos;
+      center.z() = std::max(nominal_z, 2.0);
+      poses.push_back(center);
+    }
+
+    for (int k = 0; k < az_num; ++k) {
+      const double ang = 2.0 * M_PI * static_cast<double>(k) / static_cast<double>(az_num);
+      Eigen::Vector3d p = hs.pos + Eigen::Vector3d(standoff * std::cos(ang),
+                                                   standoff * std::sin(ang),
+                                                   0.0);
+      p.z() = std::max(nominal_z, 2.0);
+      poses.push_back(p);
+    }
+
+    for (const auto& p : poses) {
+      if (invalid_grid.valid()) {
+        int ix = 0, iy = 0;
+        invalid_grid.toCell(p.x(), p.y(), ix, iy);
+        if (!invalid_grid.inBounds(ix, iy)) continue;
+        if (invalid_grid.get(ix, iy) != 0) continue;
+      }
+
+      SearchViewCandidate cand;
+      cand.hotspot_index = static_cast<int>(h);
+      cand.pos = p;
+      cand.yaw = std::atan2(hs.pos.y() - p.y(), hs.pos.x() - p.x());
+      const Eigen::Quaterniond q(Eigen::AngleAxisd(cand.yaw, Eigen::Vector3d::UnitZ()));
+      const auto vis = evaluateSearchVisibilityMass(particles, weights, N, cand.pos, q);
+      cand.visible_mass = vis.visible_mass;
+      cand.visible_mask = std::move(vis.visible_mask);
+      if (cand.visible_mass < search_view_min_visible_mass_) {
+        // 先保留低质量候选用于兜底，不在此处直接丢弃
+      }
+      candidates.push_back(std::move(cand));
+    }
+  }
+
+  std::sort(candidates.begin(), candidates.end(),
+            [](const SearchViewCandidate& a, const SearchViewCandidate& b) {
+              if (a.visible_mass != b.visible_mass) return a.visible_mass > b.visible_mass;
+              return a.hotspot_index < b.hotspot_index;
+            });
+  return candidates;
+}
+
+std::vector<SearchViewAssignment> assignSearchViewsForCoverage(
+    const std::vector<std::pair<int, Eigen::Vector3d>>& drone_positions,
+    const std::vector<SearchViewCandidate>& candidates,
+    const std::vector<double>& w_norm) {
+  std::vector<SearchViewAssignment> assignments;
+  const int nd = static_cast<int>(drone_positions.size());
+  const int nc = static_cast<int>(candidates.size());
+  if (nd <= 0 || nc <= 0) return assignments;
+
+  const int n_mask = static_cast<int>(candidates.front().visible_mask.size());
+  if (n_mask <= 0 || static_cast<int>(w_norm.size()) < n_mask) return assignments;
+
+  std::vector<bool> drone_assigned(nd, false);
+  std::vector<int> candidate_use_count(nc, 0);
+  std::vector<uint8_t> union_mask(n_mask, 0);
+  const bool allow_candidate_reuse = (nc < nd);
+
+  while (static_cast<int>(assignments.size()) < nd) {
+    SearchViewAssignment best;
+    bool found = false;
+
+    for (int d = 0; d < nd; ++d) {
+      if (drone_assigned[d]) continue;
+      for (int c = 0; c < nc; ++c) {
+        if (!allow_candidate_reuse && candidate_use_count[c] > 0) continue;
+        const auto& cand = candidates[c];
+        if (static_cast<int>(cand.visible_mask.size()) != n_mask) continue;
+
+        double gain_mass = 0.0;
+        double overlap_mass = 0.0;
+        double position_penalty = 0.0;
+        double same_hotspot_penalty = 0.0;
+        for (int i = 0; i < n_mask; ++i) {
+          if (!cand.visible_mask[i]) continue;
+          if (union_mask[i]) overlap_mass += w_norm[i];
+          else gain_mass += w_norm[i];
+        }
+        for (const auto& prev : assignments) {
+          if (prev.candidate_index < 0 || prev.candidate_index >= nc) continue;
+          const auto& prev_cand = candidates[prev.candidate_index];
+          const double dpos = (cand.pos - prev_cand.pos).norm();
+          const double rpos = std::max(1e-3, search_view_position_penalty_radius_m_);
+          position_penalty += std::exp(-0.5 * dpos * dpos / (rpos * rpos));
+          if (cand.hotspot_index == prev_cand.hotspot_index) {
+            same_hotspot_penalty += 1.0;
+          }
+        }
+        const double dist = (drone_positions[d].second - cand.pos).norm();
+        // rate-of-coverage: 单位时间内能压下去的粒子质量
+        // search_view_travel_cost_scale_ 语义改为饱和时间常数 τ(秒)，
+        // 防止零距离除 0，并压制"就地小收益"候选。
+        const double vmax = std::max(0.1, search_advance_vmax_);
+        const double eta = dist / vmax;
+        const double tau = std::max(1e-3, search_view_travel_cost_scale_);
+        const double net_gain =
+            search_view_gain_scale_ * gain_mass -
+            search_view_overlap_penalty_ * overlap_mass -
+            search_view_position_penalty_ * position_penalty -
+            search_view_same_hotspot_penalty_ * same_hotspot_penalty;
+        const double utility = net_gain / (eta + tau);
+        if (!found || utility > best.utility) {
+          found = true;
+          best.drone_vec_index = d;
+          best.drone_id = drone_positions[d].first;
+          best.candidate_index = c;
+          best.hotspot_index = cand.hotspot_index;
+          best.utility = utility;
+          best.gain_mass = gain_mass;
+          best.overlap_mass = overlap_mass;
+          best.position_penalty = position_penalty;
+          best.same_hotspot_penalty = same_hotspot_penalty;
+          best.travel_cost = dist;
+          best.visible_mass = cand.visible_mass;
+          best.distance = dist;
+        }
+      }
+    }
+
+    if (!found) break;
+    drone_assigned[best.drone_vec_index] = true;
+    candidate_use_count[best.candidate_index]++;
+    const auto& selected_mask = candidates[best.candidate_index].visible_mask;
+    for (int i = 0; i < n_mask; ++i) {
+      if (selected_mask[i]) union_mask[i] = 1;
+    }
+    assignments.push_back(best);
+  }
+
+  return assignments;
 }
 
 void applySearchResampleJitter(Eigen::MatrixXd& particles) {
@@ -1824,19 +2121,12 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
     }
 
     if (need_extract) {
-      // 任务重分配前：触发一次短时EM共识会话，并可选择等待完成
-      startSearchEmSession(now, "need_extract");
-      if (search_em_wait_for_allocation_) {
-        const ros::Duration wait_step(0.002);
-        dpf_lock.unlock();  // 允许consensus_timer获取锁并执行EM迭代
-        while (ros::ok() && !isSearchEmSessionFinished(ros::Time::now())) {
-          wait_step.sleep();
-        }
-        dpf_lock.lock();
-        search_em_session_active_ = false;
-        ROS_INFO("[dpf%d] Search EM allocation wait done: done_iters=%d target_iters=%d",
-                 drone_id_, search_em_session_done_iters_,
-                 std::max(1, search_em_session_target_iters_));
+      // 任务重分配前：触发一次短时EM共识会话，但不再阻塞等待——
+      // consensus_timer会在后续帧继续增量迭代，本次分配直接使用
+      // 当前已收敛的GMM/粒子状态，避免把 0.2~0.5s 的重分配周期
+      // 浪费在同步等 EM 上（原 search_em_wait_for_allocation_ 分支已废弃）。
+      if (!search_em_session_active_) {
+        startSearchEmSession(now, "need_extract");
       }
 
       // 提取热点（优先基于当前粒子云前沿提取），传入无人机位置做排斥
@@ -1852,75 +2142,162 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
                           drone_id_);
       }
 
-      // 发布候选热点用于调试可视化
-      geometry_msgs::PoseArray hotspot_msg;
-      hotspot_msg.header.stamp = ros::Time::now();
-      hotspot_msg.header.frame_id = "world";
-      for (const auto& h : hotspots) {
-        geometry_msgs::Pose p;
-        p.position.x = h.pos.x();
-        p.position.y = h.pos.y();
-        p.position.z = h.pos.z();
-        p.orientation.w = 1.0;
-        hotspot_msg.poses.push_back(p);
+      if (!hotspots.empty()) {
+        hotspots = spreadSearchHotspots(hotspots, num_drones_, search_hotspot_min_separation_m_);
       }
-      search_targets_pub_.publish(hotspot_msg);
 
       if (!hotspots.empty()) {
-        // 覆盖率驱动分配：
-        // 目标不是“谁离哪个热点最近”，而是让三机尽量覆盖不同高权重模态，
-        // 因此显式惩罚热点间重叠和热点重复复用。
-        const auto assignments = assignSearchHotspotsForCoverage(drone_positions, hotspots);
+        const std::vector<double> w_norm = normalizeParticleWeights(dpfPtr_->weights_, dpfPtr_->N_);
+        const auto view_candidates = buildSearchViewCandidates(
+            hotspots, drone_positions, dpfPtr_->particles_, dpfPtr_->weights_, dpfPtr_->N_,
+            global_invalid_grid_);
 
-        for (const auto& a : assignments) {
-          if (a.hotspot_index < 0 || a.hotspot_index >= static_cast<int>(hotspots.size())) continue;
-          const auto& h = hotspots[a.hotspot_index];
-          ROS_INFO("[dpf%d] Search assign: drone=%d hotspot=%d pos=(%.2f,%.2f,%.2f) w=%.3f utility=%.3f dist=%.2f overlap=%.3f reuse=%.3f",
-                   drone_id_, a.drone_id, a.hotspot_index,
-                   h.pos.x(), h.pos.y(), h.pos.z(), h.weight,
-                   a.utility, a.distance, a.overlap_penalty, a.reuse_penalty);
-        }
+        bool used_view_assignment = false;
+        if (!view_candidates.empty()) {
+          const auto view_assignments = assignSearchViewsForCoverage(drone_positions, view_candidates, w_norm);
+          if (!view_assignments.empty()) {
+            used_view_assignment = true;
 
-        // 确定本机的搜索任务点。
-        // committed_target_pos_ 现在表示“当前覆盖任务点”，交给规划器做A*连接和轨迹优化，
-        // 而不是继续沿某个方向无限外推。
-        for (const auto& a : assignments) {
-          if (a.drone_id != drone_id_ || a.hotspot_index < 0 ||
-              a.hotspot_index >= static_cast<int>(hotspots.size())) {
-            continue;
-          }
-          Eigen::Vector3d my_pos = Eigen::Vector3d::Zero();
-          for (const auto& dp : drone_positions) {
-            if (dp.first == drone_id_) {
-              my_pos = dp.second;
+            for (const auto& a : view_assignments) {
+              if (a.candidate_index < 0 || a.candidate_index >= static_cast<int>(view_candidates.size())) continue;
+              const auto& c = view_candidates[a.candidate_index];
+              ROS_INFO("[dpf%d] Search view assign: drone=%d cand=%d hotspot=%d pos=(%.2f,%.2f,%.2f) yaw=%.1fdeg vis=%.3f gain=%.3f overlap=%.3f pos_pen=%.3f same_hotspot_pen=%.1f dist=%.2f util=%.3f",
+                       drone_id_, a.drone_id, a.candidate_index, a.hotspot_index,
+                       c.pos.x(), c.pos.y(), c.pos.z(), c.yaw * 180.0 / M_PI,
+                       a.visible_mass, a.gain_mass, a.overlap_mass,
+                       a.position_penalty, a.same_hotspot_penalty,
+                       a.distance, a.utility);
+            }
+
+            for (const auto& a : view_assignments) {
+              if (a.drone_id != drone_id_ || a.candidate_index < 0 ||
+                  a.candidate_index >= static_cast<int>(view_candidates.size())) {
+                continue;
+              }
+              Eigen::Vector3d my_pos = Eigen::Vector3d::Zero();
+              for (const auto& dp : drone_positions) {
+                if (dp.first == drone_id_) {
+                  my_pos = dp.second;
+                  break;
+                }
+              }
+
+              const auto& c = view_candidates[a.candidate_index];
+              Eigen::Vector3d dir = c.pos - my_pos;
+              dir.z() = 0.0;
+              if (dir.norm() > 0.5) {
+                committed_search_dir_ = dir.normalized();
+              }
+              committed_target_pos_ = c.pos;
+              has_committed_direction_ = true;
+              last_hotspot_extract_time_ = now;
+              committed_direction_refresh_count_++;
+              const double planar_dist = std::max(0.0, dir.head<2>().norm());
+              const double vmax = std::max(0.1, search_advance_vmax_);
+              const double eta_to_reach_sec = planar_dist / vmax;
+              current_hotspot_extract_interval_sec_ =
+                  std::max(0.2, std::min(hotspot_extract_interval_base_sec_, 0.8 * eta_to_reach_sec));
+              ROS_WARN("[dpf%d] Search view committed: target=(%.2f,%.2f,%.2f) yaw=%.1fdeg vis=%.3f gain=%.3f overlap=%.3f pos_pen=%.3f same_hotspot_pen=%.1f dist=%.2f eta=%.2fs hold=%.1fs refresh=%d",
+                       drone_id_, c.pos.x(), c.pos.y(), c.pos.z(),
+                       c.yaw * 180.0 / M_PI, a.visible_mass, a.gain_mass,
+                       a.overlap_mass, a.position_penalty, a.same_hotspot_penalty,
+                       planar_dist, eta_to_reach_sec,
+                       current_hotspot_extract_interval_sec_, committed_direction_refresh_count_);
               break;
             }
+
+            geometry_msgs::PoseArray hotspot_msg;
+            hotspot_msg.header.stamp = ros::Time::now();
+            hotspot_msg.header.frame_id = "world";
+            hotspot_msg.poses.resize(num_drones_);
+            for (const auto& a : view_assignments) {
+              if (a.drone_id < 0 || a.drone_id >= num_drones_) continue;
+              const auto& c = view_candidates[a.candidate_index];
+              geometry_msgs::Pose p;
+              p.position.x = c.pos.x();
+              p.position.y = c.pos.y();
+              p.position.z = c.pos.z();
+              const Eigen::Quaterniond q(Eigen::AngleAxisd(c.yaw, Eigen::Vector3d::UnitZ()));
+              p.orientation.w = q.w();
+              p.orientation.x = q.x();
+              p.orientation.y = q.y();
+              p.orientation.z = q.z();
+              hotspot_msg.poses[a.drone_id] = p;
+            }
+            search_targets_pub_.publish(hotspot_msg);
+          }
+        }
+
+        if (!used_view_assignment) {
+          // 回退：仍按热点覆盖分配，确保新策略在候选视位不足时不会中断搜索。
+          const auto assignments = assignSearchHotspotsForCoverage(drone_positions, hotspots);
+
+          for (const auto& a : assignments) {
+            if (a.hotspot_index < 0 || a.hotspot_index >= static_cast<int>(hotspots.size())) continue;
+            const auto& h = hotspots[a.hotspot_index];
+            ROS_INFO("[dpf%d] Search assign: drone=%d hotspot=%d pos=(%.2f,%.2f,%.2f) w=%.3f utility=%.3f dist=%.2f overlap=%.3f reuse=%.3f",
+                     drone_id_, a.drone_id, a.hotspot_index,
+                     h.pos.x(), h.pos.y(), h.pos.z(), h.weight,
+                     a.utility, a.distance, a.overlap_penalty, a.reuse_penalty);
           }
 
-          const Eigen::Vector3d hotspot_pos = hotspots[a.hotspot_index].pos;
-          Eigen::Vector3d dir = hotspot_pos - my_pos;
-          dir.z() = 0.0;
-          if (dir.norm() > 0.5) {
-            committed_search_dir_ = dir.normalized();
+          for (const auto& a : assignments) {
+            if (a.drone_id != drone_id_ || a.hotspot_index < 0 ||
+                a.hotspot_index >= static_cast<int>(hotspots.size())) {
+              continue;
+            }
+            Eigen::Vector3d my_pos = Eigen::Vector3d::Zero();
+            for (const auto& dp : drone_positions) {
+              if (dp.first == drone_id_) {
+                my_pos = dp.second;
+                break;
+              }
+            }
+
+            const Eigen::Vector3d hotspot_pos = hotspots[a.hotspot_index].pos;
+            const double hotspot_yaw = hotspots[a.hotspot_index].yaw;
+            Eigen::Vector3d dir = hotspot_pos - my_pos;
+            dir.z() = 0.0;
+            if (dir.norm() > 0.5) {
+              committed_search_dir_ = dir.normalized();
+            }
+            committed_target_pos_ = hotspot_pos;
+            has_committed_direction_ = true;
+            last_hotspot_extract_time_ = now;
+            committed_direction_refresh_count_++;
+            const double planar_dist = std::max(0.0, dir.head<2>().norm());
+            const double vmax = std::max(0.1, search_advance_vmax_);
+            const double eta_to_reach_sec = planar_dist / vmax;
+            current_hotspot_extract_interval_sec_ =
+                std::max(0.2, std::min(hotspot_extract_interval_base_sec_, 0.8 * eta_to_reach_sec));
+            ROS_WARN("[dpf%d] Search task committed: target=(%.2f,%.2f,%.2f) yaw=%.1fdeg dir=(%.2f,%.2f) w=%.3f dist=%.2f eta=%.2fs hold=%.1fs refresh=%d",
+                     drone_id_, hotspot_pos.x(), hotspot_pos.y(), hotspot_pos.z(),
+                     hotspot_yaw * 180.0 / M_PI, committed_search_dir_.x(), committed_search_dir_.y(),
+                     hotspots[a.hotspot_index].weight,
+                     planar_dist, eta_to_reach_sec,
+                     current_hotspot_extract_interval_sec_, committed_direction_refresh_count_);
+            break;
           }
-          committed_target_pos_ = hotspot_pos;
-          has_committed_direction_ = true;
-          last_hotspot_extract_time_ = now;
-          committed_direction_refresh_count_++;
-          const double planar_dist = std::max(0.0, dir.head<2>().norm());
-          const double vmax = std::max(0.1, search_advance_vmax_);
-          const double eta_to_reach_sec = planar_dist / vmax;
-          // 热点离得近时，不要把整段固定周期都耗在单个热点上；
-          // 允许更快重提取，让无人机持续覆盖粒子云的不同区域。
-          current_hotspot_extract_interval_sec_ =
-              std::max(0.5, std::min(hotspot_extract_interval_base_sec_, 0.8 * eta_to_reach_sec));
-          ROS_WARN("[dpf%d] Search task committed: target=(%.2f,%.2f,%.2f) dir=(%.2f,%.2f) w=%.3f dist=%.2f eta=%.2fs hold=%.1fs refresh=%d",
-                   drone_id_, hotspot_pos.x(), hotspot_pos.y(), hotspot_pos.z(),
-                   committed_search_dir_.x(), committed_search_dir_.y(),
-                   hotspots[a.hotspot_index].weight,
-                   planar_dist, eta_to_reach_sec,
-                   current_hotspot_extract_interval_sec_, committed_direction_refresh_count_);
-          break;
+
+          geometry_msgs::PoseArray hotspot_msg;
+          hotspot_msg.header.stamp = ros::Time::now();
+          hotspot_msg.header.frame_id = "world";
+          hotspot_msg.poses.resize(num_drones_);
+          for (const auto& a : assignments) {
+            if (a.drone_id < 0 || a.drone_id >= num_drones_) continue;
+            const auto& h = hotspots[a.hotspot_index];
+            geometry_msgs::Pose p;
+            p.position.x = h.pos.x();
+            p.position.y = h.pos.y();
+            p.position.z = h.pos.z();
+            const Eigen::Quaterniond q(Eigen::AngleAxisd(h.yaw, Eigen::Vector3d::UnitZ()));
+            p.orientation.w = q.w();
+            p.orientation.x = q.x();
+            p.orientation.y = q.y();
+            p.orientation.z = q.z();
+            hotspot_msg.poses[a.drone_id] = p;
+          }
+          search_targets_pub_.publish(hotspot_msg);
         }
       }
     } else if (has_committed_direction_ && !search_hold_assigned_target_) {
@@ -1938,6 +2315,13 @@ void dpf_core_timer_callback(const ros::TimerEvent& event) {
       target_odom.pose.pose.position.x = committed_target_pos_.x();
       target_odom.pose.pose.position.y = committed_target_pos_.y();
       target_odom.pose.pose.position.z = committed_target_pos_.z();
+      const Eigen::Quaterniond target_q(Eigen::AngleAxisd(
+          std::atan2(committed_search_dir_.y(), committed_search_dir_.x()),
+          Eigen::Vector3d::UnitZ()));
+      target_odom.pose.pose.orientation.w = target_q.w();
+      target_odom.pose.pose.orientation.x = target_q.x();
+      target_odom.pose.pose.orientation.y = target_q.y();
+      target_odom.pose.pose.orientation.z = target_q.z();
       target_odom.twist.twist.linear.x = committed_search_dir_.x() * vmax;
       target_odom.twist.twist.linear.y = committed_search_dir_.y() * vmax;
       target_odom.twist.twist.linear.z = 0;
@@ -2543,6 +2927,21 @@ int main(int argc, char** argv) {
   nh.param("hotspot_min_drone_dist", hotspot_min_drone_dist_, 2.0);
   nh.param("hotspot_seed_radius", hotspot_seed_radius_, 1.5);
   nh.param("hotspot_invalid_reject_ratio", hotspot_invalid_reject_ratio_, 1.0);
+  nh.param("search_hotspot_min_separation", search_hotspot_min_separation_m_, 4.0);
+  nh.param("search_view_standoff_radius", search_view_standoff_radius_m_, 4.0);
+  nh.param("search_view_candidate_azimuths", search_view_candidate_azimuths_, 8);
+  nh.param("search_view_gain_scale", search_view_gain_scale_, 100.0);
+  nh.param("search_view_overlap_penalty", search_view_overlap_penalty_, 140.0);
+  nh.param("search_view_position_penalty_radius", search_view_position_penalty_radius_m_, 6.0);
+  nh.param("search_view_position_penalty", search_view_position_penalty_, 80.0);
+  nh.param("search_view_same_hotspot_penalty", search_view_same_hotspot_penalty_, 120.0);
+  nh.param("search_view_travel_cost_scale", search_view_travel_cost_scale_, 1.0);
+  nh.param("search_view_min_visible_mass", search_view_min_visible_mass_, 0.01);
+  if (search_view_candidate_azimuths_ < 1) search_view_candidate_azimuths_ = 1;
+  if (search_hotspot_min_separation_m_ < 0.0) search_hotspot_min_separation_m_ = 0.0;
+  if (search_view_standoff_radius_m_ < 0.5) search_view_standoff_radius_m_ = 0.5;
+  if (search_view_position_penalty_radius_m_ < 0.5) search_view_position_penalty_radius_m_ = 0.5;
+  if (search_view_min_visible_mass_ < 0.0) search_view_min_visible_mass_ = 0.0;
   if (!nh.getParam("hotspot_extract_interval_sec", hotspot_extract_interval_base_sec_)) {
     // 兼容旧参数名
     nh.param("hotspot_extract_interval", hotspot_extract_interval_base_sec_, hotspot_extract_interval_base_sec_);
@@ -2562,6 +2961,13 @@ int main(int argc, char** argv) {
            reacquire_boost_miss_min_, miss_detection_num_);
   ROS_INFO("[dpf%d] Search commitment interval: fixed=%.2fs (growth disabled)",
            drone_id_, hotspot_extract_interval_base_sec_);
+  ROS_INFO("[dpf%d] Search view params: hotspot_sep=%.2fm standoff=%.2fm azimuths=%d gain_scale=%.1f overlap_penalty=%.1f pos_penalty_r=%.2fm pos_penalty=%.1f same_hotspot_penalty=%.1f travel_cost=%.2f min_visible_mass=%.3f",
+           drone_id_, search_hotspot_min_separation_m_,
+           search_view_standoff_radius_m_, search_view_candidate_azimuths_,
+           search_view_gain_scale_, search_view_overlap_penalty_,
+           search_view_position_penalty_radius_m_, search_view_position_penalty_,
+           search_view_same_hotspot_penalty_,
+           search_view_travel_cost_scale_, search_view_min_visible_mass_);
   ROS_INFO("[dpf%d] Search spread init: frames=%d, speed_min_ratio=%.2f, theta_jitter=%.1fdeg",
            drone_id_, search_spread_init_frames_, search_spread_speed_min_ratio_,
            search_spread_theta_jitter_deg_);
@@ -2600,7 +3006,7 @@ int main(int argc, char** argv) {
            drone_id_, fx_, fy_, cx_, cy_, width_, height_, max_obs_depth_);
 
   // 初始化无效区域虚拟栅格
-  nh.param("grid_resolution", grid_resolution_, 0.3);
+  nh.param("grid_resolution", grid_resolution_, 0.15);
   nh.param("grid_map_size_x", grid_map_size_x_, -1.0);
   nh.param("grid_map_size_y", grid_map_size_y_, -1.0);
   nh.param("grid_origin_x", grid_origin_x_, -10.0);

@@ -87,6 +87,7 @@ def load_bag(path, obstacle_max_points):
 
     search_states = {d: [] for d in range(3)}
     particle_clouds = {d: [] for d in range(3)}  # (rel_t, Nx4[x,y,z,intensity])
+    search_targets = {d: [] for d in range(3)}  # (rel_t, list[(x,y,z,yaw_deg)])
     drone_odom = {d: [] for d in range(3)}       # (rel_t, x, y, z)
     target_odom = []                              # (rel_t, x, y, z)
     obstacle_xy = None                            # (N,2) from /global_map
@@ -94,6 +95,7 @@ def load_bag(path, obstacle_max_points):
     topics = (
         [f"/drone{d}/drone{d}_target_dpf/search_state" for d in range(3)] +
         [f"/drone{d}/drone{d}_target_dpf/search_particles_vis" for d in range(3)] +
+        [f"/drone{d}/drone{d}_target_dpf/search_targets" for d in range(3)] +
         [f"/drone{d}/odom" for d in range(3)] +
         ["/target/odom", "/global_map"]
     )
@@ -125,6 +127,17 @@ def load_bag(path, obstacle_max_points):
                     inten = np.ones((arr3.shape[0], 1), dtype=np.float64)
                     arr = np.hstack([arr3, inten])
                     particle_clouds[d].append((rel, arr))
+        elif "search_targets" in topic and d >= 0:
+            pts = []
+            for pose in msg.poses:
+                qx = pose.orientation.x
+                qy = pose.orientation.y
+                qz = pose.orientation.z
+                qw = pose.orientation.w
+                yaw = np.degrees(np.arctan2(2.0 * (qw * qz + qx * qy),
+                                            1.0 - 2.0 * (qy * qy + qz * qz)))
+                pts.append((pose.position.x, pose.position.y, pose.position.z, float(yaw)))
+            search_targets[d].append((rel, pts))
         elif topic == "/target/odom":
             p = msg.pose.pose.position
             target_odom.append((rel, p.x, p.y, p.z))
@@ -142,15 +155,16 @@ def load_bag(path, obstacle_max_points):
 
     bag.close()
     print("particle_cloud records:", [len(particle_clouds[d]) for d in range(3)])
+    print("search_target records:", [len(search_targets[d]) for d in range(3)])
     print("obstacle points:", 0 if obstacle_xy is None else obstacle_xy.shape[0])
-    return search_states, particle_clouds, drone_odom, target_odom, obstacle_xy
+    return search_states, particle_clouds, search_targets, drone_odom, target_odom, obstacle_xy
 
 
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    search_states, particle_clouds, drone_odom, target_odom, obstacle_xy = load_bag(
+    search_states, particle_clouds, search_targets, drone_odom, target_odom, obstacle_xy = load_bag(
         args.bag, args.obstacle_max_points)
     total_cloud_msgs = sum(len(particle_clouds[d]) for d in range(3))
     if total_cloud_msgs == 0:
@@ -170,6 +184,21 @@ def main():
     frame_times = np.linspace(t_loss_start, t_plot_end, args.n_frames)
     print("Loss #{}: t={:.3f}s dur={:.3f}s plot_end={:.3f}s".format(
         args.loss_idx, t_loss_start, loss_dur, t_plot_end))
+
+    for t_q in frame_times:
+        print("[frame t={:.2f}s] assigned search targets:".format(t_q))
+        for d in range(3):
+            entry = nearest(search_targets[d], t_q)
+            if entry is None:
+                print("  drone{}: none".format(d))
+                continue
+            pts = entry[1]
+            if d < len(pts):
+                x, y, z, yaw_deg = pts[d]
+                print("  drone{} -> ({:.2f}, {:.2f}, {:.2f}), yaw={:.1f}deg".format(
+                    d, x, y, z, yaw_deg))
+            else:
+                print("  drone{}: pose array too short ({})".format(d, len(pts)))
 
     # Fixed visualization bounds for consistent comparisons across runs
     xlim = (-30.0, 30.0)
@@ -222,6 +251,22 @@ def main():
             ax.plot(cx, cy, marker="D", ms=9, color=DRONE_COLORS[d],
                     markeredgecolor="white", markeredgewidth=1.0, zorder=4)
 
+        # assigned search target pose
+        for d in range(3):
+            st = nearest(search_targets[d], t_q)
+            if st is None:
+                continue
+            pts = st[1]
+            if d >= len(pts):
+                continue
+            tx, ty, tz, yaw_deg = pts[d]
+            ax.plot(tx, ty, marker="x", ms=10, color=DRONE_COLORS[d],
+                    markeredgewidth=2.0, zorder=4)
+            yaw_rad = np.deg2rad(yaw_deg)
+            ax.arrow(tx, ty, 1.2 * np.cos(yaw_rad), 1.2 * np.sin(yaw_rad),
+                     color=DRONE_COLORS[d], width=0.03, head_width=0.35,
+                     length_includes_head=True, alpha=0.9, zorder=4)
+
         # drone odom
         for d in range(3):
             od = nearest(drone_odom[d], t_q)
@@ -252,12 +297,14 @@ def main():
                markerfacecolor="#4cc9f0", markersize=8, alpha=0.7),
         Line2D([0], [0], marker="D", color="w", label="Weighted cloud center",
                markerfacecolor="#4cc9f0", markersize=8),
+        Line2D([0], [0], marker="x", color="w", label="Assigned search target",
+               markerfacecolor="none", markersize=8),
         Line2D([0], [0], marker="^", color="w", label="Drone odom",
                markerfacecolor="gray", markersize=8),
         Line2D([0], [0], marker="*", color="w", label="Target truth",
                markerfacecolor="#ff6b6b", markersize=14),
     ]
-    lg = fig.legend(handles=legend, loc="lower center", ncol=5,
+    lg = fig.legend(handles=legend, loc="lower center", ncol=6,
                     frameon=True, facecolor="#1a1a2e", edgecolor="#444444",
                     fontsize=11)
     for txt in lg.get_texts():

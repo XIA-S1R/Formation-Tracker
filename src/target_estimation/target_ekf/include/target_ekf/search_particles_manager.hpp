@@ -1595,12 +1595,49 @@ public:
   struct SearchHotspot {
     Eigen::Vector3d pos;
     Eigen::Vector3d vel;
-    double weight;
+    double yaw = 0.0;
+    double weight = 0.0;
   };
+
+  // 根据局部粒子云的“密集侧”估计热点朝向。
+  // 思路：热点位置作为参考点，统计局部加权质心相对热点的方向，
+  // 让 yaw 朝向粒子更密集的一侧，而不是沿速度方向。
+  template <typename PointAccessor, typename WeightAccessor>
+  double estimateHotspotYawTowardDensity(const Eigen::Vector3d& seed_pos,
+                                         int count,
+                                         PointAccessor point_at,
+                                         WeightAccessor weight_at,
+                                         double radius) const {
+    const double r = std::max(0.1, radius);
+    const double r2 = r * r;
+    Eigen::Vector2d sum_dir = Eigen::Vector2d::Zero();
+    double sum_w = 0.0;
+
+    for (int i = 0; i < count; ++i) {
+      const Eigen::Vector3d p = point_at(i);
+      const Eigen::Vector2d dp = (p - seed_pos).head<2>();
+      const double d2 = dp.squaredNorm();
+      if (d2 > r2) continue;
+
+      const double w = std::max(0.0, weight_at(i));
+      if (w < 1e-12) continue;
+
+      const double kernel = std::exp(-0.5 * d2 / r2);
+      const double local_w = w * kernel;
+      sum_dir += local_w * dp;
+      sum_w += local_w;
+    }
+
+    if (sum_w > 1e-10 && sum_dir.norm() > 1e-6) {
+      return std::atan2(sum_dir.y(), sum_dir.x());
+    }
+    return 0.0;
+  }
 
   std::vector<SearchHotspot> extractHotspots(
       int K, const std::vector<Eigen::Vector3d>& drone_positions = {}) const {
     if (!search_gmm_initialized_ || search_C_ == 0) return {};
+    const double yaw_radius = 1.5;
 
     // === 加权最远点采样，排斥无人机当前位置 ===
     // min_dist初始化为到最近无人机的距离（而非无穷大）
@@ -1687,6 +1724,11 @@ public:
         h.pos = search_gmm_mu_[seed_indices[k]].head(3);
         h.vel = search_gmm_mu_[seed_indices[k]].tail(3);
       }
+      h.yaw = estimateHotspotYawTowardDensity(
+          h.pos, search_C_,
+          [&](int idx) { return search_gmm_mu_[idx].head(3); },
+          [&](int idx) { return search_gmm_pi_(idx); },
+          yaw_radius);
       h.weight = total_w[k];
       hotspots.push_back(h);
     }
@@ -1832,10 +1874,20 @@ public:
       if (sum_w > 1e-10) {
         h.pos = sum_pos / sum_w;
         h.vel = sum_vel / sum_w;
+        h.yaw = estimateHotspotYawTowardDensity(
+            seed_pos, static_cast<int>(candidates.size()),
+            [&](int idx) { return particles.col(candidates[idx].idx).head(3); },
+            [&](int idx) { return std::max(0.0, weights(candidates[idx].idx)); },
+            radius);
         h.weight = sum_w;
       } else {
         h.pos = seed_pos;
         h.vel = particles.col(seed_particle_idx).segment(3, 3);
+        h.yaw = estimateHotspotYawTowardDensity(
+            seed_pos, static_cast<int>(candidates.size()),
+            [&](int idx) { return particles.col(candidates[idx].idx).head(3); },
+            [&](int idx) { return std::max(0.0, weights(candidates[idx].idx)); },
+            radius);
         h.weight = candidates[seed_i].score;
       }
       hotspots.push_back(h);
