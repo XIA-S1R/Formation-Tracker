@@ -1,6 +1,5 @@
 <launch>
 <env name="ROSCONSOLE_CONFIG_FILE" value="$(find planning)/config/rosconsole.conf"/>
-  <arg name="search_estimation_mode" default="search_gmm6d"/>
   <!-- ============================================================
        Map generator
   ============================================================ -->
@@ -132,30 +131,22 @@
       <param name="color_b" value="1.0"/>
     </node>
     <node name="drone0_target_dpf" pkg="target_ekf"
-          type="target_dpf_sim_node" output="screen">
+          type="target_kf_qp_sim_node" output="screen">
       <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
       <param name="max_obs_depth" value="8.0"/>
-      <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="0"/>
       <param name="num_drones" value="3"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="500"/>
-      <param name="num_components" value="4"/>
-      <param name="num_em_iters" value="10"/>
+      <param name="kf_rate" value="20"/>
       <param name="check_fov" value="true"/>
       <param name="miss_detection_num" value="5"/>
-      <param name="neg_obs_ttl_sec" value="3.0"/>
-      <param name="grid_resolution" value="0.15"/>
-      <param name="grid_map_size_x" value="42.0"/>
-      <param name="grid_map_size_y" value="40.0"/>
-      <param name="search_estimation_mode" value="$(arg search_estimation_mode)"/>
-      <param name="invalid_decay_phi_min" value="0.01"/>
-      <param name="invalid_decay_phi_mid" value="0.60"/>
-      <param name="invalid_decay_r_occ" value="-0.02"/>
-      <param name="invalid_decay_r_safe" value="0.60"/>
-      <param name="hotspot_min_drone_dist" value="2.0"/>
-      <param name="hotspot_seed_radius" value="1.5"/>
-      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
+      <param name="qp_window_size" value="30"/>
+      <param name="qp_poly_order" value="3"/>
+      <param name="qp_ridge_lambda" value="0.001"/>
+      <param name="qp_extrap_horizon" value="1.0"/>
+      <param name="search_advance_vmax" value="1.5"/>
+      <param name="kf_sigma_a" value="1.5"/>
+      <param name="kf_sigma_z" value="0.15"/>
+      <param name="shared_state_timeout" value="0.5"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
       <remap from="~target_odom" to="target_ekf_odom"/>
@@ -192,30 +183,22 @@
       <param name="color_b" value="0.2"/>
     </node>
     <node name="drone1_target_dpf" pkg="target_ekf"
-          type="target_dpf_sim_node" output="screen">
+          type="target_kf_qp_sim_node" output="screen">
       <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
       <param name="max_obs_depth" value="8.0"/>
-      <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="1"/>
       <param name="num_drones" value="3"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="500"/>
-      <param name="num_components" value="4"/>
-      <param name="num_em_iters" value="10"/>
+      <param name="kf_rate" value="20"/>
       <param name="check_fov" value="true"/>
       <param name="miss_detection_num" value="5"/>
-      <param name="neg_obs_ttl_sec" value="3.0"/>
-      <param name="grid_resolution" value="0.15"/>
-      <param name="grid_map_size_x" value="42.0"/>
-      <param name="grid_map_size_y" value="40.0"/>
-      <param name="search_estimation_mode" value="$(arg search_estimation_mode)"/>
-      <param name="invalid_decay_phi_min" value="0.01"/>
-      <param name="invalid_decay_phi_mid" value="0.60"/>
-      <param name="invalid_decay_r_occ" value="-0.02"/>
-      <param name="invalid_decay_r_safe" value="0.60"/>
-      <param name="hotspot_min_drone_dist" value="2.0"/>
-      <param name="hotspot_seed_radius" value="1.5"/>
-      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
+      <param name="qp_window_size" value="30"/>
+      <param name="qp_poly_order" value="3"/>
+      <param name="qp_ridge_lambda" value="0.001"/>
+      <param name="qp_extrap_horizon" value="1.0"/>
+      <param name="search_advance_vmax" value="1.5"/>
+      <param name="kf_sigma_a" value="1.5"/>
+      <param name="kf_sigma_z" value="0.15"/>
+      <param name="shared_state_timeout" value="0.5"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
       <remap from="~target_odom" to="target_ekf_odom"/>
@@ -252,30 +235,22 @@
       <param name="color_b" value="0.0"/>
     </node>
     <node name="drone2_target_dpf" pkg="target_ekf"
-          type="target_dpf_sim_node" output="screen">
+          type="target_kf_qp_sim_node" output="screen">
       <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
       <param name="max_obs_depth" value="8.0"/>
-      <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="2"/>
       <param name="num_drones" value="3"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="500"/>
-      <param name="num_components" value="4"/>
-      <param name="num_em_iters" value="10"/>
+      <param name="kf_rate" value="20"/>
       <param name="check_fov" value="true"/>
       <param name="miss_detection_num" value="5"/>
-      <param name="neg_obs_ttl_sec" value="3.0"/>
-      <param name="grid_resolution" value="0.15"/>
-      <param name="grid_map_size_x" value="42.0"/>
-      <param name="grid_map_size_y" value="40.0"/>
-      <param name="search_estimation_mode" value="$(arg search_estimation_mode)"/>
-      <param name="invalid_decay_phi_min" value="0.01"/>
-      <param name="invalid_decay_phi_mid" value="0.60"/>
-      <param name="invalid_decay_r_occ" value="-0.02"/>
-      <param name="invalid_decay_r_safe" value="0.60"/>
-      <param name="hotspot_min_drone_dist" value="2.0"/>
-      <param name="hotspot_seed_radius" value="1.5"/>
-      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
+      <param name="qp_window_size" value="30"/>
+      <param name="qp_poly_order" value="3"/>
+      <param name="qp_ridge_lambda" value="0.001"/>
+      <param name="qp_extrap_horizon" value="1.0"/>
+      <param name="search_advance_vmax" value="1.5"/>
+      <param name="kf_sigma_a" value="1.5"/>
+      <param name="kf_sigma_z" value="0.15"/>
+      <param name="shared_state_timeout" value="0.5"/>
       <remap from="~yolo"        to="/target/odom"/>
       <remap from="~odom"        to="odom"/>
       <remap from="~target_odom" to="target_ekf_odom"/>

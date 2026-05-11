@@ -3,6 +3,8 @@
   <arg name="init_y_" default="0"/>
   <arg name="init_z_" default="2"/>
   <arg name="num_worker_threads_" default="4"/>
+  <arg name="max_speed_" default="3.0"/>
+  <arg name="max_accel_" default="6.0"/>
 
   <node pkg="nodelet" type="nodelet" name="manager" args="manager" output="screen">
     <param name="num_worker_threads" value="$(arg num_worker_threads_)"/>
@@ -12,6 +14,8 @@
     <arg name="init_x_" value="$(arg init_x_)"/>
     <arg name="init_y_" value="$(arg init_y_)"/>
     <arg name="init_z_" value="$(arg init_z_)"/>
+    <arg name="max_speed_" value="$(arg max_speed_)"/>
+    <arg name="max_accel_" value="$(arg max_accel_)"/>
   </include>
 
   <node pkg="nodelet" type="nodelet" name="mapping" args="load mapping/Nodelet manager" output="screen">

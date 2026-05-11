@@ -2,12 +2,16 @@
   <arg name="init_x_" default="0"/>
   <arg name="init_y_" default="0"/>
   <arg name="init_z_" default="2"/>
+  <arg name="max_speed_" default="3.0"/>
+  <arg name="max_accel_" default="6.0"/>
 
   <node pkg="nodelet" type="nodelet" name="so3_quadrotor" args="load so3_quadrotor/Nodelet manager" output="screen">
     <rosparam file="$(find uav_simulator)/config/so3_quadrotor.yaml"/>
     <param name="init_x" value="$(arg init_x_)" />
     <param name="init_y" value="$(arg init_y_)" />
     <param name="init_z" value="$(arg init_z_)" />
+    <param name="max_speed" value="$(arg max_speed_)" />
+    <param name="max_accel" value="$(arg max_accel_)" />
     <remap from="~odom" to="odom"/>
     <remap from="~imu" to="imu" />
     <remap from="~so3cmd" to="so3cmd"/>

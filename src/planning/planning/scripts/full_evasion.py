@@ -42,6 +42,8 @@ WAYPOINTS = [
     (X_BETWEEN_01,  W0_BOT),    # 从墙0下方绕过
     (X_BETWEEN_01,  W1_TOP),    # 上行到墙1上边缘
     (X_BETWEEN_12,  W1_TOP),    # 从墙1上方绕过
+    (14,7),
+    (8,-5),
     (X_BETWEEN_12,  W2_BOT),    # 下行到墙2下边缘
     (X_AFTER_W2,    W2_BOT),    # 从墙2下方绕过
 

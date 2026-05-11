@@ -95,7 +95,7 @@ class Nodelet : public nodelet::Nodelet {
         control_.rpm[i] = last_control.rpm[i];
     }
     quadrotorPtr_->setInput(control_.rpm[0], control_.rpm[1], control_.rpm[2], control_.rpm[3]);
-    const bool speed_clipped = quadrotorPtr_->step(1.0/simulation_rate_);
+    const auto step_clip = quadrotorPtr_->step(1.0/simulation_rate_);
     static ros::Time next_odom_pub_time = ros::Time::now();
     ros::Time tnow = ros::Time::now();
     if (tnow >= next_odom_pub_time) {
@@ -115,10 +115,15 @@ class Nodelet : public nodelet::Nodelet {
                           "[so3_quadrotor] near obstacle: nearest=%.3fm, radius=%.3fm, pos=(%.2f, %.2f, %.2f)",
                           nearest_obs_dist, collision_radius_, pos.x(), pos.y(), pos.z());
       }
-      if (speed_clipped) {
+      if (step_clip.speed_clipped) {
         ROS_WARN_THROTTLE(0.5,
                           "[so3_quadrotor] speed capped at %.2fm/s, actual=%.2fm/s",
                           quadrotorPtr_->config.max_speed, quadrotorPtr_->getVel().norm());
+      }
+      if (step_clip.accel_clipped) {
+        ROS_WARN_THROTTLE(0.5,
+                          "[so3_quadrotor] accel capped at %.2fm/s^2",
+                          quadrotorPtr_->config.max_accel);
       }
 
       const Eigen::Vector3d&     vel = quadrotorPtr_->getVel();
@@ -223,6 +228,7 @@ class Nodelet : public nodelet::Nodelet {
     nh.getParam("max_rpm", config.max_rpm);
     nh.getParam("min_rpm", config.min_rpm);
     nh.param("max_speed", config.max_speed, 2.5);
+    nh.param("max_accel", config.max_accel, std::numeric_limits<double>::infinity());
     nh.getParam("simulation_rate", simulation_rate_);
     nh.getParam("odom_rate", odom_rate_);
     nh.param("collision_radius", collision_radius_, 0.0);

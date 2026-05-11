@@ -89,3 +89,17 @@ add_dependencies(target_dpf_sim_node
   ${catkin_EXPORTED_TARGETS}
   ${${PROJECT_NAME}_EXPORTED_TARGETS}
 )
+
+add_executable(target_kf_qp_sim_node
+ src/target_kf_qp_sim_node.cpp
+)
+
+target_link_libraries(target_kf_qp_sim_node
+   ${catkin_LIBRARIES}
+   ${PCL_LIBRARIES}
+)
+
+add_dependencies(target_kf_qp_sim_node
+  ${catkin_EXPORTED_TARGETS}
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+)

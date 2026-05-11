@@ -210,29 +210,34 @@ def write_summary_csv(rows, out_csv):
 
 
 def build_default_topics(drone_count):
-    topics = ['/target/odom', '/global_map']
+    topics = ['/target/odom']
+    # topics.append('/global_map')
     for i in range(drone_count):
         topics.append(f'/drone{i}/odom')
     for i in range(drone_count):
-        topics.append(f'/drone{i}/position_cmd')
-    for i in range(drone_count):
-        topics.append(f'/drone{i}/drone{i}_target_dpf/search_particles_vis_pre_prune')
-    for i in range(drone_count):
-        topics.append(f'/drone{i}/drone{i}_target_dpf/local_stats')
-    for i in range(drone_count):
         topics.append(f'/drone{i}/drone{i}_target_dpf/search_state')
-    for i in range(drone_count):
-        topics.append(f'/drone{i}/drone{i}_target_dpf/search_pos_gmm')
-    for i in range(drone_count):
-        topics.append(f'/drone{i}/drone{i}_target_dpf/search_particles_vis_post_prune')
-    for i in range(drone_count):
-        topics.append(f'/drone{i}/drone{i}_target_dpf/invalid_region_gmm')
-    for i in range(drone_count):
-        topics.append(f'/drone{i}/drone{i}_target_dpf/search_targets')
-    for i in range(drone_count):
-        topics.append(f'/drone{i}/drone{i}_target_dpf/search_particles_vis')
-    for i in range(drone_count):
-        topics.append(f'/drone{i}/replanState')
+    # for i in range(drone_count):
+    #     topics.append(f'/drone{i}/imu')
+    # for i in range(drone_count):
+    #     topics.append(f'/drone{i}/so3cmd')
+    # for i in range(drone_count):
+    #     topics.append(f'/drone{i}/position_cmd')
+    # for i in range(drone_count):
+    #     topics.append(f'/drone{i}/drone{i}_target_dpf/search_particles_vis_pre_prune')
+    # for i in range(drone_count):
+    #     topics.append(f'/drone{i}/drone{i}_target_dpf/local_stats')
+    # for i in range(drone_count):
+    #     topics.append(f'/drone{i}/drone{i}_target_dpf/search_pos_gmm')
+    # for i in range(drone_count):
+    #     topics.append(f'/drone{i}/drone{i}_target_dpf/search_particles_vis_post_prune')
+    # for i in range(drone_count):
+    #     topics.append(f'/drone{i}/drone{i}_target_dpf/invalid_region_gmm')
+    # for i in range(drone_count):
+    #     topics.append(f'/drone{i}/drone{i}_target_dpf/search_targets')
+    # for i in range(drone_count):
+    #     topics.append(f'/drone{i}/drone{i}_target_dpf/search_particles_vis')
+    # for i in range(drone_count):
+    #     topics.append(f'/drone{i}/replanState')
     return topics
 
 
@@ -318,9 +323,9 @@ def main():
             if not wait_for_ros_master(timeout_sec=40):
                 raise RuntimeError('ROS master not ready')
 
-            essential_topics = ['/target/odom'] + [f'/drone{i}/odom' for i in range(args.drone_count)] + ['/global_map']
+            essential_topics = ['/target/odom'] + [f'/drone{i}/odom' for i in range(args.drone_count)]
             if not wait_for_topics(essential_topics, timeout_sec=50):
-                raise RuntimeError('essential odom/global_map topics not ready')
+                raise RuntimeError('essential odom topics not ready')
 
             topic_str = ' '.join(topics)
             bag_cmd = f'rosbag record -O {bag_path} {topic_str}'

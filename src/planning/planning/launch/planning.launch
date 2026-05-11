@@ -9,6 +9,8 @@
   <arg name="num_drones"      default="3"/>
   <arg name="plan_hz_" default="20"/>
   <arg name="hard_replan_hz_" default="5"/>
+  <arg name="vmax_" default="3.0"/>
+  <arg name="amax_" default="6.0"/>
   <arg name="weight_formation_" default="10000.0"/><!-- 100000.0-->
   <arg name="formation_grad_clip_" default="15.0"/><!-- 编队梯度限幅阈值，<=0 表示关闭 -->
 
@@ -25,8 +27,8 @@
     <param name="plan_hz"        value="$(arg plan_hz_)"/>
     <param name="hard_replan_hz" value="$(arg hard_replan_hz_)"/>
     <param name="K"              value="8"/>
-    <param name="vmax"           value="3.0"/>
-    <param name="amax"           value="6.0"/>
+    <param name="vmax"           value="$(arg vmax_)"/>
+    <param name="amax"           value="$(arg amax_)"/>
     <param name="rhoT"           value="10.0"/>
     <param name="rhoP"           value="100000.0"/>
     <param name="rhoV"           value="1000.0"/>

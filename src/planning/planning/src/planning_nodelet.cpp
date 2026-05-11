@@ -1123,7 +1123,7 @@ class Nodelet : public nodelet::Nodelet {
     bool no_need_replan = false;//一般情况下局部目标点不断更新，每有所更新就触发重规划
     if (!force_hover_ && !wait_hover_) {
       double last_traj_t_rest = traj_poly_.getTotalDuration() - (ros::Time::now() - replan_stamp_).toSec();//上次规划的轨迹剩余时间
-      bool new_goal = (local_goal - traj_poly_.getPos(traj_poly_.getTotalDuration())).norm() > tracking_dist_;//因为goal_是一直在更新的，local_goal也在一直更新。目前的轨迹是上一次基于上一次replan时的local_goal的，如果当前轨迹的终点和local_goal距离大于tracking_dist_，则认为有更新的目标
+      bool new_goal = (local_goal - traj_poly_.getPos(traj_poly_.getTotalDuration())).norm() > 3.0;//因为goal_是一直在更新的，local_goal也在一直更新。目前的轨迹是上一次基于上一次replan时的local_goal的，如果当前轨迹的终点和local_goal距离大于xx，则认为有更新的目标
       if (!new_goal) {
         if (last_traj_t_rest < 1.0) {
           ROS_WARN("[planner] NEAR GOAL...");
@@ -1142,7 +1142,7 @@ class Nodelet : public nodelet::Nodelet {
     }
     // NOTE determin whether to pub hover
     if (has_published_motion_traj_ &&
-        (goal_ - odom_p).norm() < tracking_dist_ + tolerance_d_ && odom_v.norm() < 0.1) {//已经接近目标点了，并且速度很小，认为到达目标点，可以悬停了
+        (goal_ - odom_p).norm() < 0.01 && odom_v.norm() < 0.1) {//已经接近目标点了，并且速度很小，认为到达目标点，可以悬停了
       if (!wait_hover_) {
         pub_hover_p(odom_p, ros::Time::now());
         wait_hover_ = true;

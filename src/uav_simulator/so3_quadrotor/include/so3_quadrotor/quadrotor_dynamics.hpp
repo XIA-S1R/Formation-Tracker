@@ -16,6 +16,7 @@ struct Config {
   double          max_rpm;
   double          min_rpm;
   double          max_speed;          // hard translational speed cap
+  double          max_accel;          // hard cap on ||Δv / dt|| per integration step
 };
 struct Control {
   double rpm[4];
@@ -34,6 +35,8 @@ class Quadrotor {
  private:
   // parameters
   Config config_;
+  Eigen::Vector3d last_acc_ = Eigen::Vector3d::Zero();
+  bool last_acc_valid_ = false;
   // state
   struct State {
     Eigen::Vector3d x = Eigen::Vector3d::Zero();
@@ -71,6 +74,19 @@ class Quadrotor {
     }
   } state_;
   Eigen::Vector4d  input_ = Eigen::Vector4d::Zero();
+  inline Eigen::Vector3d getRawAcc() const {
+    Eigen::LLT<Eigen::Matrix3d> llt(state_.R.transpose() * state_.R);
+    Eigen::Matrix3d             P = llt.matrixL();
+    Eigen::Matrix3d             R = state_.R * P.inverse();
+    double resistance = 0.1 *                                        // C
+                        3.14159265 * (config_.arm_length) * (config_.arm_length) * // S
+                        state_.v.norm() * state_.v.norm();
+    Eigen::Vector3d vnorm = state_.v.norm() > 0 ? state_.v.normalized() : Eigen::Vector3d::Zero();
+    Eigen::Vector4d motor_rpm_sq = state_.motor_rpm.array().square();
+    double thrust = config_.kf * motor_rpm_sq.sum();
+    return -Eigen::Vector3d(0, 0, config_.g) + thrust * R.col(2) / config_.mass
+         - resistance * vnorm / config_.mass;
+  }
  public:
   const Config &config;
   const State &state;
@@ -136,23 +152,51 @@ class Quadrotor {
     state_dot.motor_rpm = (input_ - state.motor_rpm) / config_.motor_time_constant;
     return state_dot;
   }
-  // Runs the actual dynamics simulation with a time step of dt
-  inline bool step(const double &dt) {
+  // Runs the actual dynamics simulation with a time step of dt.
+  // Clipping is applied after RK4 integration:
+  // 1) project dv to satisfy ||dv/dt|| <= max_accel
+  // 2) project v to satisfy ||v|| <= max_speed
+  struct StepClip {
+    bool speed_clipped = false;
+    bool accel_clipped = false;
+  };
+  inline StepClip step(const double &dt) {
     // Runge–Kutta
+    const Eigen::Vector3d v_before = state_.v;
     State k1 = diff(state_);
     State k2 = diff(state_+k1*dt/2);
     State k3 = diff(state_+k2*dt/2);
     State k4 = diff(state_+k3*dt);
     state_ = state_ + (k1+k2*2+k3*2+k4) * dt/6;
 
+    StepClip clip;
+
+    if (std::isfinite(config_.max_accel) && config_.max_accel > 0.0 && dt > 0.0) {
+      Eigen::Vector3d dv = state_.v - v_before;
+      const double accel_mag = dv.norm() / dt;
+      if (accel_mag > config_.max_accel && accel_mag > 1e-9) {
+        dv *= (config_.max_accel / accel_mag);
+        state_.v = v_before + dv;
+        clip.accel_clipped = true;
+      }
+    }
+
     if (std::isfinite(config_.max_speed) && config_.max_speed > 0.0) {
       const double speed = state_.v.norm();
       if (speed > config_.max_speed && speed > 1e-9) {
         state_.v *= (config_.max_speed / speed);
-        return true;
+        clip.speed_clipped = true;
       }
     }
-    return false;
+
+    if (dt > 0.0) {
+      last_acc_ = (state_.v - v_before) / dt;
+      last_acc_valid_ = true;
+    } else {
+      last_acc_.setZero();
+      last_acc_valid_ = false;
+    }
+    return clip;
   }
   // get control from cmd
   inline Control getControl(const Cmd& cmd) {
@@ -242,12 +286,15 @@ class Quadrotor {
   // set initial state
   inline void setPos(const Eigen::Vector3d &pos) {
     state_.x = pos;
+    last_acc_valid_ = false;
   }
   inline void setYpr(const Eigen::Vector3d &ypr) {
     state_.R = uav_utils::ypr_to_R(ypr);
+    last_acc_valid_ = false;
   }
   inline void setRpm(const Eigen::Vector4d &rpm) {
     state_.motor_rpm = rpm;
+    last_acc_valid_ = false;
   }
   // get values of state
   inline double getGrav() const {
@@ -260,16 +307,7 @@ class Quadrotor {
     return state_.v;
   }
   inline Eigen::Vector3d getAcc() const {
-    Eigen::LLT<Eigen::Matrix3d> llt(state_.R.transpose() * state_.R);
-    Eigen::Matrix3d             P = llt.matrixL();
-    Eigen::Matrix3d             R = state_.R * P.inverse();
-    double resistance = 0.1 *                                        // C
-                        3.14159265 * (config_.arm_length) * (config_.arm_length) * // S
-                        state_.v.norm() * state_.v.norm();
-    Eigen::Vector3d vnorm = state_.v.normalized();
-    Eigen::Vector4d motor_rpm_sq = state_.motor_rpm.array().square();
-    double thrust = config_.kf * motor_rpm_sq.sum();
-    return -Eigen::Vector3d(0, 0, config_.g) + thrust * R.col(2) / config_.mass - resistance * vnorm / config_.mass;
+    return last_acc_valid_ ? last_acc_ : getRawAcc();
   }
   inline Eigen::Quaterniond getQuat() const {
     return Eigen::Quaterniond(state_.R);
