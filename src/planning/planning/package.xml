@@ -17,6 +17,8 @@
   <depend>decomp_ros_utils</depend>
   <depend>target_ekf</depend>
   <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
 
   <export>
     <nodelet plugin="${prefix}/nodelet_plugin.xml"/>

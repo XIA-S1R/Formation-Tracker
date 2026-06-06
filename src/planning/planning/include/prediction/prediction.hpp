@@ -31,14 +31,14 @@ struct Predict {
   double pre_dur;
   double rho_a;
   double car_z, vmax;
-  mapping::OccGridMap map;
+  const mapping::OccGridMap* map_ = nullptr;
   // Single heap allocation — O(1) construction, no 4M individual new/delete.
   std::unique_ptr<Node[]> data_pool_;
   NodePtr data[MAX_MEMORY];
   int stack_top;
 
   inline bool isValid(const Eigen::Vector3d& p, const Eigen::Vector3d& v) const {
-    return (v.norm() < vmax) && (!map.isOccupied(p));
+    return (v.norm() < vmax) && map_ && (!map_->isOccupied(p));
   }
 
  public:
@@ -53,9 +53,8 @@ struct Predict {
       data[i] = &data_pool_[i];
     }
   }
-  inline void setMap(const mapping::OccGridMap& _map) {
-    map = _map;
-    // map.inflate_last();
+  inline void setMap(const mapping::OccGridMap& map) {
+    map_ = &map;
   }
 
   inline bool predict(const Eigen::Vector3d& target_p,
@@ -63,12 +62,15 @@ struct Predict {
                       std::vector<Eigen::Vector3d>& target_predcit,
                       const double& max_time = 0.1) {
     // 检查起点是否在障碍物内（容忍估计误差）
-    bool start_in_obstacle = map.isOccupied(target_p);
+    if (map_ == nullptr) {
+      return false;
+    }
+    bool start_in_obstacle = map_->isOccupied(target_p);
     auto isValidLocal = [&](const Eigen::Vector3d& p, const Eigen::Vector3d& v) -> bool {
       if (start_in_obstacle && (p - target_p).norm() < 0.5) {
         return (v.norm() < vmax);  // 起点附近不检查障碍物
       }
-      return (v.norm() < vmax) && (!map.isOccupied(p));
+      return (v.norm() < vmax) && (!map_->isOccupied(p));
     };
 
     auto score = [&](const NodePtr& ptr) -> double {

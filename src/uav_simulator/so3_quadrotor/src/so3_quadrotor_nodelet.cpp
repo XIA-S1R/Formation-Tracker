@@ -12,6 +12,7 @@
 #include <pcl/point_types.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <csignal>
+#include <array>
 #include <limits>
 
 namespace so3_quadrotor {
@@ -169,11 +170,11 @@ class Nodelet : public nodelet::Nodelet {
       imu_msg_.linear_acceleration.z = acc[2];
       imu_pub_.publish(imu_msg_);
       // drone visualization
-      std::vector<Eigen::Vector3d> propellers;
-      propellers.emplace_back(0, +quadrotorPtr_->config.arm_length/2, 0.02);
-      propellers.emplace_back(0, -quadrotorPtr_->config.arm_length/2, 0.02);
-      propellers.emplace_back(-quadrotorPtr_->config.arm_length/2, 0, 0.02);
-      propellers.emplace_back(+quadrotorPtr_->config.arm_length/2, 0, 0.02);
+      const std::array<Eigen::Vector3d, 4> propellers = {
+          Eigen::Vector3d(0, +quadrotorPtr_->config.arm_length/2, 0.02),
+          Eigen::Vector3d(0, -quadrotorPtr_->config.arm_length/2, 0.02),
+          Eigen::Vector3d(-quadrotorPtr_->config.arm_length/2, 0, 0.02),
+          Eigen::Vector3d(+quadrotorPtr_->config.arm_length/2, 0, 0.02)};
       for (size_t i=0; i<4; ++i) {
         double rpm = quadrotorPtr_->state.motor_rpm.coeff(i);
         if (i/2) {

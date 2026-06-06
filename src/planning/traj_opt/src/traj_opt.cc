@@ -332,6 +332,15 @@ bool TrajOpt::extractVs(const std::vector<Eigen::MatrixXd>& hPs,
   return true;
 }
 
+void TrajOpt::ensureWorkspace(size_t required_size) {
+  if (required_size <= x_capacity_) {
+    return;
+  }
+  x_buffer_.resize(required_size);
+  x_capacity_ = x_buffer_.size();
+  x_ = x_buffer_.data();
+}
+
 TrajOpt::TrajOpt(ros::NodeHandle& nh) : nh_(nh) {
   // nh.getParam("N", N_);
   nh.getParam("K", K_);
@@ -599,7 +608,7 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
   dim_p_ = 3 * (N_ - 1);  // P directly as optimization variables
   p_.resize(dim_p_);
   t_.resize(dim_t_);
-  x_ = new double[dim_p_ + dim_t_ + 1];
+  ensureWorkspace(static_cast<size_t>(dim_p_ + dim_t_ + 1));
 
   tracking_ps_ = target_predcit;
   tracking_visible_ps_ = visible_ps;
@@ -618,7 +627,6 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
   }
   jerkOpt_.generate(P, T);
   traj = jerkOpt_.getTraj();
-  delete[] x_;
   return true;
 }
 
@@ -710,7 +718,7 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
   dim_p_ = 3 * (N_ - 1);  // P directly as optimization variables
   p_.resize(dim_p_);
   t_.resize(dim_t_);
-  x_ = new double[dim_p_ + dim_t_ + 1];
+  ensureWorkspace(static_cast<size_t>(dim_p_ + dim_t_ + 1));
 
   tracking_ps_ = target_predcit;
 
@@ -727,7 +735,6 @@ bool TrajOpt::generate_traj(const Eigen::MatrixXd& iniState,
   }
   jerkOpt_.generate(P, T);
   traj = jerkOpt_.getTraj();
-  delete[] x_;
   return true;
 }
 
@@ -888,7 +895,7 @@ bool TrajOpt::generate_traj_hard(const Eigen::MatrixXd& iniState,
   }
   p_.resize(dim_p_);
   t_.resize(dim_t_);
-  x_ = new double[dim_p_ + dim_t_ + 1];
+  ensureWorkspace(static_cast<size_t>(dim_p_ + dim_t_ + 1));
   Eigen::VectorXd T(N_);
   Eigen::MatrixXd P(3, N_ - 1);
   tracking_ps_ = target_predcit;
@@ -901,7 +908,6 @@ bool TrajOpt::generate_traj_hard(const Eigen::MatrixXd& iniState,
   forwardP(p_, cfgVs_, P);
   jerkOpt_.generate(P, T);
   traj = jerkOpt_.getTraj();
-  delete[] x_;
   return true;
 }
 
@@ -927,7 +933,7 @@ bool TrajOpt::generate_traj_hard(const Eigen::MatrixXd& iniState,
   }
   p_.resize(dim_p_);
   t_.resize(dim_t_);
-  x_ = new double[dim_p_ + dim_t_ + 1];
+  ensureWorkspace(static_cast<size_t>(dim_p_ + dim_t_ + 1));
   Eigen::VectorXd T(N_);
   Eigen::MatrixXd P(3, N_ - 1);
   tracking_ps_.clear();
@@ -940,7 +946,6 @@ bool TrajOpt::generate_traj_hard(const Eigen::MatrixXd& iniState,
   forwardP(p_, cfgVs_, P);
   jerkOpt_.generate(P, T);
   traj = jerkOpt_.getTraj();
-  delete[] x_;
   return true;
 }
 

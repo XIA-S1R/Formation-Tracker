@@ -13,6 +13,7 @@
   <arg name="amax_" default="6.0"/>
   <arg name="weight_formation_" default="10000.0"/><!-- 100000.0-->
   <arg name="formation_grad_clip_" default="15.0"/><!-- 编队梯度限幅阈值，<=0 表示关闭 -->
+  <arg name="planner_visualization_" default="false"/>
 
   <node pkg="nodelet" type="nodelet" name="planning" args="load planning/Nodelet manager" output="screen">
     <remap from="~odom" to="odom"/>
@@ -50,6 +51,7 @@
     <param name="search_yaw_scan_range_deg" value="45.0"/><!-- 搜索模式偏航扫描半幅 -->
     <param name="search_yaw_scan_freq_hz" value="0.25"/><!-- 搜索模式偏航扫描频率 -->
     <param name="debug"          value="false"/>
+    <param name="planner_visualization" value="$(arg planner_visualization_)"/>
 
     <param name="prediction/rho_a" value="1.0"/><!-- A*搜索中对加速度的惩罚 -->
     <param name="prediction/vmax"  value="4.0"/>

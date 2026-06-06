@@ -1,5 +1,6 @@
 <launch>
 <env name="ROSCONSOLE_CONFIG_FILE" value="$(find planning)/config/rosconsole.conf"/>
+  <arg name="search_estimation_mode" default="search_gmm6d"/>
   <!-- ============================================================
        Map generator
   ============================================================ -->
@@ -29,6 +30,8 @@
       <param name="init_x" value="-16"/>
       <param name="init_y" value="0"/>
       <param name="init_z" value="2"/>
+      <param name="max_speed" value="2.5"/>
+      <param name="max_accel" value="5.0"/>
       <remap from="~odom"   to="odom"/>
       <remap from="~imu"    to="imu"/>
       <remap from="~so3cmd" to="so3cmd"/>
@@ -75,9 +78,9 @@
       <param name="plan_hz"          value="20"/>
       <param name="K"                value="8"/>
       <param name="vmax"             value="2.5"/>
-      <param name="amax"             value="5"/>
+      <param name="amax"             value="5.0"/>
       <param name="rhoT"             value="100.0"/>
-      <param name="rhoP"             value="1000000.0"/>
+      <param name="rhoP"             value="10000.0"/>
       <param name="rhoV"             value="1000.0"/>
       <param name="rhoA"             value="1000.0"/>
       <param name="clearance_d"      value="0.2"/>
@@ -113,6 +116,8 @@
       <arg name="init_x_" value="-17.00"/>
       <arg name="init_y_" value=" 1.0000"/>
       <arg name="init_z_" value=" 1.50"/>
+      <arg name="max_speed_" value="3.0"/>
+      <arg name="max_accel_" value="6.0"/>
     </include>
     <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
       <remap from="~gridmap"         to="gridmap"/>
@@ -133,13 +138,21 @@
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="0"/>
       <param name="num_drones" value="4"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="200"/>
-      <param name="num_components" value="4"/>
-      <param name="num_em_iters" value="10"/>
+      <param name="dpf_rate" value="15"/>
+      <param name="num_particles" value="250"/>
+      <param name="num_components" value="3"/>
+      <param name="num_em_iters" value="5"/>
       <param name="check_fov" value="true"/>
       <param name="miss_detection_num" value="5"/>
-      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="neg_obs_ttl_sec" value="3.0"/>
+      <param name="grid_resolution" value="0.30"/>
+      <param name="grid_map_size_x" value="42.0"/>
+      <param name="grid_map_size_y" value="40.0"/>
+      <param name="search_estimation_mode" value="$(arg search_estimation_mode)"/>
+      <param name="invalid_decay_phi_min" value="0.01"/>
+      <param name="invalid_decay_phi_mid" value="0.60"/>
+      <param name="invalid_decay_r_occ" value="-0.02"/>
+      <param name="invalid_decay_r_safe" value="0.60"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
       <param name="hotspot_invalid_reject_ratio" value="1.0"/>
@@ -164,6 +177,8 @@
       <arg name="init_x_" value="-17.00"/>
       <arg name="init_y_" value="-1.0000"/>
       <arg name="init_z_" value=" 1.50"/>
+      <arg name="max_speed_" value="3.0"/>
+      <arg name="max_accel_" value="6.0"/>
     </include>
     <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
       <remap from="~gridmap"         to="gridmap"/>
@@ -184,13 +199,21 @@
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="1"/>
       <param name="num_drones" value="4"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="200"/>
-      <param name="num_components" value="4"/>
-      <param name="num_em_iters" value="10"/>
+      <param name="dpf_rate" value="15"/>
+      <param name="num_particles" value="250"/>
+      <param name="num_components" value="3"/>
+      <param name="num_em_iters" value="5"/>
       <param name="check_fov" value="true"/>
       <param name="miss_detection_num" value="5"/>
-      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="neg_obs_ttl_sec" value="3.0"/>
+      <param name="grid_resolution" value="0.30"/>
+      <param name="grid_map_size_x" value="42.0"/>
+      <param name="grid_map_size_y" value="40.0"/>
+      <param name="search_estimation_mode" value="$(arg search_estimation_mode)"/>
+      <param name="invalid_decay_phi_min" value="0.01"/>
+      <param name="invalid_decay_phi_mid" value="0.60"/>
+      <param name="invalid_decay_r_occ" value="-0.02"/>
+      <param name="invalid_decay_r_safe" value="0.60"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
       <param name="hotspot_invalid_reject_ratio" value="1.0"/>
@@ -215,6 +238,8 @@
       <arg name="init_x_" value="-19.00"/>
       <arg name="init_y_" value="-1.0000"/>
       <arg name="init_z_" value=" 1.50"/>
+      <arg name="max_speed_" value="3.0"/>
+      <arg name="max_accel_" value="6.0"/>
     </include>
     <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
       <remap from="~gridmap"         to="gridmap"/>
@@ -235,13 +260,21 @@
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="2"/>
       <param name="num_drones" value="4"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="200"/>
-      <param name="num_components" value="4"/>
-      <param name="num_em_iters" value="10"/>
+      <param name="dpf_rate" value="15"/>
+      <param name="num_particles" value="250"/>
+      <param name="num_components" value="3"/>
+      <param name="num_em_iters" value="5"/>
       <param name="check_fov" value="true"/>
       <param name="miss_detection_num" value="5"/>
-      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="neg_obs_ttl_sec" value="3.0"/>
+      <param name="grid_resolution" value="0.30"/>
+      <param name="grid_map_size_x" value="42.0"/>
+      <param name="grid_map_size_y" value="40.0"/>
+      <param name="search_estimation_mode" value="$(arg search_estimation_mode)"/>
+      <param name="invalid_decay_phi_min" value="0.01"/>
+      <param name="invalid_decay_phi_mid" value="0.60"/>
+      <param name="invalid_decay_r_occ" value="-0.02"/>
+      <param name="invalid_decay_r_safe" value="0.60"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
       <param name="hotspot_invalid_reject_ratio" value="1.0"/>
@@ -266,6 +299,8 @@
       <arg name="init_x_" value="-19.00"/>
       <arg name="init_y_" value=" 1.0000"/>
       <arg name="init_z_" value=" 1.50"/>
+      <arg name="max_speed_" value="3.0"/>
+      <arg name="max_accel_" value="6.0"/>
     </include>
     <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
       <remap from="~gridmap"         to="gridmap"/>
@@ -286,13 +321,21 @@
       <param name="pitch_thr" value="37"/>
       <param name="drone_id" value="3"/>
       <param name="num_drones" value="4"/>
-      <param name="dpf_rate" value="20"/>
-      <param name="num_particles" value="200"/>
-      <param name="num_components" value="4"/>
-      <param name="num_em_iters" value="10"/>
+      <param name="dpf_rate" value="15"/>
+      <param name="num_particles" value="250"/>
+      <param name="num_components" value="3"/>
+      <param name="num_em_iters" value="5"/>
       <param name="check_fov" value="true"/>
       <param name="miss_detection_num" value="5"/>
-      <param name="neg_obs_ttl_sec" value="8.0"/>
+      <param name="neg_obs_ttl_sec" value="3.0"/>
+      <param name="grid_resolution" value="0.30"/>
+      <param name="grid_map_size_x" value="42.0"/>
+      <param name="grid_map_size_y" value="40.0"/>
+      <param name="search_estimation_mode" value="$(arg search_estimation_mode)"/>
+      <param name="invalid_decay_phi_min" value="0.01"/>
+      <param name="invalid_decay_phi_mid" value="0.60"/>
+      <param name="invalid_decay_r_occ" value="-0.02"/>
+      <param name="invalid_decay_r_safe" value="0.60"/>
       <param name="hotspot_min_drone_dist" value="2.0"/>
       <param name="hotspot_seed_radius" value="1.5"/>
       <param name="hotspot_invalid_reject_ratio" value="1.0"/>

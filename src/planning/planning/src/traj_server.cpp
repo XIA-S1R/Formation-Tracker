@@ -15,6 +15,19 @@ quadrotor_msgs::PolyTraj trajMsg_, trajMsg_last_;
 Eigen::Vector3d last_p_;
 double last_yaw_ = 0;
 
+struct ParsedTrajCache {
+  bool valid = false;
+  bool hover = false;
+  int traj_id = -1;
+  ros::Time start_time;
+  std::vector<float> hover_p;
+  quadrotor_msgs::PolyTraj msg;
+  Trajectory traj;
+  double total_duration = 0.0;
+};
+
+ParsedTrajCache traj_cache_, traj_cache_last_;
+
 double wrap_angle(double angle) {
   return std::atan2(std::sin(angle), std::cos(angle));
 }
@@ -65,54 +78,74 @@ void publish_cmd(int traj_id,
   last_p_ = p;
 }
 
-bool exe_traj(const quadrotor_msgs::PolyTraj &trajMsg) {
-  double t = (ros::Time::now() - trajMsg.start_time).toSec();
+bool build_traj_cache(const quadrotor_msgs::PolyTraj& trajMsg, ParsedTrajCache& cache) {
+  cache = ParsedTrajCache();
+  cache.msg = trajMsg;
+  cache.traj_id = trajMsg.traj_id;
+  cache.start_time = trajMsg.start_time;
+  cache.hover = trajMsg.hover;
+  cache.hover_p = trajMsg.hover_p;
+  if (trajMsg.hover) {
+    cache.valid = true;
+    return true;
+  }
+  if (trajMsg.order != 5) {
+    ROS_ERROR("[traj_server] Only support trajectory order equals 5 now!");
+    return false;
+  }
+  if (trajMsg.duration.size() * (trajMsg.order + 1) != trajMsg.coef_x.size()) {
+    ROS_ERROR("[traj_server] WRONG trajectory parameters!");
+    return false;
+  }
+
+  int piece_nums = trajMsg.duration.size();
+  std::vector<double> dura(piece_nums);
+  std::vector<CoefficientMat> cMats(piece_nums);
+  for (int i = 0; i < piece_nums; ++i) {
+    int i6 = i * 6;
+    cMats[i].row(0) << trajMsg.coef_x[i6 + 0], trajMsg.coef_x[i6 + 1], trajMsg.coef_x[i6 + 2],
+        trajMsg.coef_x[i6 + 3], trajMsg.coef_x[i6 + 4], trajMsg.coef_x[i6 + 5];
+    cMats[i].row(1) << trajMsg.coef_y[i6 + 0], trajMsg.coef_y[i6 + 1], trajMsg.coef_y[i6 + 2],
+        trajMsg.coef_y[i6 + 3], trajMsg.coef_y[i6 + 4], trajMsg.coef_y[i6 + 5];
+    cMats[i].row(2) << trajMsg.coef_z[i6 + 0], trajMsg.coef_z[i6 + 1], trajMsg.coef_z[i6 + 2],
+        trajMsg.coef_z[i6 + 3], trajMsg.coef_z[i6 + 4], trajMsg.coef_z[i6 + 5];
+
+    dura[i] = trajMsg.duration[i];
+  }
+  cache.traj = Trajectory(dura, cMats);
+  cache.total_duration = cache.traj.getTotalDuration();
+  cache.valid = true;
+  return true;
+}
+
+bool exe_traj(const ParsedTrajCache& cache) {
+  if (!cache.valid) {
+    return false;
+  }
+  double t = (ros::Time::now() - cache.start_time).toSec();
   if (t > 0) {
-    if (trajMsg.hover) {
-      if (trajMsg.hover_p.size() != 3) {
+    if (cache.hover) {
+      if (cache.hover_p.size() != 3) {
         ROS_ERROR("[traj_server] hover_p is not 3d!");
       }
       Eigen::Vector3d p, v0;
-      p.x() = trajMsg.hover_p[0];
-      p.y() = trajMsg.hover_p[1];
-      p.z() = trajMsg.hover_p[2];
+      p.x() = cache.hover_p[0];
+      p.y() = cache.hover_p[1];
+      p.z() = cache.hover_p[2];
       v0.setZero();
-      publish_cmd(trajMsg.traj_id, p, v0, v0, last_yaw_, 0);  // TODO yaw
+      publish_cmd(cache.traj_id, p, v0, v0, last_yaw_, 0);  // TODO yaw
       return true;
     }
-    if (trajMsg.order != 5) {
-      ROS_ERROR("[traj_server] Only support trajectory order equals 5 now!");
-      return false;
-    }
-    if (trajMsg.duration.size() * (trajMsg.order + 1) != trajMsg.coef_x.size()) {
-      ROS_ERROR("[traj_server] WRONG trajectory parameters!");
-      return false;
-    }
-    int piece_nums = trajMsg.duration.size();
-    std::vector<double> dura(piece_nums);
-    std::vector<CoefficientMat> cMats(piece_nums);
-    for (int i = 0; i < piece_nums; ++i) {
-      int i6 = i * 6;
-      cMats[i].row(0) << trajMsg.coef_x[i6 + 0], trajMsg.coef_x[i6 + 1], trajMsg.coef_x[i6 + 2],
-          trajMsg.coef_x[i6 + 3], trajMsg.coef_x[i6 + 4], trajMsg.coef_x[i6 + 5];
-      cMats[i].row(1) << trajMsg.coef_y[i6 + 0], trajMsg.coef_y[i6 + 1], trajMsg.coef_y[i6 + 2],
-          trajMsg.coef_y[i6 + 3], trajMsg.coef_y[i6 + 4], trajMsg.coef_y[i6 + 5];
-      cMats[i].row(2) << trajMsg.coef_z[i6 + 0], trajMsg.coef_z[i6 + 1], trajMsg.coef_z[i6 + 2],
-          trajMsg.coef_z[i6 + 3], trajMsg.coef_z[i6 + 4], trajMsg.coef_z[i6 + 5];
-
-      dura[i] = trajMsg.duration[i];
-    }
-    Trajectory traj(dura, cMats);
-    if (t > traj.getTotalDuration()) {
+    if (t > cache.total_duration) {
       ROS_ERROR("[traj_server] trajectory too short left!");
       return false;
     }
     Eigen::Vector3d p, v, a;
-    p = traj.getPos(t);
-    v = traj.getVel(t);
-    a = traj.getAcc(t);
-    auto yaw_cmd = sample_yaw_cmd(trajMsg, t);
-    publish_cmd(trajMsg.traj_id, p, v, a, yaw_cmd.first, yaw_cmd.second);
+    p = cache.traj.getPos(t);
+    v = cache.traj.getVel(t);
+    a = cache.traj.getAcc(t);
+    auto yaw_cmd = sample_yaw_cmd(cache.msg, t);
+    publish_cmd(cache.traj_id, p, v, a, yaw_cmd.first, yaw_cmd.second);
     last_yaw_ = yaw_cmd.first;
     return true;
   }
@@ -125,8 +158,12 @@ void heartbeatCallback(const std_msgs::EmptyConstPtr &msg) {
 
 void polyTrajCallback(const quadrotor_msgs::PolyTrajConstPtr &msgPtr) {
   trajMsg_ = *msgPtr;
+  if (!build_traj_cache(trajMsg_, traj_cache_)) {
+    return;
+  }
   if (!receive_traj_) {
     trajMsg_last_ = trajMsg_;
+    traj_cache_last_ = traj_cache_;
     receive_traj_ = true;
   }
 }
@@ -141,10 +178,11 @@ void cmdCallback(const ros::TimerEvent &e) {
     publish_cmd(trajMsg_.traj_id, last_p_, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), 0, 0);  // TODO yaw
     return;
   }
-  if (exe_traj(trajMsg_)) {
+  if (exe_traj(traj_cache_)) {
     trajMsg_last_ = trajMsg_;
+    traj_cache_last_ = traj_cache_;
     return;
-  } else if (exe_traj(trajMsg_last_)) {
+  } else if (exe_traj(traj_cache_last_)) {
     return;
   }
 }

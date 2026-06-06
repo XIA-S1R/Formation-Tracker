@@ -33,8 +33,15 @@ Eigen::IOFormat CommaInitFmt(Eigen::StreamPrecision, Eigen::DontAlignCols, ", ",
 
 class Nodelet : public nodelet::Nodelet {
  private:
+  struct FakeGoalContext {
+    Eigen::Vector3d goal = Eigen::Vector3d::Zero();
+    bool goal_is_terminal = true;
+    Eigen::Vector3d next_goal = Eigen::Vector3d::Zero();
+    bool has_next_goal = false;
+  };
+
   std::thread initThread_;
-  ros::Subscriber gridmap_sub_, odom_sub_, target_sub_, triger_sub_, land_triger_sub_;
+  ros::Subscriber gridmap_sub_, odom_sub_, target_sub_, triger_sub_, land_triger_sub_, goal_terminal_sub_, next_goal_sub_;
   ros::Timer plan_timer_;
 
   ros::Publisher traj_pub_, heartbeat_pub_, replanState_pub_;
@@ -72,7 +79,15 @@ class Nodelet : public nodelet::Nodelet {
 
   // NOTE planning or fake target
   bool fake_ = false;
-  Eigen::Vector3d goal_;
+  std::atomic_bool latest_goal_is_terminal_input_ = ATOMIC_VAR_INIT(true);
+  std::atomic<double> latest_goal_terminal_msg_sec_{-1.0};
+  std::mutex fake_goal_ctx_mutex_;
+  FakeGoalContext current_fake_goal_ctx_;
+  Eigen::Vector3d latest_next_goal_input_ = Eigen::Vector3d::Zero();
+  bool latest_goal_has_next_input_ = false;
+  double latest_next_goal_msg_sec_ = -1.0;
+  double goal_terminal_latch_max_age_ = 0.5;
+  double fake_turn_in_radius_ = 2.0;
   Eigen::Vector3d land_p_;
   Eigen::Quaterniond land_q_;
 
@@ -89,7 +104,10 @@ class Nodelet : public nodelet::Nodelet {
   bool obs_clip_enable_ = true;
   double obs_clip_range_ = 10.0;
   double obs_clip_margin_ = 0.5;
+  bool planner_visualization_ = false;
   ros::Time last_hard_replan_stamp_ = ros::Time(0);
+  ros::Time last_map_stamp_ = ros::Time(0);
+  bool map_dirty_ = true;
   double last_formation_heading_ = 0.0;
   bool last_formation_heading_valid_ = false;
   double vmax_, amax_;
@@ -122,6 +140,62 @@ class Nodelet : public nodelet::Nodelet {
   std::vector<SwarmTrajData> swarm_trajs_;
   std::mutex swarm_trajs_mutex_;
   ros::Subscriber broadcast_traj_sub_;
+
+  void refreshGridmapCache(bool force_esdf) {
+    while (gridmap_lock_.test_and_set())
+      ;
+    const bool map_changed = map_dirty_ || last_map_stamp_ != map_msg_.header.stamp;
+    if (map_changed) {
+      gridmapPtr_->from_msg(map_msg_);
+      last_map_stamp_ = map_msg_.header.stamp;
+      map_dirty_ = false;
+    }
+    if (force_esdf && (map_changed || !gridmapPtr_->esdfReady())) {
+      gridmapPtr_->updateESDF();
+    }
+    replanStateMsg_.occmap = map_msg_;
+    gridmap_lock_.clear();
+  }
+
+  Eigen::Vector3d computeFakePassThroughVelocity(const FakeGoalContext& goal_ctx,
+                                                 const Eigen::Vector3d& odom_p,
+                                                 const Eigen::Vector3d& odom_v,
+                                                 const Eigen::Vector3d& p_start,
+                                                 const std::vector<Eigen::Vector3d>& path,
+                                                 const double replan_t,
+                                                 const bool goal_in_local_window) const {
+    Eigen::Vector3d dir = Eigen::Vector3d::Zero();
+    const double goal_dist = (goal_ctx.goal - odom_p).norm();
+    const bool use_next_goal_dir =
+        goal_in_local_window &&
+        goal_dist <= fake_turn_in_radius_ &&
+        goal_ctx.has_next_goal &&
+        (goal_ctx.next_goal - goal_ctx.goal).norm() > 1e-3;
+    if (use_next_goal_dir) {
+      dir = goal_ctx.next_goal - goal_ctx.goal;
+    }
+    if (dir.norm() < 1e-3) {
+      dir = goal_ctx.goal - odom_p;
+    }
+    if (dir.norm() < 1e-3 && path.size() >= 2) {
+      dir = path.back() - path[path.size() - 2];
+    }
+    if (dir.norm() < 1e-3 && !path.empty()) {
+      dir = path.back() - p_start;
+    }
+    if (dir.norm() < 1e-3 && !force_hover_ && replan_t <= traj_poly_.getTotalDuration()) {
+      dir = traj_poly_.getVel(replan_t);
+    }
+    if (dir.norm() < 1e-3) {
+      dir = odom_v;
+    }
+    if (dir.norm() < 1e-3) {
+      dir = Eigen::Vector3d::UnitX();
+    }
+    dir.normalize();
+
+    return std::max(0.0, vmax_) * dir;
+  }
 
   bool clipPathToObservationRange(std::vector<Eigen::Vector3d>& path,
                                   const Eigen::Vector3d& sensor_p) const {
@@ -386,9 +460,48 @@ class Nodelet : public nodelet::Nodelet {
   }
 
   void triger_callback(const geometry_msgs::PoseStampedConstPtr& msgPtr) {
-  // 将triger话题中的x,y位置作为goal位置
-    goal_ << msgPtr->pose.position.x, msgPtr->pose.position.y, 3 ;
+    FakeGoalContext goal_ctx;
+    goal_ctx.goal << msgPtr->pose.position.x, msgPtr->pose.position.y, 3.0;
+    bool goal_is_terminal = true;
+    const double last_terminal_msg_sec = latest_goal_terminal_msg_sec_.load(std::memory_order_relaxed);
+    const double now_sec = ros::Time::now().toSec();
+    if (last_terminal_msg_sec >= 0.0 &&
+        (now_sec - last_terminal_msg_sec) <= goal_terminal_latch_max_age_) {
+      goal_is_terminal = latest_goal_is_terminal_input_.load(std::memory_order_relaxed);
+    }
+    goal_ctx.goal_is_terminal = goal_is_terminal;
+    {
+      std::lock_guard<std::mutex> lock(fake_goal_ctx_mutex_);
+      if (!goal_is_terminal &&
+          latest_goal_has_next_input_ &&
+          latest_next_goal_msg_sec_ >= 0.0 &&
+          (now_sec - latest_next_goal_msg_sec_) <= goal_terminal_latch_max_age_) {
+        goal_ctx.next_goal = latest_next_goal_input_;
+        goal_ctx.has_next_goal = true;
+      }
+      current_fake_goal_ctx_ = goal_ctx;
+    }
     triger_received_ = true;
+    if (goal_ctx.has_next_goal) {
+      ROS_INFO("[planner] New fake goal: (%.2f, %.2f, %.2f), terminal=%d, next=(%.2f, %.2f, %.2f)",
+               goal_ctx.goal.x(), goal_ctx.goal.y(), goal_ctx.goal.z(), goal_is_terminal ? 1 : 0,
+               goal_ctx.next_goal.x(), goal_ctx.next_goal.y(), goal_ctx.next_goal.z());
+    } else {
+      ROS_INFO("[planner] New fake goal: (%.2f, %.2f, %.2f), terminal=%d",
+               goal_ctx.goal.x(), goal_ctx.goal.y(), goal_ctx.goal.z(), goal_is_terminal ? 1 : 0);
+    }
+  }
+
+  void goal_terminal_callback(const std_msgs::Bool::ConstPtr& msgPtr) {
+    latest_goal_is_terminal_input_.store(msgPtr->data, std::memory_order_relaxed);
+    latest_goal_terminal_msg_sec_.store(ros::Time::now().toSec(), std::memory_order_relaxed);
+  }
+
+  void next_goal_callback(const geometry_msgs::PoseStampedConstPtr& msgPtr) {
+    std::lock_guard<std::mutex> lock(fake_goal_ctx_mutex_);
+    latest_next_goal_input_ << msgPtr->pose.position.x, msgPtr->pose.position.y, 3.0;
+    latest_goal_has_next_input_ = true;
+    latest_next_goal_msg_sec_ = ros::Time::now().toSec();
   }
 
   void land_triger_callback(const geometry_msgs::PoseStampedConstPtr& msgPtr) {
@@ -423,6 +536,7 @@ class Nodelet : public nodelet::Nodelet {
       ;
     map_msg_ = *msgPtr;
     map_received_ = true;
+    map_dirty_ = true;
     gridmap_lock_.clear();
   }
 
@@ -752,16 +866,9 @@ class Nodelet : public nodelet::Nodelet {
     }
 
     // NOTE obtain map
-    ROS_DEBUG("[drone %d] acquiring gridmap_lock", trajOptPtr_->drone_id_);
-    while (gridmap_lock_.test_and_set())
-      ;
-    gridmapPtr_->from_msg(map_msg_);
-    if (trajOptPtr_->use_soft_constraint_) {
-      gridmapPtr_->updateESDF();  // 软约束模式需要 ESDF
-    }
-    replanStateMsg_.occmap = map_msg_;
-    gridmap_lock_.clear();
-    ROS_DEBUG("[drone %d] gridmap_lock released", trajOptPtr_->drone_id_);
+    ROS_DEBUG("[drone %d] refreshing gridmap cache", trajOptPtr_->drone_id_);
+    refreshGridmapCache(trajOptPtr_->use_soft_constraint_);
+    ROS_DEBUG("[drone %d] gridmap cache ready", trajOptPtr_->drone_id_);
 
 
     // Check map freshness - allow up to 200ms delay for lidar mapping
@@ -784,10 +891,12 @@ class Nodelet : public nodelet::Nodelet {
     }
 
     // visualize the ray from drone to target
-    if (envPtr_->checkRayValid(odom_p, target_p)) {
-      visPtr_->visualize_arrow(odom_p, target_p, "ray", visualization::yellow);// 无遮挡标记黄色
-    } else {
-      visPtr_->visualize_arrow(odom_p, target_p, "ray", visualization::red);// 有遮挡标记红色
+    if (planner_visualization_ || debug_) {
+      if (envPtr_->checkRayValid(odom_p, target_p)) {
+        visPtr_->visualize_arrow(odom_p, target_p, "ray", visualization::yellow);
+      } else {
+        visPtr_->visualize_arrow(odom_p, target_p, "ray", visualization::red);
+      }
     }
 
     // 20Hz 主循环中，默认只做合法性检查；
@@ -831,12 +940,15 @@ class Nodelet : public nodelet::Nodelet {
     }
     if (generate_new_traj_success) {
       Eigen::Vector3d observable_p = target_predcit.back();
-      visPtr_->visualize_path(target_predcit, "car_predict");
-      std::vector<Eigen::Vector3d> observable_margin;
-      for (double theta = 0; theta <= 2 * M_PI; theta += 0.01) {
-        observable_margin.emplace_back(observable_p + tracking_dist_ * Eigen::Vector3d(cos(theta), sin(theta), 0));
+      if (planner_visualization_ || debug_) {
+        visPtr_->visualize_path(target_predcit, "car_predict");
+        std::vector<Eigen::Vector3d> observable_margin;
+        observable_margin.reserve(629);
+        for (double theta = 0; theta <= 2 * M_PI; theta += 0.01) {
+          observable_margin.emplace_back(observable_p + tracking_dist_ * Eigen::Vector3d(cos(theta), sin(theta), 0));
+        }
+        visPtr_->visualize_path(observable_margin, "observable_margin");
       }
-      visPtr_->visualize_path(observable_margin, "observable_margin");//observable_margin是以预测轨迹的最后一个点为圆心，追踪距离为半径的圆，用于可视化追踪者的期望位置范围
     }
 
     // NOTE replan state
@@ -915,7 +1027,9 @@ class Nodelet : public nodelet::Nodelet {
     std::vector<double> thetas;
     Trajectory traj;
     if (generate_new_traj_success) {
-      visPtr_->visualize_path(path, "astar");
+      if (planner_visualization_ || debug_) {
+        visPtr_->visualize_path(path, "astar");
+      }
       // 拼接预测路径：astar_path + predict_path（去掉重复连接点）。
       std::vector<Eigen::Vector3d> astar_path = path;
       std::vector<Eigen::Vector3d> predict_waypts;
@@ -964,8 +1078,10 @@ class Nodelet : public nodelet::Nodelet {
         ROS_DEBUG("[drone %d] starting generateSFC", trajOptPtr_->drone_id_);
         envPtr_->generateSFC(path, 2.0, hPolys, keyPts);
         ROS_DEBUG("[drone %d] generateSFC done", trajOptPtr_->drone_id_);
-        envPtr_->visCorridor(hPolys);
-        visPtr_->visualize_pairline(keyPts, "keyPts");
+        if (planner_visualization_ || debug_) {
+          envPtr_->visCorridor(hPolys);
+          visPtr_->visualize_pairline(keyPts, "keyPts");
+        }
       }
 
       // NOTE trajectory optimization
@@ -981,15 +1097,15 @@ class Nodelet : public nodelet::Nodelet {
       }
       ROS_DEBUG("[drone %d] traj optimization done: %d", trajOptPtr_->drone_id_, generate_new_traj_success);
 
-      visPtr_->visualize_traj(traj, "traj");
+      if (planner_visualization_ || debug_) {
+        visPtr_->visualize_traj(traj, "traj");
+      }
     }
 
     // NOTE collision check
     bool valid = false;
     // 从消息更新网格地图
-    while (gridmap_lock_.test_and_set());
-    gridmapPtr_->from_msg(map_msg_);
-    gridmap_lock_.clear();
+    refreshGridmapCache(false);
     if (generate_new_traj_success) {
       valid = validcheck(traj, replan_stamp);
     } else {
@@ -1076,7 +1192,9 @@ class Nodelet : public nodelet::Nodelet {
       trajOptPtr_->emergency_recovery_ = true;
       return;  // current generated traj invalid but last is valid
     }
-    visPtr_->visualize_traj(traj, "traj");
+    if (planner_visualization_ || debug_) {
+      visPtr_->visualize_traj(traj, "traj");
+    }
   }
 
   void fake_timer_callback(const ros::TimerEvent& event) {
@@ -1098,6 +1216,13 @@ class Nodelet : public nodelet::Nodelet {
     if (!triger_received_) {//目标需要收到RVIZ NavigateTo话题才会启动规划
       return;
     }
+    FakeGoalContext goal_ctx;
+    {
+      std::lock_guard<std::mutex> lock(fake_goal_ctx_mutex_);
+      goal_ctx = current_fake_goal_ctx_;
+    }
+    const Eigen::Vector3d current_goal = goal_ctx.goal;
+    const bool goal_is_terminal = goal_ctx.goal_is_terminal;
     // NOTE force-hover: waiting for the speed of drone small enough
     if (force_hover_ && odom_v.norm() > 0.1) {
       return;
@@ -1105,19 +1230,16 @@ class Nodelet : public nodelet::Nodelet {
 
     // NOTE local goal
     Eigen::Vector3d local_goal;
-    Eigen::Vector3d delta = goal_ - odom_p;
+    Eigen::Vector3d delta = current_goal - odom_p;
+    const bool goal_in_local_window = delta.norm() <= 15.0;
     if (delta.norm() < 15) {//规划半径15m
-      local_goal = goal_;
+      local_goal = current_goal;
     } else {
       local_goal = delta.normalized() * 15 + odom_p;
     }
 
     // NOTE obtain map
-    while (gridmap_lock_.test_and_set())
-      ;
-    gridmapPtr_->from_msg(map_msg_);
-    replanStateMsg_.occmap = map_msg_;
-    gridmap_lock_.clear();//gridmap_lock_用于保证读取map_msg_时的线程安全
+    refreshGridmapCache(false);
 
     // NOTE determin whether to replan
     bool no_need_replan = false;//一般情况下局部目标点不断更新，每有所更新就触发重规划
@@ -1125,7 +1247,7 @@ class Nodelet : public nodelet::Nodelet {
       double last_traj_t_rest = traj_poly_.getTotalDuration() - (ros::Time::now() - replan_stamp_).toSec();//上次规划的轨迹剩余时间
       bool new_goal = (local_goal - traj_poly_.getPos(traj_poly_.getTotalDuration())).norm() > 3.0;//因为goal_是一直在更新的，local_goal也在一直更新。目前的轨迹是上一次基于上一次replan时的local_goal的，如果当前轨迹的终点和local_goal距离大于xx，则认为有更新的目标
       if (!new_goal) {
-        if (last_traj_t_rest < 1.0) {
+        if (goal_is_terminal && last_traj_t_rest < 1.0) {
           ROS_WARN("[planner] NEAR GOAL...");
           no_need_replan = true;//没有更新的目标，当前轨迹的终点就是最终目标点。并且当前轨迹快要结束了，不需要重新规划
         } else if (validcheck(traj_poly_, replan_stamp_, last_traj_t_rest)) {
@@ -1141,8 +1263,9 @@ class Nodelet : public nodelet::Nodelet {
       }
     }
     // NOTE determin whether to pub hover
-    if (has_published_motion_traj_ &&
-        (goal_ - odom_p).norm() < 0.01 && odom_v.norm() < 0.1) {//已经接近目标点了，并且速度很小，认为到达目标点，可以悬停了
+    if (goal_is_terminal &&
+        has_published_motion_traj_ &&
+        (current_goal - odom_p).norm() < 0.01 && odom_v.norm() < 0.1) {//已经接近目标点了，并且速度很小，认为到达目标点，可以悬停了
       if (!wait_hover_) {
         pub_hover_p(odom_p, ros::Time::now());
         wait_hover_ = true;
@@ -1224,6 +1347,9 @@ class Nodelet : public nodelet::Nodelet {
       Eigen::MatrixXd finState;
       finState.setZero(3, 3);
       finState.col(0) = path.back();
+      if (!goal_is_terminal) {
+        finState.col(1) = computeFakePassThroughVelocity(goal_ctx, odom_p, odom_v, p_start, path, replan_t, goal_in_local_window);
+      }
       // return;
       generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, hPolys, traj);//轨迹优化！！
       visPtr_->visualize_traj(traj, "traj");
@@ -1265,9 +1391,7 @@ class Nodelet : public nodelet::Nodelet {
       return;
     } else {
       // Update map with latest data before executing old trajectory
-      while (gridmap_lock_.test_and_set());
-      gridmapPtr_->from_msg(map_msg_);
-      gridmap_lock_.clear();
+      refreshGridmapCache(false);
 
       // Verify old trajectory with latest map
       if (!validcheck(traj_poly_, replan_stamp_)) {
@@ -1458,6 +1582,7 @@ class Nodelet : public nodelet::Nodelet {
     nh.param("search_yaw_scan_range_deg", search_yaw_scan_range_deg_, 45.0);
     nh.param("search_yaw_scan_freq_hz", search_yaw_scan_freq_hz_, 0.25);
     nh.param("post_reacquire_boost_sec", post_reacquire_boost_sec_, 3.0);
+    nh.param("planner_visualization", planner_visualization_, false);
     post_reacquire_boost_sec_ = std::max(0.0, post_reacquire_boost_sec_);
     search_yaw_scan_range_deg_ = std::max(0.0, search_yaw_scan_range_deg_);
     search_yaw_scan_freq_hz_ = std::max(0.0, search_yaw_scan_freq_hz_);
@@ -1465,6 +1590,10 @@ class Nodelet : public nodelet::Nodelet {
     nh.getParam("fake", fake_);
     nh.getParam("vmax", vmax_);
     nh.getParam("amax", amax_);
+    nh.param("goal_terminal_latch_max_age", goal_terminal_latch_max_age_, 0.5);
+    nh.param("fake_turn_in_radius", fake_turn_in_radius_, 2.0);
+    goal_terminal_latch_max_age_ = std::max(0.0, goal_terminal_latch_max_age_);
+    fake_turn_in_radius_ = std::max(0.0, fake_turn_in_radius_);
 
     gridmapPtr_ = std::make_shared<mapping::OccGridMap>();
     envPtr_ = std::make_shared<env::Env>(nh, gridmapPtr_);
@@ -1484,6 +1613,8 @@ class Nodelet : public nodelet::Nodelet {
       wr_msg::readMsg(replanStateMsg_, ros::package::getPath("planning") + "/../../../debug/replan_state.bin");
       inflate_gridmap_pub_ = nh.advertise<quadrotor_msgs::OccMap3d>("gridmap_inflate", 10);
       gridmapPtr_->from_msg(replanStateMsg_.occmap);
+      last_map_stamp_ = replanStateMsg_.occmap.header.stamp;
+      map_dirty_ = false;
       prePtr_->setMap(*gridmapPtr_);
       std::cout << "plan state: " << replanStateMsg_.state << std::endl;
     } else if (fake_) {
@@ -1505,6 +1636,8 @@ class Nodelet : public nodelet::Nodelet {
     }
 
     triger_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("triger", 10, &Nodelet::triger_callback, this, ros::TransportHints().tcpNoDelay());
+    goal_terminal_sub_ = nh.subscribe<std_msgs::Bool>("goal_is_terminal", 10, &Nodelet::goal_terminal_callback, this, ros::TransportHints().tcpNoDelay());
+    next_goal_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("next_goal", 10, &Nodelet::next_goal_callback, this, ros::TransportHints().tcpNoDelay());
     land_triger_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("land_triger", 10, &Nodelet::land_triger_callback, this, ros::TransportHints().tcpNoDelay());
     broadcast_traj_sub_ = nh.subscribe<quadrotor_msgs::PolyTraj>("/planning/broadcast_traj_recv", 100,
                                                                  &Nodelet::RecvBroadcastPolyTrajCallback,

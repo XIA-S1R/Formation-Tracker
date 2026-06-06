@@ -40,7 +40,9 @@ class TrajOpt {
   Eigen::VectorXd p_;
   // duration of each piece of the trajectory
   Eigen::VectorXd t_;
-  double* x_;
+  std::vector<double> x_buffer_;
+  double* x_ = nullptr;
+  size_t x_capacity_ = 0;
   double sum_T_;
 
   std::vector<Eigen::Vector3d> tracking_ps_;
@@ -80,6 +82,7 @@ class TrajOpt {
   // polyH utils
   bool extractVs(const std::vector<Eigen::MatrixXd>& hPs,
                  std::vector<Eigen::MatrixXd>& vPs) const;
+  void ensureWorkspace(size_t required_size);
 
  public:
   TrajOpt(ros::NodeHandle& nh);

@@ -5,6 +5,7 @@
 #include <vector>
 #include <cmath>
 #include <limits>
+#include <type_traits>
 
 namespace mapping {
 
@@ -57,15 +58,15 @@ struct RingBuffer {
 struct OccGridMap {
  public:
   // parameters
-  int p_min, p_max, p_hit, p_mis, p_occ, p_def;
-  int inflate_size;
-  double sensor_range;
+  int p_min = 0, p_max = 0, p_hit = 0, p_mis = 0, p_occ = 0, p_def = 0;
+  int inflate_size = 0;
+  double sensor_range = 0.0;
   // states
   bool init_finished = false;
-  int offset_x, offset_y, offset_z;
+  int offset_x = 0, offset_y = 0, offset_z = 0;
   // ring buffer
-  double resolution;
-  int size_x, size_y, size_z;
+  double resolution = 0.0;
+  int size_x = 0, size_y = 0, size_z = 0;
 
  private:
   RingBuffer<int8_t> infocc;  // -128 ~ 127  1 for occupied, 0 for known, -1 for free
@@ -152,6 +153,8 @@ struct OccGridMap {
   }
   template <typename _Msgtype>
   inline void from_msg(const _Msgtype& msg) {
+    const bool shape_changed =
+        size_x != msg.size_x || size_y != msg.size_y || size_z != msg.size_z;
     resolution = msg.resolution;
     size_x = msg.size_x;
     size_y = msg.size_y;
@@ -159,8 +162,11 @@ struct OccGridMap {
     offset_x = msg.offset_x;
     offset_y = msg.offset_y;
     offset_z = msg.offset_z;
-    infocc.setup(size_x, size_y, size_z);
+    if (shape_changed || infocc.data.size() != msg.data.size()) {
+      infocc.setup(size_x, size_y, size_z);
+    }
     infocc.data = msg.data;
+    esdf_valid_ = false;
   }
   inline void setOcc(const Eigen::Vector3d& p) {
     infocc.atId(pos2idx(p)) = 1;

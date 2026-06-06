@@ -267,9 +267,9 @@ void OccGridMap::fillESDF(F_get f_get, F_set f_set, int start, int end) {
 
 void OccGridMap::updateESDF() {
   int total = size_x * size_y * size_z;
-  esdf_buffer_.resize(total);
-  esdf_tmp1_.resize(total);
-  esdf_tmp2_.resize(total);
+  if ((int)esdf_buffer_.size() != total) esdf_buffer_.resize(total);
+  if ((int)esdf_tmp1_.size() != total) esdf_tmp1_.resize(total);
+  if ((int)esdf_tmp2_.size() != total) esdf_tmp2_.resize(total);
 
   // Pass 1: along Z
   for (int rx = 0; rx < size_x; rx++) {

@@ -11,6 +11,7 @@
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/kdtree/kdtree_flann.h>
 
 namespace mapping {
 
@@ -25,6 +26,9 @@ class Nodelet : public nodelet::Nodelet {
 
   // global map storage (shared by both modes)
   pcl::PointCloud<pcl::PointXYZ> global_cloud_;
+  pcl::PointCloud<pcl::PointXYZ>::Ptr global_cloud_ptr_{new pcl::PointCloud<pcl::PointXYZ>()};
+  pcl::KdTreeFLANN<pcl::PointXYZ> global_kdtree_;
+  bool global_kdtree_ready_ = false;
   bool global_map_received_ = false;
   ros::Subscriber global_map_sub_;
 
@@ -51,6 +55,9 @@ class Nodelet : public nodelet::Nodelet {
 
   OccGridMap gridmap_;
   int inflate_size_;
+  std::vector<int> radius_indices_;
+  std::vector<float> radius_sq_distances_;
+  std::vector<Eigen::Vector3d> obs_pts_cache_;
 
   // global map mode: receive once, setOcc + inflate, then publish periodically
   void global_map_callback(const sensor_msgs::PointCloud2ConstPtr& msgPtr) {
@@ -70,12 +77,18 @@ class Nodelet : public nodelet::Nodelet {
     if (global_map_received_) return;
     pcl::PointCloud<pcl::PointXYZ> cloud;
     pcl::fromROSMsg(*msgPtr, cloud);
+    global_cloud_.clear();
     
     // 只保留感知范围附近的点（±60m）
     for (const auto& pt : cloud) {
       if (std::abs(pt.x) < 60 && std::abs(pt.y) < 60 && std::abs(pt.z) < 30) {
         global_cloud_.push_back(pt);
       }
+    }
+    *global_cloud_ptr_ = global_cloud_;
+    if (!global_cloud_ptr_->empty()) {
+      global_kdtree_.setInputCloud(global_cloud_ptr_);
+      global_kdtree_ready_ = true;
     }
     
     global_map_received_ = true;
@@ -114,32 +127,52 @@ class Nodelet : public nodelet::Nodelet {
     Eigen::Vector3d sensor_p = cur_pos_;
     odom_lock_.clear();
 
-    ROS_INFO_THROTTLE(1, "[mapping] global_cloud size: %zu, sensor_p: (%.2f, %.2f, %.2f)", global_cloud_.size(), sensor_p.x(), sensor_p.y(), sensor_p.z());
+    ROS_DEBUG_THROTTLE(1, "[mapping] global_cloud size: %zu, sensor_p: (%.2f, %.2f, %.2f)", global_cloud_.size(), sensor_p.x(), sensor_p.y(), sensor_p.z());
 
-    std::vector<Eigen::Vector3d> obs_pts;
-    for (const auto& pt : global_cloud_) {
-      Eigen::Vector3d p(pt.x, pt.y, pt.z);
-      Eigen::Vector3d delta = p - sensor_p;
+    obs_pts_cache_.clear();
+    if (global_kdtree_ready_) {
+      pcl::PointXYZ search_point(sensor_p.x(), sensor_p.y(), sensor_p.z());
+      radius_indices_.clear();
+      radius_sq_distances_.clear();
+      global_kdtree_.radiusSearch(search_point, sensor_range_, radius_indices_, radius_sq_distances_);
+      obs_pts_cache_.reserve(radius_indices_.size());
+      for (const int idx : radius_indices_) {
+        const auto& pt = global_cloud_ptr_->points[idx];
+        Eigen::Vector3d p(pt.x, pt.y, pt.z);
+        Eigen::Vector3d delta = p - sensor_p;
 
-      // horizontal distance (xy plane)
-      double xy_dist = std::sqrt(delta.x() * delta.x() + delta.y() * delta.y());
-      if (xy_dist > sensor_range_) continue;
+        double xy_dist = std::sqrt(delta.x() * delta.x() + delta.y() * delta.y());
+        if (xy_dist > sensor_range_) continue;
 
-      // vertical angle: -90° to 90°
-      double z_angle_rad = std::atan2(delta.z(), xy_dist);
-      if (z_angle_rad < -M_PI / 2.0 || z_angle_rad > M_PI / 2.0) continue;
+        double z_angle_rad = std::atan2(delta.z(), xy_dist);
+        if (z_angle_rad < -M_PI / 2.0 || z_angle_rad > M_PI / 2.0) continue;
 
-      obs_pts.push_back(p);
+        obs_pts_cache_.push_back(p);
+      }
+    } else {
+      obs_pts_cache_.reserve(global_cloud_.size());
+      for (const auto& pt : global_cloud_) {
+        Eigen::Vector3d p(pt.x, pt.y, pt.z);
+        Eigen::Vector3d delta = p - sensor_p;
+
+        double xy_dist = std::sqrt(delta.x() * delta.x() + delta.y() * delta.y());
+        if (xy_dist > sensor_range_) continue;
+
+        double z_angle_rad = std::atan2(delta.z(), xy_dist);
+        if (z_angle_rad < -M_PI / 2.0 || z_angle_rad > M_PI / 2.0) continue;
+
+        obs_pts_cache_.push_back(p);
+      }
     }
 
-    ROS_INFO_THROTTLE(1, "[mapping] obs_pts: %zu", obs_pts.size());
+    ROS_DEBUG_THROTTLE(1, "[mapping] obs_pts: %zu", obs_pts_cache_.size());
 
     // Set timestamp BEFORE updateMap to reflect actual observation time
     quadrotor_msgs::OccMap3d gridmap_msg;
     gridmap_msg.header.frame_id = "world";
     gridmap_msg.header.stamp = ros::Time::now();
 
-    gridmap_.updateMap(sensor_p, obs_pts);
+    gridmap_.updateMap(sensor_p, obs_pts_cache_);
     gridmap_.updateESDF();
 
     if (use_mask_) {
