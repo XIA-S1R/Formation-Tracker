@@ -1,0 +1,650 @@
+Panels:
+  - Class: rviz/Displays
+    Help Height: 0
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /real_field_map1
+        - /target1
+        - /drone01
+        - /drone11
+        - /drone21
+        - /dpf_debug1
+      Splitter Ratio: 0.46
+    Tree Height: 760
+  - Class: rviz/Selection
+    Name: Selection
+  - Class: rviz/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+  - Class: rviz/Time
+    Experimental: false
+    Name: Time
+    SyncMode: 0
+    SyncSource: real_field_map
+Preferences:
+  PromptSaveOnExit: true
+Toolbars:
+  toolButtonStyle: 2
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Cell Size: 0.5
+      Class: rviz/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Line Style:
+        Line Width: 0.015
+        Value: Lines
+      Name: xy_grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 16
+      Reference Frame: world
+      Value: true
+    - Alpha: 0.55
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 3
+        Min Value: 0
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 60; 60; 60
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: real_field_map
+      Position Transformer: XYZ
+      Queue Size: 1
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.08
+      Style: Boxes
+      Topic: /global_map
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
+    - Class: rviz/Group
+      Displays:
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /target/odom_visualization/robot
+          Name: robot
+          Namespaces:
+            mesh: true
+          Queue Size: 100
+          Value: true
+        - Alpha: 1
+          Buffer Length: 1
+          Class: rviz/Path
+          Color: 255; 30; 30
+          Enabled: true
+          Head Diameter: 0.25
+          Head Length: 0.18
+          Length: 0.25
+          Line Style: Billboards
+          Line Width: 0.055
+          Name: executed_path
+          Offset:
+            X: 0
+            Y: 0
+            Z: 0
+          Pose Color: 255; 85; 85
+          Pose Style: None
+          Queue Size: 10
+          Radius: 0.03
+          Shaft Diameter: 0.08
+          Shaft Length: 0.08
+          Topic: /target/odom_visualization/path
+          Unreliable: false
+          Value: true
+        - Angle Tolerance: 0.01
+          Class: rviz/Odometry
+          Covariance:
+            Orientation:
+              Alpha: 0.5
+              Color: 255; 255; 127
+              Color Style: Unique
+              Frame: Local
+              Offset: 1
+              Scale: 1
+              Value: false
+            Position:
+              Alpha: 0.3
+              Color: 204; 51; 204
+              Scale: 1
+              Value: false
+            Value: false
+          Enabled: false
+          Keep: 1
+          Name: odom_axes
+          Position Tolerance: 0.01
+          Queue Size: 10
+          Shape:
+            Alpha: 1
+            Axes Length: 0.55
+            Axes Radius: 0.04
+            Color: 255; 30; 30
+            Head Length: 0.18
+            Head Radius: 0.06
+            Shaft Length: 0.55
+            Shaft Radius: 0.03
+            Value: Arrow
+          Topic: /target/odom
+          Unreliable: false
+          Value: false
+      Enabled: true
+      Name: target
+    - Class: rviz/Group
+      Displays:
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /drone0/odom_visualization/robot
+          Name: robot
+          Namespaces:
+            mesh: true
+          Queue Size: 100
+          Value: true
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /drone0/odom_visualization/fov_visual
+          Name: fov
+          Namespaces:
+            fov_edges: true
+            fov_nodes: true
+          Queue Size: 100
+          Value: true
+        - Alpha: 1
+          Buffer Length: 1
+          Class: rviz/Path
+          Color: 0; 90; 255
+          Enabled: true
+          Head Diameter: 0.25
+          Head Length: 0.18
+          Length: 0.25
+          Line Style: Billboards
+          Line Width: 0.06
+          Name: planned_traj
+          Offset:
+            X: 0
+            Y: 0
+            Z: 0
+          Pose Color: 0; 90; 255
+          Pose Style: None
+          Queue Size: 10
+          Radius: 0.03
+          Shaft Diameter: 0.08
+          Shaft Length: 0.08
+          Topic: /drone0/planning/traj
+          Unreliable: false
+          Value: true
+        - Alpha: 1
+          Buffer Length: 1
+          Class: rviz/Path
+          Color: 0; 120; 255
+          Enabled: true
+          Head Diameter: 0.2
+          Head Length: 0.15
+          Length: 0.2
+          Line Style: Billboards
+          Line Width: 0.025
+          Name: executed_path
+          Offset:
+            X: 0
+            Y: 0
+            Z: 0
+          Pose Color: 0; 120; 255
+          Pose Style: None
+          Queue Size: 10
+          Radius: 0.03
+          Shaft Diameter: 0.08
+          Shaft Length: 0.08
+          Topic: /drone0/odom_visualization/path
+          Unreliable: false
+          Value: true
+        - Alpha: 0.8
+          Autocompute Intensity Bounds: true
+          Autocompute Value Bounds:
+            Max Value: 3
+            Min Value: 0
+            Value: true
+          Axis: Z
+          Channel Name: intensity
+          Class: rviz/PointCloud2
+          Color: 0; 90; 255
+          Color Transformer: AxisColor
+          Decay Time: 0
+          Enabled: false
+          Invert Rainbow: false
+          Max Color: 255; 255; 255
+          Min Color: 0; 0; 0
+          Name: local_inflate_map
+          Position Transformer: XYZ
+          Queue Size: 10
+          Selectable: true
+          Size (Pixels): 3
+          Size (m): 0.08
+          Style: Boxes
+          Topic: /drone0/mapping_vis/vs_gridmap_inflate
+          Unreliable: false
+          Use Fixed Frame: true
+          Use rainbow: true
+          Value: false
+      Enabled: true
+      Name: drone0
+    - Class: rviz/Group
+      Displays:
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /drone1/odom_visualization/robot
+          Name: robot
+          Namespaces:
+            mesh: true
+          Queue Size: 100
+          Value: true
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /drone1/odom_visualization/fov_visual
+          Name: fov
+          Namespaces:
+            fov_edges: true
+            fov_nodes: true
+          Queue Size: 100
+          Value: true
+        - Alpha: 1
+          Buffer Length: 1
+          Class: rviz/Path
+          Color: 0; 170; 60
+          Enabled: true
+          Head Diameter: 0.25
+          Head Length: 0.18
+          Length: 0.25
+          Line Style: Billboards
+          Line Width: 0.06
+          Name: planned_traj
+          Offset:
+            X: 0
+            Y: 0
+            Z: 0
+          Pose Color: 0; 170; 60
+          Pose Style: None
+          Queue Size: 10
+          Radius: 0.03
+          Shaft Diameter: 0.08
+          Shaft Length: 0.08
+          Topic: /drone1/planning/traj
+          Unreliable: false
+          Value: true
+        - Alpha: 1
+          Buffer Length: 1
+          Class: rviz/Path
+          Color: 0; 140; 50
+          Enabled: true
+          Head Diameter: 0.2
+          Head Length: 0.15
+          Length: 0.2
+          Line Style: Billboards
+          Line Width: 0.025
+          Name: executed_path
+          Offset:
+            X: 0
+            Y: 0
+            Z: 0
+          Pose Color: 0; 140; 50
+          Pose Style: None
+          Queue Size: 10
+          Radius: 0.03
+          Shaft Diameter: 0.08
+          Shaft Length: 0.08
+          Topic: /drone1/odom_visualization/path
+          Unreliable: false
+          Value: true
+        - Alpha: 0.8
+          Autocompute Intensity Bounds: true
+          Autocompute Value Bounds:
+            Max Value: 3
+            Min Value: 0
+            Value: true
+          Axis: Z
+          Channel Name: intensity
+          Class: rviz/PointCloud2
+          Color: 0; 170; 60
+          Color Transformer: AxisColor
+          Decay Time: 0
+          Enabled: false
+          Invert Rainbow: false
+          Max Color: 255; 255; 255
+          Min Color: 0; 0; 0
+          Name: local_inflate_map
+          Position Transformer: XYZ
+          Queue Size: 10
+          Selectable: true
+          Size (Pixels): 3
+          Size (m): 0.08
+          Style: Boxes
+          Topic: /drone1/mapping_vis/vs_gridmap_inflate
+          Unreliable: false
+          Use Fixed Frame: true
+          Use rainbow: true
+          Value: false
+      Enabled: true
+      Name: drone1
+    - Class: rviz/Group
+      Displays:
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /drone2/odom_visualization/robot
+          Name: robot
+          Namespaces:
+            mesh: true
+          Queue Size: 100
+          Value: true
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /drone2/odom_visualization/fov_visual
+          Name: fov
+          Namespaces:
+            fov_edges: true
+            fov_nodes: true
+          Queue Size: 100
+          Value: true
+        - Alpha: 1
+          Buffer Length: 1
+          Class: rviz/Path
+          Color: 240; 140; 0
+          Enabled: true
+          Head Diameter: 0.25
+          Head Length: 0.18
+          Length: 0.25
+          Line Style: Billboards
+          Line Width: 0.06
+          Name: planned_traj
+          Offset:
+            X: 0
+            Y: 0
+            Z: 0
+          Pose Color: 240; 140; 0
+          Pose Style: None
+          Queue Size: 10
+          Radius: 0.03
+          Shaft Diameter: 0.08
+          Shaft Length: 0.08
+          Topic: /drone2/planning/traj
+          Unreliable: false
+          Value: true
+        - Alpha: 1
+          Buffer Length: 1
+          Class: rviz/Path
+          Color: 215; 120; 0
+          Enabled: true
+          Head Diameter: 0.2
+          Head Length: 0.15
+          Length: 0.2
+          Line Style: Billboards
+          Line Width: 0.025
+          Name: executed_path
+          Offset:
+            X: 0
+            Y: 0
+            Z: 0
+          Pose Color: 215; 120; 0
+          Pose Style: None
+          Queue Size: 10
+          Radius: 0.03
+          Shaft Diameter: 0.08
+          Shaft Length: 0.08
+          Topic: /drone2/odom_visualization/path
+          Unreliable: false
+          Value: true
+        - Alpha: 0.8
+          Autocompute Intensity Bounds: true
+          Autocompute Value Bounds:
+            Max Value: 3
+            Min Value: 0
+            Value: true
+          Axis: Z
+          Channel Name: intensity
+          Class: rviz/PointCloud2
+          Color: 240; 140; 0
+          Color Transformer: AxisColor
+          Decay Time: 0
+          Enabled: false
+          Invert Rainbow: false
+          Max Color: 255; 255; 255
+          Min Color: 0; 0; 0
+          Name: local_inflate_map
+          Position Transformer: XYZ
+          Queue Size: 10
+          Selectable: true
+          Size (Pixels): 3
+          Size (m): 0.08
+          Style: Boxes
+          Topic: /drone2/mapping_vis/vs_gridmap_inflate
+          Unreliable: false
+          Use Fixed Frame: true
+          Use rainbow: true
+          Value: false
+      Enabled: true
+      Name: drone2
+    - Class: rviz/Group
+      Displays:
+        - Angle Tolerance: 0.01
+          Class: rviz/Odometry
+          Covariance:
+            Orientation:
+              Alpha: 0.5
+              Color: 255; 255; 127
+              Color Style: Unique
+              Frame: Local
+              Offset: 1
+              Scale: 1
+              Value: false
+            Position:
+              Alpha: 0.3
+              Color: 204; 51; 204
+              Scale: 1
+              Value: false
+            Value: false
+          Enabled: true
+          Keep: 1
+          Name: drone0_target_ekf
+          Position Tolerance: 0.01
+          Queue Size: 10
+          Shape:
+            Alpha: 1
+            Axes Length: 0.45
+            Axes Radius: 0.035
+            Color: 0; 90; 255
+            Head Length: 0.16
+            Head Radius: 0.055
+            Shaft Length: 0.45
+            Shaft Radius: 0.025
+            Value: Axes
+          Topic: /drone0/target_ekf_odom
+          Unreliable: false
+          Value: true
+        - Angle Tolerance: 0.01
+          Class: rviz/Odometry
+          Covariance:
+            Orientation:
+              Alpha: 0.5
+              Color: 255; 255; 127
+              Color Style: Unique
+              Frame: Local
+              Offset: 1
+              Scale: 1
+              Value: false
+            Position:
+              Alpha: 0.3
+              Color: 204; 51; 204
+              Scale: 1
+              Value: false
+            Value: false
+          Enabled: true
+          Keep: 1
+          Name: drone1_target_ekf
+          Position Tolerance: 0.01
+          Queue Size: 10
+          Shape:
+            Alpha: 1
+            Axes Length: 0.45
+            Axes Radius: 0.035
+            Color: 0; 170; 60
+            Head Length: 0.16
+            Head Radius: 0.055
+            Shaft Length: 0.45
+            Shaft Radius: 0.025
+            Value: Axes
+          Topic: /drone1/target_ekf_odom
+          Unreliable: false
+          Value: true
+        - Angle Tolerance: 0.01
+          Class: rviz/Odometry
+          Covariance:
+            Orientation:
+              Alpha: 0.5
+              Color: 255; 255; 127
+              Color Style: Unique
+              Frame: Local
+              Offset: 1
+              Scale: 1
+              Value: false
+            Position:
+              Alpha: 0.3
+              Color: 204; 51; 204
+              Scale: 1
+              Value: false
+            Value: false
+          Enabled: true
+          Keep: 1
+          Name: drone2_target_ekf
+          Position Tolerance: 0.01
+          Queue Size: 10
+          Shape:
+            Alpha: 1
+            Axes Length: 0.45
+            Axes Radius: 0.035
+            Color: 240; 140; 0
+            Head Length: 0.16
+            Head Radius: 0.055
+            Shaft Length: 0.45
+            Shaft Radius: 0.025
+            Value: Axes
+          Topic: /drone2/target_ekf_odom
+          Unreliable: false
+          Value: true
+        - Alpha: 0.7
+          Autocompute Intensity Bounds: true
+          Autocompute Value Bounds:
+            Max Value: 10
+            Min Value: -10
+            Value: true
+          Axis: Z
+          Channel Name: intensity
+          Class: rviz/PointCloud2
+          Color: 80; 200; 255
+          Color Transformer: FlatColor
+          Decay Time: 0
+          Enabled: false
+          Invert Rainbow: false
+          Max Color: 255; 255; 255
+          Min Color: 0; 0; 0
+          Name: drone0_particles
+          Position Transformer: XYZ
+          Queue Size: 10
+          Selectable: true
+          Size (Pixels): 3
+          Size (m): 0.045
+          Style: Spheres
+          Topic: /drone0/drone0_target_dpf/search_particles_vis
+          Unreliable: false
+          Use Fixed Frame: true
+          Use rainbow: true
+          Value: false
+        - Class: rviz/MarkerArray
+          Enabled: false
+          Marker Topic: /drone0/drone0_target_dpf/search_gmm_vis
+          Name: drone0_search_gmm
+          Namespaces:
+            {}
+          Queue Size: 100
+          Value: false
+      Enabled: true
+      Name: dpf_debug
+  Enabled: true
+  Global Options:
+    Background Color: 248; 248; 248
+    Default Light: true
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+      Hide Inactive Objects: true
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+    - Class: rviz/SetInitialPose
+      Theta std deviation: 0.261799
+      Topic: /initialpose
+      X std deviation: 0.5
+      Y std deviation: 0.5
+    - Class: rviz/SetGoal
+      Topic: /move_base_simple/goal
+    - Class: rviz/PublishPoint
+      Single click: true
+      Topic: /clicked_point
+  Value: true
+  Views:
+    Current:
+      Class: rviz/XYOrbit
+      Distance: 8.2
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Field of View: 0.785398
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 1.15
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Pitch: 1.12
+      Target Frame: world
+      Yaw: 3.14
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1000
+  Hide Left Dock: false
+  Hide Right Dock: false
+  Selection:
+    collapsed: false
+  Time:
+    collapsed: false
+  Views:
+    collapsed: false
+  Width: 1500
+  X: 40
+  Y: 40

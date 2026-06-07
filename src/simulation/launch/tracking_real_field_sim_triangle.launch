@@ -13,6 +13,11 @@
   <arg name="tracker_amax" default="1.6"/>
   <arg name="tracking_dist" default="0.9"/>
   <arg name="trigger_delay" default="5.0"/>
+  <arg name="rviz" default="false"/>
+  <arg name="rviz_config" default="$(find simulation)/config/tracking_real_field_sim.rviz"/>
+
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="rviz"
+        args="-d $(arg rviz_config)" output="screen"/>
 
   <node pkg="real_uav_bridge" type="static_pointcloud_map_publisher"
         name="static_map_publisher" output="screen">
