@@ -1,0 +1,30 @@
+{
+  "field": {
+    "x_min_m": -3.3,
+    "x_max_m": 3.0,
+    "y_min_m": -2.8,
+    "y_max_m": 2.5,
+    "z_min_m": 0.0,
+    "z_max_m": 2.5
+  },
+  "obstacle_size_m": {
+    "x": 0.6,
+    "y": 1.2,
+    "z": 1.6
+  },
+  "sampling_step_m": 0.05,
+  "obstacles": [
+    {
+      "name": "pillar_0",
+      "right_front_corner_m": [2.1, 1.2]
+    },
+    {
+      "name": "pillar_1",
+      "right_front_corner_m": [0.2, -0.4]
+    },
+    {
+      "name": "pillar_2",
+      "right_front_corner_m": [-1.6, 0.7]
+    }
+  ]
+}

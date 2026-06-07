@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="760" viewBox="0 0 1100 760">
+<rect width="100%" height="100%" fill="white"/>
+<text x="40" y="40" font-family="Arial" font-size="24" fill="#222">3D check view: measured obstacle map</text>
+<polygon points="487.5,222.2 1023.0,447.1 572.5,636.4 37.0,411.4" fill="#f3f3f3" stroke="#333" stroke-width="2"/>
+<polygon points="555.5,536.4 606.5,557.8 606.5,381.8 555.5,360.4" fill="#e05747" opacity="0.58" stroke="#222" stroke-width="2"/>
+<polygon points="708.5,515.0 606.5,557.8 606.5,381.8 708.5,339.0" fill="#e05747" opacity="0.70" stroke="#222" stroke-width="2"/>
+<polygon points="657.5,317.6 708.5,339.0 606.5,381.8 555.5,360.4" fill="#e05747" opacity="0.85" stroke="#222" stroke-width="2"/>
+<circle cx="606.5" cy="557.8" r="6" fill="#111"/>
+<text x="632.0" y="327.7" font-family="Arial" font-size="18" text-anchor="middle" fill="#111">pillar_0</text>
+<polygon points="530.0,411.4 581.0,432.9 581.0,256.9 530.0,235.4" fill="#4589d1" opacity="0.58" stroke="#222" stroke-width="2"/>
+<polygon points="683.0,390.0 581.0,432.9 581.0,256.9 683.0,214.0" fill="#4589d1" opacity="0.70" stroke="#222" stroke-width="2"/>
+<polygon points="632.0,192.6 683.0,214.0 581.0,256.9 530.0,235.4" fill="#4589d1" opacity="0.85" stroke="#222" stroke-width="2"/>
+<circle cx="581.0" cy="432.9" r="6" fill="#111"/>
+<text x="606.5" y="202.7" font-family="Arial" font-size="18" text-anchor="middle" fill="#111">pillar_1</text>
+<polygon points="283.5,386.4 334.5,407.9 334.5,231.9 283.5,210.4" fill="#4faa5b" opacity="0.58" stroke="#222" stroke-width="2"/>
+<polygon points="436.5,365.0 334.5,407.9 334.5,231.9 436.5,189.0" fill="#4faa5b" opacity="0.70" stroke="#222" stroke-width="2"/>
+<polygon points="385.5,167.6 436.5,189.0 334.5,231.9 283.5,210.4" fill="#4faa5b" opacity="0.85" stroke="#222" stroke-width="2"/>
+<circle cx="334.5" cy="407.9" r="6" fill="#111"/>
+<text x="360.0" y="177.7" font-family="Arial" font-size="18" text-anchor="middle" fill="#111">pillar_2</text>
+<line x1="530.0" y1="440.0" x2="615.0" y2="475.7" stroke="#d13f31" stroke-width="4"/>
+<line x1="530.0" y1="440.0" x2="445.0" y2="475.7" stroke="#2f7fcc" stroke-width="4"/>
+<line x1="530.0" y1="440.0" x2="530.0" y2="330.0" stroke="#31934b" stroke-width="4"/>
+<text x="623.0" y="475.7" font-family="Arial" font-size="18" fill="#d13f31">+x</text>
+<text x="453.0" y="475.7" font-family="Arial" font-size="18" fill="#2f7fcc">+y</text>
+<text x="538.0" y="330.0" font-family="Arial" font-size="18" fill="#31934b">+z</text>
+</svg>

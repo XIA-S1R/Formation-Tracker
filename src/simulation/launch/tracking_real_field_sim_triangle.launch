@@ -1,0 +1,309 @@
+<launch>
+  <env name="ROSCONSOLE_CONFIG_FILE" value="$(find planning)/config/rosconsole.conf"/>
+
+  <arg name="search_estimation_mode" default="search_gmm6d"/>
+  <arg name="planner_visualization" default="false"/>
+  <arg name="search_debug_logs" default="false"/>
+  <arg name="static_map_file" default="$(find real_uav_bridge)/maps/generated/real_field_obstacles.csv"/>
+  <arg name="map_x_length" default="6.3"/>
+  <arg name="map_y_length" default="5.3"/>
+  <arg name="map_z_length" default="3.0"/>
+  <arg name="map_resolution" default="0.15"/>
+  <arg name="tracker_vmax" default="0.8"/>
+  <arg name="tracker_amax" default="1.6"/>
+  <arg name="tracking_dist" default="0.9"/>
+  <arg name="trigger_delay" default="5.0"/>
+
+  <node pkg="real_uav_bridge" type="static_pointcloud_map_publisher"
+        name="static_map_publisher" output="screen">
+    <param name="map_file" value="$(arg static_map_file)"/>
+    <param name="frame_id" value="world"/>
+    <param name="publish_hz" value="1.0"/>
+  </node>
+
+  <node pkg="topic_tools" type="relay" name="swarm_traj_relay"
+        args="/planning/broadcast_traj_send /planning/broadcast_traj_recv"
+        output="screen"/>
+
+  <node pkg="planning" type="delayed_trigger.py"
+        name="delayed_triger_for_real_field_sim" output="screen">
+    <param name="topic" value="/triger"/>
+    <param name="delay" value="$(arg trigger_delay)"/>
+    <param name="publish_hz" value="10.0"/>
+    <param name="duration" value="2.0"/>
+  </node>
+
+  <node pkg="planning" type="real_field_evasion.py"
+        name="real_field_evasion" output="screen">
+    <param name="publish_rate" value="100.0"/>
+    <param name="max_cmd_speed" value="0.65"/>
+    <param name="max_cmd_acc" value="1.2"/>
+    <param name="start_tolerance" value="0.7"/>
+    <param name="wait_for_trigger" value="true"/>
+    <param name="trigger_topic" value="/triger"/>
+  </node>
+
+  <group ns="target">
+    <node pkg="nodelet" type="nodelet" name="manager" args="manager" output="screen">
+      <param name="num_worker_threads" value="8"/>
+    </node>
+
+    <node pkg="nodelet" type="nodelet" name="so3_quadrotor"
+          args="load so3_quadrotor/Nodelet manager" output="screen">
+      <rosparam file="$(find uav_simulator)/config/so3_quadrotor.yaml"/>
+      <param name="init_x" value="0.00"/>
+      <param name="init_y" value="2.10"/>
+      <param name="init_z" value="1.20"/>
+      <param name="max_speed" value="0.9"/>
+      <param name="max_accel" value="1.6"/>
+      <remap from="~odom"   to="odom"/>
+      <remap from="~imu"    to="imu"/>
+      <remap from="~so3cmd" to="so3cmd"/>
+      <remap from="~vis"    to="vis"/>
+    </node>
+
+    <node pkg="nodelet" type="nodelet" name="so3_controller"
+          args="load so3_controller/Nodelet manager" output="screen">
+      <rosparam file="$(find uav_simulator)/config/so3_controller.yaml"/>
+      <remap from="~odom"         to="odom"/>
+      <remap from="~imu"          to="imu"/>
+      <remap from="~so3cmd"       to="so3cmd"/>
+      <remap from="~position_cmd" to="position_cmd"/>
+    </node>
+
+    <node pkg="nodelet" type="nodelet" name="mapping"
+          args="load mapping/Nodelet manager" output="screen">
+      <remap from="~global_map"       to="/global_map"/>
+      <remap from="~gridmap_inflate"  to="gridmap_inflate"/>
+      <param name="resolution"        value="$(arg map_resolution)"/>
+      <param name="inflate_size"      value="2"/>
+      <param name="use_global_map"    value="true"/>
+      <param name="x_length"          value="$(arg map_x_length)"/>
+      <param name="y_length"          value="$(arg map_y_length)"/>
+      <param name="z_length"          value="$(arg map_z_length)"/>
+      <param name="use_mask"          value="false"/>
+    </node>
+
+    <node pkg="odom_visualization" name="odom_visualization"
+          type="odom_visualization" output="screen">
+      <remap from="~odom" to="odom"/>
+      <param name="robot_scale" value="0.45"/>
+      <param name="color_r" value="1.0"/>
+      <param name="color_g" value="0.0"/>
+      <param name="color_b" value="0.0"/>
+    </node>
+  </group>
+
+  <group ns="drone0">
+    <include file="$(find simulation)/launch/uav_simulator_only.launch">
+      <arg name="init_x_" value="0.00"/>
+      <arg name="init_y_" value="1.15"/>
+      <arg name="init_z_" value="1.20"/>
+      <arg name="max_speed_" value="$(arg tracker_vmax)"/>
+      <arg name="max_accel_" value="$(arg tracker_amax)"/>
+    </include>
+    <include file="$(find mapping)/launch/mapping_real.launch">
+      <arg name="resolution_" value="$(arg map_resolution)"/>
+      <arg name="inflate_size_" value="1"/>
+      <arg name="x_length_" value="$(arg map_x_length)"/>
+      <arg name="y_length_" value="$(arg map_y_length)"/>
+      <arg name="z_length_" value="$(arg map_z_length)"/>
+    </include>
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+      <remap from="~gridmap"         to="gridmap"/>
+      <remap from="~gridmap_inflate" to="gridmap_inflate"/>
+    </node>
+    <node pkg="odom_visualization" name="odom_visualization"
+          type="odom_visualization" output="screen">
+      <remap from="~odom" to="odom"/>
+      <param name="robot_scale" value="0.55"/>
+      <param name="color_r" value="0.0"/>
+      <param name="color_g" value="0.5"/>
+      <param name="color_b" value="1.0"/>
+    </node>
+    <node name="drone0_target_dpf" pkg="target_ekf"
+          type="target_dpf_sim_node" output="screen">
+      <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
+      <param name="max_obs_depth" value="4.5"/>
+      <param name="pitch_thr" value="37"/>
+      <param name="drone_id" value="0"/>
+      <param name="num_drones" value="3"/>
+      <param name="dpf_rate" value="20"/>
+      <param name="num_particles" value="500"/>
+      <param name="num_components" value="4"/>
+      <param name="num_em_iters" value="10"/>
+      <param name="check_fov" value="true"/>
+      <param name="miss_detection_num" value="5"/>
+      <param name="neg_obs_ttl_sec" value="3.0"/>
+      <param name="grid_resolution" value="$(arg map_resolution)"/>
+      <param name="grid_map_size_x" value="$(arg map_x_length)"/>
+      <param name="grid_map_size_y" value="$(arg map_y_length)"/>
+      <param name="search_estimation_mode" value="$(arg search_estimation_mode)"/>
+      <param name="invalid_decay_phi_min" value="0.01"/>
+      <param name="invalid_decay_phi_mid" value="0.60"/>
+      <param name="invalid_decay_r_occ" value="-0.02"/>
+      <param name="invalid_decay_r_safe" value="0.60"/>
+      <param name="hotspot_min_drone_dist" value="0.8"/>
+      <param name="hotspot_seed_radius" value="0.8"/>
+      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
+      <param name="search_debug_logs" value="$(arg search_debug_logs)"/>
+      <remap from="~yolo"        to="/target/odom"/>
+      <remap from="~odom"        to="odom"/>
+      <remap from="~target_odom" to="target_ekf_odom"/>
+      <remap from="~global_map"  to="/global_map"/>
+    </node>
+    <include file="$(find planning)/launch/planning.launch">
+      <arg name="rhosVisibility_"  value="1000.0"/>
+      <arg name="rhoTracking_"     value="10.0"/>
+      <arg name="target_name_"     value="/drone0/target_ekf_odom"/>
+      <arg name="drone_id"         value="0"/>
+      <arg name="formation_type_"  value="triangle"/>
+      <arg name="vmax_"            value="$(arg tracker_vmax)"/>
+      <arg name="amax_"            value="$(arg tracker_amax)"/>
+      <arg name="tracking_dist_"   value="$(arg tracking_dist)"/>
+      <arg name="planner_visualization_" value="$(arg planner_visualization)"/>
+    </include>
+  </group>
+
+  <group ns="drone1">
+    <include file="$(find simulation)/launch/uav_simulator_only.launch">
+      <arg name="init_x_" value="-0.55"/>
+      <arg name="init_y_" value="1.85"/>
+      <arg name="init_z_" value="1.20"/>
+      <arg name="max_speed_" value="$(arg tracker_vmax)"/>
+      <arg name="max_accel_" value="$(arg tracker_amax)"/>
+    </include>
+    <include file="$(find mapping)/launch/mapping_real.launch">
+      <arg name="resolution_" value="$(arg map_resolution)"/>
+      <arg name="inflate_size_" value="1"/>
+      <arg name="x_length_" value="$(arg map_x_length)"/>
+      <arg name="y_length_" value="$(arg map_y_length)"/>
+      <arg name="z_length_" value="$(arg map_z_length)"/>
+    </include>
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+      <remap from="~gridmap"         to="gridmap"/>
+      <remap from="~gridmap_inflate" to="gridmap_inflate"/>
+    </node>
+    <node pkg="odom_visualization" name="odom_visualization"
+          type="odom_visualization" output="screen">
+      <remap from="~odom" to="odom"/>
+      <param name="robot_scale" value="0.55"/>
+      <param name="color_r" value="0.0"/>
+      <param name="color_g" value="0.8"/>
+      <param name="color_b" value="0.2"/>
+    </node>
+    <node name="drone1_target_dpf" pkg="target_ekf"
+          type="target_dpf_sim_node" output="screen">
+      <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
+      <param name="max_obs_depth" value="4.5"/>
+      <param name="pitch_thr" value="37"/>
+      <param name="drone_id" value="1"/>
+      <param name="num_drones" value="3"/>
+      <param name="dpf_rate" value="20"/>
+      <param name="num_particles" value="500"/>
+      <param name="num_components" value="4"/>
+      <param name="num_em_iters" value="10"/>
+      <param name="check_fov" value="true"/>
+      <param name="miss_detection_num" value="5"/>
+      <param name="neg_obs_ttl_sec" value="3.0"/>
+      <param name="grid_resolution" value="$(arg map_resolution)"/>
+      <param name="grid_map_size_x" value="$(arg map_x_length)"/>
+      <param name="grid_map_size_y" value="$(arg map_y_length)"/>
+      <param name="search_estimation_mode" value="$(arg search_estimation_mode)"/>
+      <param name="invalid_decay_phi_min" value="0.01"/>
+      <param name="invalid_decay_phi_mid" value="0.60"/>
+      <param name="invalid_decay_r_occ" value="-0.02"/>
+      <param name="invalid_decay_r_safe" value="0.60"/>
+      <param name="hotspot_min_drone_dist" value="0.8"/>
+      <param name="hotspot_seed_radius" value="0.8"/>
+      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
+      <param name="search_debug_logs" value="$(arg search_debug_logs)"/>
+      <remap from="~yolo"        to="/target/odom"/>
+      <remap from="~odom"        to="odom"/>
+      <remap from="~target_odom" to="target_ekf_odom"/>
+      <remap from="~global_map"  to="/global_map"/>
+    </node>
+    <include file="$(find planning)/launch/planning.launch">
+      <arg name="rhosVisibility_"  value="1000.0"/>
+      <arg name="rhoTracking_"     value="10.0"/>
+      <arg name="target_name_"     value="/drone1/target_ekf_odom"/>
+      <arg name="drone_id"         value="1"/>
+      <arg name="formation_type_"  value="triangle"/>
+      <arg name="vmax_"            value="$(arg tracker_vmax)"/>
+      <arg name="amax_"            value="$(arg tracker_amax)"/>
+      <arg name="tracking_dist_"   value="$(arg tracking_dist)"/>
+      <arg name="planner_visualization_" value="$(arg planner_visualization)"/>
+    </include>
+  </group>
+
+  <group ns="drone2">
+    <include file="$(find simulation)/launch/uav_simulator_only.launch">
+      <arg name="init_x_" value="0.55"/>
+      <arg name="init_y_" value="1.85"/>
+      <arg name="init_z_" value="1.20"/>
+      <arg name="max_speed_" value="$(arg tracker_vmax)"/>
+      <arg name="max_accel_" value="$(arg tracker_amax)"/>
+    </include>
+    <include file="$(find mapping)/launch/mapping_real.launch">
+      <arg name="resolution_" value="$(arg map_resolution)"/>
+      <arg name="inflate_size_" value="1"/>
+      <arg name="x_length_" value="$(arg map_x_length)"/>
+      <arg name="y_length_" value="$(arg map_y_length)"/>
+      <arg name="z_length_" value="$(arg map_z_length)"/>
+    </include>
+    <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
+      <remap from="~gridmap"         to="gridmap"/>
+      <remap from="~gridmap_inflate" to="gridmap_inflate"/>
+    </node>
+    <node pkg="odom_visualization" name="odom_visualization"
+          type="odom_visualization" output="screen">
+      <remap from="~odom" to="odom"/>
+      <param name="robot_scale" value="0.55"/>
+      <param name="color_r" value="1.0"/>
+      <param name="color_g" value="0.6"/>
+      <param name="color_b" value="0.0"/>
+    </node>
+    <node name="drone2_target_dpf" pkg="target_ekf"
+          type="target_dpf_sim_node" output="screen">
+      <rosparam command="load" file="$(find target_ekf)/config/camera.yaml"/>
+      <param name="max_obs_depth" value="4.5"/>
+      <param name="pitch_thr" value="37"/>
+      <param name="drone_id" value="2"/>
+      <param name="num_drones" value="3"/>
+      <param name="dpf_rate" value="20"/>
+      <param name="num_particles" value="500"/>
+      <param name="num_components" value="4"/>
+      <param name="num_em_iters" value="10"/>
+      <param name="check_fov" value="true"/>
+      <param name="miss_detection_num" value="5"/>
+      <param name="neg_obs_ttl_sec" value="3.0"/>
+      <param name="grid_resolution" value="$(arg map_resolution)"/>
+      <param name="grid_map_size_x" value="$(arg map_x_length)"/>
+      <param name="grid_map_size_y" value="$(arg map_y_length)"/>
+      <param name="search_estimation_mode" value="$(arg search_estimation_mode)"/>
+      <param name="invalid_decay_phi_min" value="0.01"/>
+      <param name="invalid_decay_phi_mid" value="0.60"/>
+      <param name="invalid_decay_r_occ" value="-0.02"/>
+      <param name="invalid_decay_r_safe" value="0.60"/>
+      <param name="hotspot_min_drone_dist" value="0.8"/>
+      <param name="hotspot_seed_radius" value="0.8"/>
+      <param name="hotspot_invalid_reject_ratio" value="1.0"/>
+      <param name="search_debug_logs" value="$(arg search_debug_logs)"/>
+      <remap from="~yolo"        to="/target/odom"/>
+      <remap from="~odom"        to="odom"/>
+      <remap from="~target_odom" to="target_ekf_odom"/>
+      <remap from="~global_map"  to="/global_map"/>
+    </node>
+    <include file="$(find planning)/launch/planning.launch">
+      <arg name="rhosVisibility_"  value="1000.0"/>
+      <arg name="rhoTracking_"     value="10.0"/>
+      <arg name="target_name_"     value="/drone2/target_ekf_odom"/>
+      <arg name="drone_id"         value="2"/>
+      <arg name="formation_type_"  value="triangle"/>
+      <arg name="vmax_"            value="$(arg tracker_vmax)"/>
+      <arg name="amax_"            value="$(arg tracker_amax)"/>
+      <arg name="tracking_dist_"   value="$(arg tracking_dist)"/>
+      <arg name="planner_visualization_" value="$(arg planner_visualization)"/>
+    </include>
+  </group>
+</launch>

@@ -14,6 +14,7 @@
   <arg name="weight_formation_" default="10000.0"/><!-- 100000.0-->
   <arg name="formation_grad_clip_" default="15.0"/><!-- 编队梯度限幅阈值，<=0 表示关闭 -->
   <arg name="planner_visualization_" default="false"/>
+  <arg name="tracking_dist_" default="3.0"/>
 
   <node pkg="nodelet" type="nodelet" name="planning" args="load planning/Nodelet manager" output="screen">
     <remap from="~odom" to="odom"/>
@@ -40,7 +41,7 @@
     <param name="clearance_d"    value="0.5"/><!-- 距离障碍物的安全间隙 -->
     <param name="use_soft_constraint" value="true"/><!-- true: ESDF软约束, false: 走廊硬约束 -->
     <param name="tolerance_d"    value="0.5"/>
-    <param name="tracking_dist"  value="3.0"/><!-- 希望维持的跟踪距离 -->
+    <param name="tracking_dist"  value="$(arg tracking_dist_)"/><!-- 希望维持的跟踪距离 -->
     <param name="tracking_dur"   value="3.0"/><!-- 跟踪规划规划未来3s的轨迹 -->
     <param name="tracking_dt"    value="0.2"/><!-- 采样间隔，用于计算代价 -->
     <param name="obs_clip_enable" value="true"/><!-- 前端路径截断到观测半径内 -->
