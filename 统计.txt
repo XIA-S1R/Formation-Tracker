@@ -1,2 +1,18 @@
 拟合预测法：成功率：89.5% 平均重捕用时：0.687s  最大重捕用时：3.424s
 本方法：成功率：96.4% 平均重捕用时：1.066s  最大重捕用时：9.147s
+
+roslaunch simulation tracking_real_triangle.launch \
+  drone0_ip:=192.168.1.101 \
+  drone1_ip:=192.168.1.102 \
+  drone2_ip:=192.168.1.103 \
+  use_mock_map:=false \
+  static_map_file:=/path/to/site_map.pcd
+
+  roslaunch real_uav_bridge onboard_tracker_px4.launch \
+  drone_id:=0 \
+  ground_ip:=192.168.1.10 \
+  cmd_listen_port:=18000 \
+  ground_port:=18100 \
+  odom_topic:=/vins_estimator/imu_propagate \
+  start_mavros:=true \
+  fcu_url:=/dev/ttyTHS1:921600

@@ -1,0 +1,26 @@
+<launch>
+  <arg name="num_worker_threads_" default="4"/>
+  <arg name="resolution_" default="0.15"/>
+  <arg name="inflate_size_" default="1"/>
+  <arg name="x_length_" default="42.0"/>
+  <arg name="y_length_" default="40.0"/>
+  <arg name="z_length_" default="20.0"/>
+  <arg name="use_mask_" default="false"/>
+
+  <node pkg="nodelet" type="nodelet" name="manager" args="manager" output="screen">
+    <param name="num_worker_threads" value="$(arg num_worker_threads_)"/>
+  </node>
+
+  <node pkg="nodelet" type="nodelet" name="mapping"
+        args="load mapping/Nodelet manager" output="screen">
+    <remap from="~global_map" to="/global_map"/>
+    <remap from="~gridmap_inflate" to="gridmap_inflate"/>
+    <param name="use_global_map" value="true"/>
+    <param name="resolution" value="$(arg resolution_)"/>
+    <param name="inflate_size" value="$(arg inflate_size_)"/>
+    <param name="x_length" value="$(arg x_length_)"/>
+    <param name="y_length" value="$(arg y_length_)"/>
+    <param name="z_length" value="$(arg z_length_)"/>
+    <param name="use_mask" value="$(arg use_mask_)"/>
+  </node>
+</launch>

@@ -6,6 +6,7 @@ add_compile_options(-std=c++14)
 find_package(catkin REQUIRED COMPONENTS
   nav_msgs
   geometry_msgs
+  mavros_msgs
   message_generation
 )
 
@@ -19,6 +20,7 @@ add_message_files(
   SO3Command.msg
   AuxCommand.msg
   Px4ctrlDebug.msg
+  Px4ctrlData.msg
   TakeoffLand.msg
 )
 
@@ -26,10 +28,11 @@ generate_messages(
   DEPENDENCIES
   geometry_msgs
   nav_msgs
+  mavros_msgs
 )
 
 catkin_package(
-  CATKIN_DEPENDS message_runtime geometry_msgs nav_msgs
+  CATKIN_DEPENDS message_runtime geometry_msgs nav_msgs mavros_msgs
 )
 
 include_directories(

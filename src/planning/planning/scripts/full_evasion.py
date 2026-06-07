@@ -12,6 +12,7 @@ import math
 
 import numpy as np
 import rospy
+from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from quadrotor_msgs.msg import PositionCommand
 
@@ -98,14 +99,19 @@ class FullEvasionDirectCmd:
         self.max_cmd_acc = float(rospy.get_param('~max_cmd_acc', 5.0))
         self.traj_id = int(rospy.get_param('~trajectory_id', 1))
         self.yaw = float(rospy.get_param('~yaw', 0.0))
+        self.wait_for_trigger = bool(rospy.get_param('~wait_for_trigger', False))
+        self.trigger_topic = str(rospy.get_param('~trigger_topic', '/triger'))
         self.hover_x = rospy.get_param('~hover_x', None)
         self.hover_y = rospy.get_param('~hover_y', None)
         self.hover_z = rospy.get_param('~hover_z', None)
 
         self.cmd_pub = rospy.Publisher('/target/position_cmd', PositionCommand, queue_size=10)
         self.target_pos = None
+        self.trigger_received = False
 
         rospy.Subscriber('/target/odom', Odometry, self.odom_cb)
+        if self.wait_for_trigger:
+            rospy.Subscriber(self.trigger_topic, PoseStamped, self.trigger_cb)
 
         rospy.loginfo('[full_evasion] waiting for target odom...')
         t0 = rospy.Time.now()
@@ -139,6 +145,18 @@ class FullEvasionDirectCmd:
     def odom_cb(self, msg):
         p = msg.pose.pose.position
         self.target_pos = np.array([p.x, p.y, p.z], dtype=float)
+
+    def trigger_cb(self, _msg):
+        self.trigger_received = True
+
+    def wait_for_start_trigger(self):
+        if not self.wait_for_trigger:
+            return
+        rospy.loginfo('[full_evasion] waiting for trigger on %s...', self.trigger_topic)
+        rate = rospy.Rate(20.0)
+        while not rospy.is_shutdown() and not self.trigger_received:
+            rate.sleep()
+        rospy.loginfo('[full_evasion] trigger received')
 
     @staticmethod
     def build_derivatives(ts, ps):
@@ -226,6 +244,7 @@ class FullEvasionDirectCmd:
     def run(self):
         rate = rospy.Rate(max(1.0, self.publish_rate))
         rospy.sleep(0.2)
+        self.wait_for_start_trigger()
         start_wall = rospy.Time.now()
         rospy.loginfo('[full_evasion] start direct position_cmd replay, duration=%.2fs, samples=%d',
                       self.total_duration, len(self.ref_t))

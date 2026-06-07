@@ -1,0 +1,53 @@
+<launch>
+  <arg name="drone0_ip" default="192.168.1.101"/>
+  <arg name="drone1_ip" default="192.168.1.102"/>
+  <arg name="drone2_ip" default="192.168.1.103"/>
+  <arg name="drone0_cmd_port" default="18000"/>
+  <arg name="drone1_cmd_port" default="18001"/>
+  <arg name="drone2_cmd_port" default="18002"/>
+  <arg name="drone0_ground_port" default="18100"/>
+  <arg name="drone1_ground_port" default="18101"/>
+  <arg name="drone2_ground_port" default="18102"/>
+  <arg name="trigger_max_age" default="30.0"/>
+
+  <group ns="drone0">
+    <node pkg="real_uav_bridge" type="cmd_odom_ground_bridge" name="ground_bridge" output="screen">
+      <param name="drone_ip" value="$(arg drone0_ip)"/>
+      <param name="cmd_port" value="$(arg drone0_cmd_port)"/>
+      <param name="listen_port" value="$(arg drone0_ground_port)"/>
+      <param name="cmd_topic" value="position_cmd"/>
+      <param name="odom_topic" value="odom"/>
+      <param name="trigger_topic" value="/drone0/traj_start_trigger"/>
+    </node>
+  </group>
+
+  <group ns="drone1">
+    <node pkg="real_uav_bridge" type="cmd_odom_ground_bridge" name="ground_bridge" output="screen">
+      <param name="drone_ip" value="$(arg drone1_ip)"/>
+      <param name="cmd_port" value="$(arg drone1_cmd_port)"/>
+      <param name="listen_port" value="$(arg drone1_ground_port)"/>
+      <param name="cmd_topic" value="position_cmd"/>
+      <param name="odom_topic" value="odom"/>
+      <param name="trigger_topic" value="/drone1/traj_start_trigger"/>
+    </node>
+  </group>
+
+  <group ns="drone2">
+    <node pkg="real_uav_bridge" type="cmd_odom_ground_bridge" name="ground_bridge" output="screen">
+      <param name="drone_ip" value="$(arg drone2_ip)"/>
+      <param name="cmd_port" value="$(arg drone2_cmd_port)"/>
+      <param name="listen_port" value="$(arg drone2_ground_port)"/>
+      <param name="cmd_topic" value="position_cmd"/>
+      <param name="odom_topic" value="odom"/>
+      <param name="trigger_topic" value="/drone2/traj_start_trigger"/>
+    </node>
+  </group>
+
+  <node pkg="real_uav_bridge" type="trigger_all_ready_node" name="real_uav_trigger_all_ready" output="screen">
+    <param name="num_drones" value="3"/>
+    <param name="input_topic_prefix" value="/drone"/>
+    <param name="input_topic_suffix" value="/traj_start_trigger"/>
+    <param name="output_topic" value="/triger"/>
+    <param name="max_trigger_age" value="$(arg trigger_max_age)"/>
+  </node>
+</launch>

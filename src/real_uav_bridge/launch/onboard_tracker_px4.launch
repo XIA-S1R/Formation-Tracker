@@ -1,0 +1,36 @@
+<launch>
+  <arg name="drone_id" default="0"/>
+  <arg name="ground_ip" default="192.168.1.10"/>
+  <arg name="cmd_listen_port" default="18000"/>
+  <arg name="ground_port" default="18100"/>
+  <arg name="odom_topic" default="/vins_estimator/imu_propagate"/>
+  <arg name="tracker_cmd_topic" default="/tracker_cmd/position_cmd"/>
+  <arg name="trigger_topic" default="/traj_start_trigger"/>
+  <arg name="odom_send_hz" default="50.0"/>
+  <arg name="start_mavros" default="false"/>
+  <arg name="fcu_url" default="/dev/ttyTHS1:921600"/>
+  <arg name="gcs_url" default=""/>
+  <arg name="ctrl_param_file" default="$(find px4ctrl)/config/ctrl_param_fpv.yaml"/>
+
+  <include if="$(arg start_mavros)" file="$(find mavros)/launch/px4.launch">
+    <arg name="fcu_url" value="$(arg fcu_url)"/>
+    <arg name="gcs_url" value="$(arg gcs_url)"/>
+  </include>
+
+  <node pkg="real_uav_bridge" type="cmd_odom_onboard_bridge"
+        name="cmd_odom_onboard_bridge_$(arg drone_id)" output="screen">
+    <param name="ground_ip" value="$(arg ground_ip)"/>
+    <param name="ground_port" value="$(arg ground_port)"/>
+    <param name="cmd_listen_port" value="$(arg cmd_listen_port)"/>
+    <param name="cmd_topic" value="$(arg tracker_cmd_topic)"/>
+    <param name="odom_topic" value="$(arg odom_topic)"/>
+    <param name="trigger_topic" value="$(arg trigger_topic)"/>
+    <param name="odom_send_hz" value="$(arg odom_send_hz)"/>
+  </node>
+
+  <node pkg="px4ctrl" type="px4ctrl_node" name="px4ctrl" output="screen">
+    <rosparam command="load" file="$(arg ctrl_param_file)"/>
+    <remap from="~odom" to="$(arg odom_topic)"/>
+    <remap from="~cmd" to="$(arg tracker_cmd_topic)"/>
+  </node>
+</launch>
