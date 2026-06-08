@@ -12,16 +12,24 @@ from quadrotor_msgs.msg import PositionCommand
 
 
 WAYPOINTS = [
-    (0.0, 0.00, 2.10, 1.20, 0.0),
-    (2.0, 0.90, 2.10, 1.20, 0.0),
-    (5.5, 2.55, 1.65, 1.25, math.radians(-25.0)),
-    (9.5, 2.55, -0.35, 1.25, math.radians(-90.0)),
-    (14.0, 1.10, -1.95, 1.20, math.radians(-140.0)),
-    (17.5, -0.80, -1.95, 1.25, math.radians(180.0)),
-    (21.5, -2.65, -1.10, 1.30, math.radians(155.0)),
-    (26.0, -2.65, 1.25, 1.30, math.radians(90.0)),
-    (29.0, -1.25, 1.65, 1.25, math.radians(20.0)),
-    (32.5, 0.40, 2.10, 1.20, 0.0),
+    (0.0, 0.00, 2.10, 0.80, 0.0),
+    (1.5, 0.65, 1.65, 0.80, math.radians(-22.5)),
+    (4.5, 2.10, 1.05, 0.80, math.radians(-90.0)),
+    (7.0, 2.10, -0.15, 0.80, math.radians(180.0)),
+    (10.5, 0.30, -0.15, 0.80, math.radians(180.0)),
+    (14.0, -1.50, -0.15, 0.80, math.radians(180.0)),
+    (16.5, -2.85, -0.15, 0.80, math.radians(90.0)),
+    (19.0, -2.85, 1.05, 0.80, math.radians(0.0)),
+    (21.5, -1.45, 1.05, 0.80, math.radians(-90.0)),
+    (26.5, -1.45, -1.55, 0.80, math.radians(-42.5)),
+    (28.0, -0.85, -2.10, 0.80, math.radians(0.0)),
+    (30.5, 0.55, -2.10, 0.80, math.radians(90.0)),
+    (32.5, 0.55, -0.95, 0.80, math.radians(19.7)),
+    (35.5, 1.95, -0.45, 0.80, math.radians(90.0)),
+    (38.0, 1.95, 0.95, 0.80, math.radians(161.6)),
+    (41.0, 0.45, 1.45, 0.80, math.radians(135.0)),
+    (42.5, -0.15, 2.05, 0.80, math.radians(5.2)),
+    (44.0, 0.40, 2.10, 0.80, math.radians(5.2)),
 ]
 
 
@@ -35,9 +43,11 @@ class RealFieldEvasion:
         self.start_tolerance = float(rospy.get_param("~start_tolerance", 0.6))
         self.max_cmd_speed = float(rospy.get_param("~max_cmd_speed", 0.65))
         self.max_cmd_acc = float(rospy.get_param("~max_cmd_acc", 1.2))
+        self.target_z = float(rospy.get_param("~target_z", 0.8))
         self.traj_id = int(rospy.get_param("~trajectory_id", 20))
         self.wait_for_trigger = bool(rospy.get_param("~wait_for_trigger", False))
         self.trigger_topic = str(rospy.get_param("~trigger_topic", "/triger"))
+        self.post_trigger_delay = max(0.0, float(rospy.get_param("~post_trigger_delay", 0.0)))
 
         self.cmd_pub = rospy.Publisher("/target/position_cmd", PositionCommand, queue_size=10)
         self.target_pos = None
@@ -56,6 +66,7 @@ class RealFieldEvasion:
 
         self.ref_t = np.array([p[0] for p in WAYPOINTS], dtype=float)
         self.ref_p = np.array([[p[1], p[2], p[3]] for p in WAYPOINTS], dtype=float)
+        self.ref_p[:, 2] = self.target_z
         self.ref_yaw = np.unwrap(np.array([p[4] for p in WAYPOINTS], dtype=float))
         self.ref_v, self.ref_a = self.build_derivatives(self.ref_t, self.ref_p)
         self.ref_yaw_rate, _ = self.build_derivatives(self.ref_t, self.ref_yaw.reshape((-1, 1)))
@@ -98,6 +109,12 @@ class RealFieldEvasion:
         while not rospy.is_shutdown() and not self.trigger_received:
             rate.sleep()
         rospy.loginfo("[real_field_evasion] trigger received")
+        if self.post_trigger_delay > 1e-6:
+            rospy.loginfo(
+                "[real_field_evasion] waiting %.2fs after trigger before evasion",
+                self.post_trigger_delay,
+            )
+            rospy.sleep(self.post_trigger_delay)
 
     @staticmethod
     def build_derivatives(ts, values):

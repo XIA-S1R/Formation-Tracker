@@ -15,6 +15,8 @@
   <arg name="formation_grad_clip_" default="15.0"/><!-- 编队梯度限幅阈值，<=0 表示关闭 -->
   <arg name="planner_visualization_" default="false"/>
   <arg name="tracking_dist_" default="3.0"/>
+  <arg name="search_altitude_floor_" default="2.0"/>
+  <arg name="clearance_d_" default="0.5"/>
 
   <node pkg="nodelet" type="nodelet" name="planning" args="load planning/Nodelet manager" output="screen">
     <remap from="~odom" to="odom"/>
@@ -38,7 +40,7 @@
     <param name="rhoTracking"    value="$(arg rhoTracking_)"/><!-- 追踪成本的权重 -->
     <param name="rhosVisibility" value="$(arg rhosVisibility_)"/><!-- 可视性成本的权重 -->
     <param name="theta_clearance" value="0.8"/><!-- 距离可视区域边界的安全间隙 -->
-    <param name="clearance_d"    value="0.5"/><!-- 距离障碍物的安全间隙 -->
+    <param name="clearance_d"    value="$(arg clearance_d_)"/><!-- 距离障碍物的安全间隙 -->
     <param name="use_soft_constraint" value="true"/><!-- true: ESDF软约束, false: 走廊硬约束 -->
     <param name="tolerance_d"    value="0.5"/>
     <param name="tracking_dist"  value="$(arg tracking_dist_)"/><!-- 希望维持的跟踪距离 -->
@@ -47,10 +49,14 @@
     <param name="obs_clip_enable" value="true"/><!-- 前端路径截断到观测半径内 -->
     <param name="obs_clip_range"  value="7.0"/><!-- 观测半径（建议比 mapping/sensor_range 小） -->
     <param name="obs_clip_margin" value="0.5"/><!-- 裁剪边界留白 -->
+    <param name="retry_dense_sampling_enable" value="true"/><!-- validcheck失败后临时提高优化采样密度重试 -->
+    <param name="retry_dense_sampling_multiplier" value="2"/>
+    <param name="retry_dense_sampling_max_k" value="32"/>
     <param name="post_reacquire_boost_sec" value="3.0"/><!-- 退出搜索后暂时关闭编队代价 -->
     <param name="formation_heading_speed_thresh" value="0.2"/><!-- 目标低速时保持上次编队朝向 -->
     <param name="search_yaw_scan_range_deg" value="45.0"/><!-- 搜索模式偏航扫描半幅 -->
     <param name="search_yaw_scan_freq_hz" value="0.25"/><!-- 搜索模式偏航扫描频率 -->
+    <param name="search_altitude_floor" value="$(arg search_altitude_floor_)"/><!-- 搜索模式安全高度下限 -->
     <param name="debug"          value="false"/>
     <param name="planner_visualization" value="$(arg planner_visualization_)"/>
 

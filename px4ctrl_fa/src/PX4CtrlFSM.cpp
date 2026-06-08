@@ -9,7 +9,6 @@ PX4CtrlFSM::PX4CtrlFSM(Parameter_t &param_, Controller &controller_, const ros::
 {
     // 默认手动飞行 并将悬停状态归零
 	state = MANUAL_CTRL;
-    state = MANUAL_CTRL;
 	hover_pose.setZero();
     px4ctrl_data_pub_ = nh_.advertise<quadrotor_msgs::Px4ctrlData>("/px4ctrl/data_to_gs", 10);
     px4ctrl_data_pub_timer_ = nh_.createTimer(ros::Duration(0.05), boost::bind(&PX4CtrlFSM::px4ctrlDataPub, this));
@@ -45,7 +44,6 @@ void PX4CtrlFSM::process()
 
 	ros::Time now_time = ros::Time::now();
 	Controller_Output_t u;
-	bool rotor_low_speed_during_land = false;
 	Desired_State_t des(odom_data);         // 期望姿态
 	bool rotor_low_speed_during_land = false;
 
@@ -59,20 +57,17 @@ void PX4CtrlFSM::process()
 		{
             // 定位检查
 			if (!odom_is_received(now_time))
-			if (!odom_is_received(now_time))
 			{
 				ROS_ERROR("[px4ctrl] Reject AUTO_HOVER(L2). No odom!");
 				break;
 			}
             // 命令检查
 			if (cmd_is_received(now_time))
-			if (cmd_is_received(now_time))
 			{
 				ROS_ERROR("[px4ctrl] Reject AUTO_HOVER(L2). You are sending commands before toggling into AUTO_HOVER, which is not allowed. Stop sending commands now!");
 				break;
 			}
             // 当前速度检查
-			if (odom_data.v.norm() > 3.0)
 			if (odom_data.v.norm() > 3.0)
 			{
 				ROS_ERROR("[px4ctrl] Reject AUTO_HOVER(L2). Odom_Vel=%fm/s, which seems that the locolization module goes wrong!", odom_data.v.norm());
@@ -139,7 +134,6 @@ void PX4CtrlFSM::process()
 			}
             // 无人机解锁
 			if (param.takeoff_land.enable_auto_arm)
-			if (param.takeoff_land.enable_auto_arm)
 			{
 				toggle_arm_disarm(true);
 			}
@@ -165,7 +159,6 @@ void PX4CtrlFSM::process()
 	{
         // 退出自动悬停模式判定
 		if (!rc_data.is_hover_mode || !odom_is_received(now_time))
-		if (!rc_data.is_hover_mode || !odom_is_received(now_time))
 		{
 			state = MANUAL_CTRL;
 			toggle_offboard_mode(false);
@@ -175,7 +168,6 @@ void PX4CtrlFSM::process()
         // 命令控制模式判定
 		else if (rc_data.is_command_mode && cmd_is_received(now_time))
 		{
-			// if (state_data.current_state.mode == "GUIDED_NOGPS")
 			if (state_data.current_state.mode == "OFFBOARD")
 			{
 				state = CMD_CTRL;
@@ -215,7 +207,6 @@ void PX4CtrlFSM::process()
 		set_hov_with_odom();
         // 若丢失位置信息，则直接强行进入手动控制模式
 		if (!rc_data.is_hover_mode || !odom_is_received(now_time))
-		if (!rc_data.is_hover_mode || !odom_is_received(now_time))
 		{
 			state = MANUAL_CTRL;
 			toggle_offboard_mode(false);
@@ -223,7 +214,6 @@ void PX4CtrlFSM::process()
 			ROS_WARN("[px4ctrl] From CMD_CTRL(L3) to MANUAL_CTRL(L1)!");
 		}
         // 无命令输入，则进入自动悬停模式
-		else if (!rc_data.is_command_mode || !cmd_is_received(now_time))
 		else if (!rc_data.is_command_mode || !cmd_is_received(now_time))
 		{
 			state = AUTO_HOVER;
@@ -320,8 +310,7 @@ void PX4CtrlFSM::process()
 
 		break;
 	}
-    case EMERGENCY_LAND:
-    {
+    case EMERGENCY_LAND :    // todo 紧急降落逻辑未编写
     {
         return;
     }
@@ -519,15 +508,9 @@ void PX4CtrlFSM::set_hov_with_rc()
     // 按步长进行自动悬停的遥控器控制
     // 该方法产生的速度与推杆量大小无关，只与推杆方向有关
 	hover_pose(0) += rc_data.ch[param.rule_pitch_] * param.max_manual_vel * delta_t * (param.rc_reverse.pitch ? 1 : -1);
-	hover_pose(0) += rc_data.ch[param.rule_pitch_] * param.max_manual_vel * delta_t * (param.rc_reverse.pitch ? 1 : -1);
 	hover_pose(1) += rc_data.ch[param.rule_roll_] * param.max_manual_vel * delta_t * (param.rc_reverse.roll ? 1 : -1);
 	hover_pose(2) += rc_data.ch[param.rule_throttle_] * param.max_manual_vel * delta_t * (param.rc_reverse.throttle ? 1 : -1);
 	hover_pose(3) += rc_data.ch[param.rule_yaw_] * param.max_manual_vel * delta_t * (param.rc_reverse.yaw ? 1 : -1);
-
-    // 在此处强制限制了z轴的偏移量，但是具体控制还不清楚有没有限制
-	if (hover_pose(2) < -0.3)
-	if (hover_pose(2) < -0.3)
-		hover_pose(2) = -0.3;
 
 	// if (param.print_dbg)
 	// {
@@ -583,6 +566,18 @@ bool PX4CtrlFSM::recv_new_odom()
 	}
 
 	return false;
+}
+
+bool PX4CtrlFSM::fcu_in_offboard() const
+{
+	return state_data.current_state.mode == "OFFBOARD";
+}
+
+bool PX4CtrlFSM::fcu_entered_offboard() const
+{
+	return state_data.have_last_state &&
+		   state_data.last_state.mode != "OFFBOARD" &&
+		   state_data.current_state.mode == "OFFBOARD";
 }
 
 void PX4CtrlFSM::publish_bodyrate_ctrl(const Controller_Output_t &u, const ros::Time &stamp)
@@ -696,11 +691,10 @@ bool PX4CtrlFSM::toggle_emergency_land() {
     }
 
     cmd.request.custom_mode = "AUTO.LAND";
-    if (!(set_FCU_mode_srv.call(cmd) && cmd.response.mode_sent)){
+    if (!set_FCU_mode_srv.call(cmd) && cmd.response.mode_sent){
         ROS_ERROR_STREAM("[PX4Ctrl] : Emergency Land mode switch rejected by px4 !!!!!");
         return false;
     }
-    return true;
 }
 
 // Reboot Fly Ctrl Unit
@@ -739,9 +733,6 @@ void PX4CtrlFSM::px4ctrlDataPub() {
             break;
         case AUTO_LAND:
             msg.px4_ctrl_mode = 5;
-            break;
-        case EMERGENCY_LAND:
-            msg.px4_ctrl_mode = 6;
             break;
     };
     msg.px4_ctrl_extended_state = extended_state_data.current_extended_state;

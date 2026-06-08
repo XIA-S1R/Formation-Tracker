@@ -6,18 +6,42 @@
   <arg name="search_debug_logs" default="false"/>
   <arg name="static_map_file" default="$(find real_uav_bridge)/maps/generated/real_field_obstacles.csv"/>
   <arg name="map_x_length" default="6.3"/>
-  <arg name="map_y_length" default="5.55"/>
-  <arg name="map_z_length" default="5.0"/>
+  <arg name="map_y_length" default="5.3"/>
+  <arg name="map_z_length" default="3.0"/>
   <arg name="map_resolution" default="0.15"/>
   <arg name="tracker_vmax" default="0.8"/>
   <arg name="tracker_amax" default="1.6"/>
   <arg name="target_z" default="0.8"/>
-  <arg name="tracker_init_z" default="$(arg target_z)"/>
-  <arg name="tracker_search_altitude" default="$(arg target_z)"/>
-  <arg name="tracking_dist" default="0.6"/>
-  <arg name="trigger_delay" default="5.0"/>
+  <arg name="tracker_search_altitude" default="1.0"/>
+  <arg name="tracking_dist" default="0.9"/>
+  <arg name="start_target_evasion" default="true"/>
+  <arg name="target_wait_for_trigger" default="true"/>
+  <arg name="target_post_trigger_delay" default="3.0"/>
   <arg name="rviz" default="false"/>
   <arg name="rviz_config" default="$(find simulation)/config/tracking_real_field_sim.rviz"/>
+
+  <arg name="enable_mocap_udp" default="true"/>
+  <arg name="mocap_listen_ip" default="0.0.0.0"/>
+  <arg name="drone0_mocap_port" default="5005"/>
+  <arg name="drone1_mocap_port" default="5006"/>
+  <arg name="drone2_mocap_port" default="5007"/>
+  <arg name="drone0_mocap_tracker" default=""/>
+  <arg name="drone1_mocap_tracker" default=""/>
+  <arg name="drone2_mocap_tracker" default=""/>
+
+  <arg name="enable_position_cmd_udp" default="true"/>
+  <arg name="drone0_ip" default="192.168.1.101"/>
+  <arg name="drone1_ip" default="192.168.1.102"/>
+  <arg name="drone2_ip" default="192.168.1.103"/>
+  <arg name="drone0_cmd_port" default="18000"/>
+  <arg name="drone1_cmd_port" default="18001"/>
+  <arg name="drone2_cmd_port" default="18002"/>
+  <arg name="drone0_ground_port" default="18100"/>
+  <arg name="drone1_ground_port" default="18101"/>
+  <arg name="drone2_ground_port" default="18102"/>
+  <arg name="position_cmd_enable_topic" default="/triger"/>
+  <arg name="send_position_cmd_before_trigger" default="false"/>
+  <arg name="trigger_max_age" default="30.0"/>
 
   <node if="$(arg rviz)" pkg="rviz" type="rviz" name="rviz"
         args="-d $(arg rviz_config)" output="screen"/>
@@ -29,28 +53,56 @@
     <param name="publish_hz" value="1.0"/>
   </node>
 
+  <include if="$(arg enable_mocap_udp)"
+           file="$(find real_uav_bridge)/launch/mocap_udp_odom_triangle.launch">
+    <arg name="listen_ip" value="$(arg mocap_listen_ip)"/>
+    <arg name="drone0_port" value="$(arg drone0_mocap_port)"/>
+    <arg name="drone1_port" value="$(arg drone1_mocap_port)"/>
+    <arg name="drone2_port" value="$(arg drone2_mocap_port)"/>
+    <arg name="drone0_tracker" value="$(arg drone0_mocap_tracker)"/>
+    <arg name="drone1_tracker" value="$(arg drone1_mocap_tracker)"/>
+    <arg name="drone2_tracker" value="$(arg drone2_mocap_tracker)"/>
+  </include>
+
+  <include if="$(arg enable_position_cmd_udp)"
+           file="$(find real_uav_bridge)/launch/position_cmd_sender_triangle.launch">
+    <arg name="drone0_ip" value="$(arg drone0_ip)"/>
+    <arg name="drone1_ip" value="$(arg drone1_ip)"/>
+    <arg name="drone2_ip" value="$(arg drone2_ip)"/>
+    <arg name="drone0_cmd_port" value="$(arg drone0_cmd_port)"/>
+    <arg name="drone1_cmd_port" value="$(arg drone1_cmd_port)"/>
+    <arg name="drone2_cmd_port" value="$(arg drone2_cmd_port)"/>
+    <arg name="drone0_ground_port" value="$(arg drone0_ground_port)"/>
+    <arg name="drone1_ground_port" value="$(arg drone1_ground_port)"/>
+    <arg name="drone2_ground_port" value="$(arg drone2_ground_port)"/>
+    <arg name="enable_topic" value="$(arg position_cmd_enable_topic)"/>
+    <arg name="send_before_enable" value="$(arg send_position_cmd_before_trigger)"/>
+  </include>
+
+  <node pkg="real_uav_bridge" type="trigger_all_ready_node"
+        name="real_field_all_trackers_ready_trigger" output="screen">
+    <param name="num_drones" value="3"/>
+    <param name="input_topic_prefix" value="/drone"/>
+    <param name="input_topic_suffix" value="/traj_start_trigger"/>
+    <param name="output_topic" value="/triger"/>
+    <param name="max_trigger_age" value="$(arg trigger_max_age)"/>
+    <param name="publish_once" value="true"/>
+  </node>
+
   <node pkg="topic_tools" type="relay" name="swarm_traj_relay"
         args="/planning/broadcast_traj_send /planning/broadcast_traj_recv"
         output="screen"/>
 
-  <node pkg="planning" type="delayed_trigger.py"
-        name="delayed_triger_for_real_field_sim" output="screen">
-    <param name="topic" value="/triger"/>
-    <param name="delay" value="$(arg trigger_delay)"/>
-    <param name="publish_hz" value="10.0"/>
-    <param name="duration" value="2.0"/>
-  </node>
-
-  <node pkg="planning" type="real_field_evasion.py"
+  <node if="$(arg start_target_evasion)" pkg="planning" type="real_field_evasion.py"
         name="real_field_evasion" output="screen">
     <param name="publish_rate" value="100.0"/>
     <param name="max_cmd_speed" value="0.65"/>
     <param name="max_cmd_acc" value="1.2"/>
     <param name="target_z" value="$(arg target_z)"/>
     <param name="start_tolerance" value="0.7"/>
-    <param name="wait_for_trigger" value="true"/>
+    <param name="wait_for_trigger" value="$(arg target_wait_for_trigger)"/>
     <param name="trigger_topic" value="/triger"/>
-    <param name="post_trigger_delay" value="3.0"/>
+    <param name="post_trigger_delay" value="$(arg target_post_trigger_delay)"/>
   </node>
 
   <group ns="target">
@@ -105,12 +157,9 @@
   </group>
 
   <group ns="drone0">
-    <include file="$(find mapping)/launch/mapping.launch">
-      <arg name="init_x_" value="0.55"/>
-      <arg name="init_y_" value="1.85"/>
-      <arg name="init_z_" value="$(arg tracker_init_z)"/>
-      <arg name="max_speed_" value="$(arg tracker_vmax)"/>
-      <arg name="max_accel_" value="$(arg tracker_amax)"/>
+    <include file="$(find mapping)/launch/mapping_only.launch">
+      <arg name="resolution_" value="$(arg map_resolution)"/>
+      <arg name="inflate_size_" value="1"/>
     </include>
     <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
       <remap from="~gridmap"         to="gridmap"/>
@@ -171,12 +220,9 @@
   </group>
 
   <group ns="drone1">
-    <include file="$(find mapping)/launch/mapping.launch">
-      <arg name="init_x_" value="0.00"/>
-      <arg name="init_y_" value="1.15"/>
-      <arg name="init_z_" value="$(arg tracker_init_z)"/>
-      <arg name="max_speed_" value="$(arg tracker_vmax)"/>
-      <arg name="max_accel_" value="$(arg tracker_amax)"/>
+    <include file="$(find mapping)/launch/mapping_only.launch">
+      <arg name="resolution_" value="$(arg map_resolution)"/>
+      <arg name="inflate_size_" value="1"/>
     </include>
     <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
       <remap from="~gridmap"         to="gridmap"/>
@@ -237,12 +283,9 @@
   </group>
 
   <group ns="drone2">
-    <include file="$(find mapping)/launch/mapping.launch">
-      <arg name="init_x_" value="-0.55"/>
-      <arg name="init_y_" value="1.85"/>
-      <arg name="init_z_" value="$(arg tracker_init_z)"/>
-      <arg name="max_speed_" value="$(arg tracker_vmax)"/>
-      <arg name="max_accel_" value="$(arg tracker_amax)"/>
+    <include file="$(find mapping)/launch/mapping_only.launch">
+      <arg name="resolution_" value="$(arg map_resolution)"/>
+      <arg name="inflate_size_" value="1"/>
     </include>
     <node name="mapping_vis" pkg="mapping" type="mapping_vis_node">
       <remap from="~gridmap"         to="gridmap"/>

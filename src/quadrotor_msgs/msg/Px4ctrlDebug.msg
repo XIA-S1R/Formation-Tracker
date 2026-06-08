@@ -20,6 +20,7 @@ float64 des_q_w
 float64 des_thr
 float64 thr2acc
 float64 thr_scale_compensate
+float64 hover_percentage
 float64 voltage
 
 float64 err_axisang_x
@@ -30,4 +31,3 @@ float64 err_axisang_ang
 float64 fb_rate_x
 float64 fb_rate_y
 float64 fb_rate_z
-

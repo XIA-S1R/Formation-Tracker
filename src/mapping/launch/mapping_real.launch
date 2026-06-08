@@ -6,13 +6,16 @@
   <arg name="y_length_" default="40.0"/>
   <arg name="z_length_" default="20.0"/>
   <arg name="use_mask_" default="false"/>
+  <arg name="start_manager_" default="true"/>
+  <arg name="manager_name_" default="manager"/>
 
-  <node pkg="nodelet" type="nodelet" name="manager" args="manager" output="screen">
+  <node if="$(arg start_manager_)"
+        pkg="nodelet" type="nodelet" name="$(arg manager_name_)" args="manager" output="screen">
     <param name="num_worker_threads" value="$(arg num_worker_threads_)"/>
   </node>
 
   <node pkg="nodelet" type="nodelet" name="mapping"
-        args="load mapping/Nodelet manager" output="screen">
+        args="load mapping/Nodelet $(arg manager_name_)" output="screen">
     <remap from="~global_map" to="/global_map"/>
     <remap from="~gridmap_inflate" to="gridmap_inflate"/>
     <param name="use_global_map" value="true"/>

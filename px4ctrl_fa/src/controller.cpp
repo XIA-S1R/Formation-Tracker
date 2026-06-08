@@ -424,22 +424,28 @@ Eigen::Vector3d Controller::computePIDErrorAcc(
 
   // x acceleration
   double x_pos_error = std::isnan(des.p(0)) ? 0.0 : std::max(std::min(des.p(0) - odom.p(0), 1.0), -1.0);
-  double x_vel_error = std::max(std::min((des.v(0) + Kp(0) * x_pos_error) - odom.v(0), 1.0), -1.0);
-  acc_error(0) = Kv(0) * x_vel_error;
+  double x_des_vel = des.v(0) + Kp(0) * x_pos_error;
+  x_des_vel = std::max(std::min(x_des_vel, param.max_xy_vel), -param.max_xy_vel);
+  double x_vel_error = x_des_vel - odom.v(0);
+  acc_error(0) = std::max(std::min(Kv(0) * x_vel_error, param.max_xy_acc), -param.max_xy_acc);
 
   // y acceleration
   double y_pos_error = std::isnan(des.p(1)) ? 0.0 : std::max(std::min(des.p(1) - odom.p(1), 1.0), -1.0);
-  double y_vel_error = std::max(std::min((des.v(1) + Kp(1) * y_pos_error) - odom.v(1), 1.0), -1.0);
-  acc_error(1) = Kv(1) * y_vel_error;
+  double y_des_vel = des.v(1) + Kp(1) * y_pos_error;
+  y_des_vel = std::max(std::min(y_des_vel, param.max_xy_vel), -param.max_xy_vel);
+  double y_vel_error = y_des_vel - odom.v(1);
+  acc_error(1) = std::max(std::min(Kv(1) * y_vel_error, param.max_xy_acc), -param.max_xy_acc);
 
   // z acceleration
   double z_pos_error = std::isnan(des.p(2)) ? 0.0 : std::max(std::min(des.p(2) - odom.p(2), 1.0), -1.0);
-  double z_vel_error = std::max(std::min((des.v(2) + Kp(2) * z_pos_error) - odom.v(2), 1.0), -1.0);
-  acc_error(2) = Kv(2) * z_vel_error;
+  double z_des_vel = des.v(2) + Kp(2) * z_pos_error;
+  z_des_vel = std::max(std::min(z_des_vel, param.max_z_vel), -param.max_z_vel);
+  double z_vel_error = z_des_vel - odom.v(2);
+  acc_error(2) = std::max(std::min(Kv(2) * z_vel_error, param.max_z_acc), -param.max_z_acc);
 
-  debug.des_v_x = (des.v(0) + Kp(0) * x_pos_error); //debug
-  debug.des_v_y = (des.v(1) + Kp(1) * y_pos_error);
-  debug.des_v_z = (des.v(2) + Kp(2) * z_pos_error);
+  debug.des_v_x = x_des_vel; //debug
+  debug.des_v_y = y_des_vel;
+  debug.des_v_z = z_des_vel;
 
   return acc_error;
 }
@@ -451,6 +457,7 @@ Eigen::Vector3d Controller::computeLimitedTotalAcc(
 {
   Eigen::Vector3d total_acc;
   total_acc = PIDErrorAcc + ref_acc - Gravity - drag_acc;
+  total_acc(2) = std::max(std::min(total_acc(2) - param.gra, param.max_z_acc), -param.max_z_acc) + param.gra;
 
   // Limit angle
   if (param.max_angle > 0)

@@ -1,4 +1,5 @@
 #include "input.h"
+#include <cmath>
 
 RC_Data_t::RC_Data_t()
 {
@@ -35,6 +36,11 @@ void RC_Data_t::feed(mavros_msgs::RCInConstPtr pMsg)
             ch[i] = 0.0;
     }
 
+    // Radio mapping by channel number:
+    // CH5/SB -> px4ctrl hover/offboard enable
+    // CH6/SC -> px4ctrl command mode enable
+    // CH7/SA -> PX4 kill, handled by the flight controller
+    // CH8/SD -> reboot command path below, not used in normal flight
     mode = ((double)msg.channels[4] - 1000.0) / 1000.0;
     gear = ((double)msg.channels[5] - 1000.0) / 1000.0;
     reboot_cmd = ((double)msg.channels[7] - 1000.0) / 1000.0;
@@ -57,7 +63,8 @@ void RC_Data_t::feed(mavros_msgs::RCInConstPtr pMsg)
         last_reboot_cmd = reboot_cmd;
     }
 
-    // 1
+    // CH5/SB enters AUTO_HOVER on the middle -> high edge. PX4 keeps
+    // low/middle assigned to STABILIZED and leaves high for OFFBOARD.
     if (last_mode < API_MODE_THRESHOLD_VALUE && mode > API_MODE_THRESHOLD_VALUE)
         enter_hover_mode = true;
     else
@@ -205,7 +212,15 @@ State_Data_t::State_Data_t()
 
 void State_Data_t::feed(mavros_msgs::StateConstPtr pMsg)
 {
-
+    if (!have_last_state)
+    {
+        last_state = *pMsg;
+        have_last_state = true;
+    }
+    else
+    {
+        last_state = current_state;
+    }
     current_state = *pMsg;
 }
 
@@ -225,6 +240,21 @@ Command_Data_t::Command_Data_t()
 
 void Command_Data_t::feed(quadrotor_msgs::PositionCommandConstPtr pMsg)
 {
+    auto finite_point = [](const geometry_msgs::Point& p) {
+        return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+    };
+    auto finite_vec = [](const geometry_msgs::Vector3& v) {
+        return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+    };
+
+    if (!finite_point(pMsg->position) || !finite_vec(pMsg->velocity) ||
+        !finite_vec(pMsg->acceleration) || !finite_vec(pMsg->jerk) ||
+        !std::isfinite(pMsg->yaw) || !std::isfinite(pMsg->yaw_dot) ||
+        std::abs(pMsg->yaw_dot) > 10.0)
+    {
+        ROS_ERROR_THROTTLE(1.0, "[px4ctrl] Drop invalid position command: yaw=%f, yaw_dot=%f", pMsg->yaw, pMsg->yaw_dot);
+        return;
+    }
 
     msg = *pMsg;
     rcv_stamp = ros::Time::now();
@@ -247,7 +277,7 @@ void Command_Data_t::feed(quadrotor_msgs::PositionCommandConstPtr pMsg)
 
     // std::cout << "j1=" << j.transpose() << std::endl;
 
-    yaw = uav_utils::normalize_angle(msg.yaw);
+    yaw = std::remainder(msg.yaw, 2.0 * M_PI);
     yaw_rate = msg.yaw_dot;
 }
 

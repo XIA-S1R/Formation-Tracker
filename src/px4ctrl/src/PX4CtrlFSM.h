@@ -87,6 +87,7 @@ public:
 private:
 	State_t state; // Should only be changed in PX4CtrlFSM::process() function!
 	AutoTakeoffLand_t takeoff_land;
+	ros::Time thrust_estimator_start_time_;
 
 	// ---- control related ----
 	Desired_State_t get_hover_des();

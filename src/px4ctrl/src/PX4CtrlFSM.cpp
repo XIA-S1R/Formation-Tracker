@@ -1,16 +1,21 @@
 #include "PX4CtrlFSM.h"
 #include <uav_utils/converters.h>
 
+namespace
+{
+constexpr double kThrustEstimatorStartDelay = 0.5;
+}
+
 using namespace std;
 using namespace uav_utils;
 
-PX4CtrlFSM::PX4CtrlFSM(Parameter_t &param_, Controller &controller_, const ros::NodeHandle &nh) : param(param_), controller(controller_),
-                                                                                            nh_(nh) /*, thrust_curve(thrust_curve_)*/
+PX4CtrlFSM::PX4CtrlFSM(Parameter_t &param_, Controller &controller_, const ros::NodeHandle &nh) : nh_(nh), param(param_),
+                                                                                            controller(controller_) /*, thrust_curve(thrust_curve_)*/
 {
     // 默认手动飞行 并将悬停状态归零
 	state = MANUAL_CTRL;
-    state = MANUAL_CTRL;
 	hover_pose.setZero();
+	thrust_estimator_start_time_ = ros::Time(0);
     px4ctrl_data_pub_ = nh_.advertise<quadrotor_msgs::Px4ctrlData>("/px4ctrl/data_to_gs", 10);
     px4ctrl_data_pub_timer_ = nh_.createTimer(ros::Duration(0.05), boost::bind(&PX4CtrlFSM::px4ctrlDataPub, this));
 }
@@ -47,7 +52,6 @@ void PX4CtrlFSM::process()
 	Controller_Output_t u;
 	bool rotor_low_speed_during_land = false;
 	Desired_State_t des(odom_data);         // 期望姿态
-	bool rotor_low_speed_during_land = false;
 
 	// STEP1: state machine runs
 	switch (state)
@@ -59,20 +63,17 @@ void PX4CtrlFSM::process()
 		{
             // 定位检查
 			if (!odom_is_received(now_time))
-			if (!odom_is_received(now_time))
 			{
 				ROS_ERROR("[px4ctrl] Reject AUTO_HOVER(L2). No odom!");
 				break;
 			}
             // 命令检查
 			if (cmd_is_received(now_time))
-			if (cmd_is_received(now_time))
 			{
 				ROS_ERROR("[px4ctrl] Reject AUTO_HOVER(L2). You are sending commands before toggling into AUTO_HOVER, which is not allowed. Stop sending commands now!");
 				break;
 			}
             // 当前速度检查
-			if (odom_data.v.norm() > 3.0)
 			if (odom_data.v.norm() > 3.0)
 			{
 				ROS_ERROR("[px4ctrl] Reject AUTO_HOVER(L2). Odom_Vel=%fm/s, which seems that the locolization module goes wrong!", odom_data.v.norm());
@@ -81,6 +82,7 @@ void PX4CtrlFSM::process()
 
 			state = AUTO_HOVER;
 			controller.resetThrustMapping();
+			thrust_estimator_start_time_ = now_time + ros::Duration(kThrustEstimatorStartDelay);
 			set_hov_with_odom();
 			toggle_offboard_mode(true);
 
@@ -139,7 +141,6 @@ void PX4CtrlFSM::process()
 			}
             // 无人机解锁
 			if (param.takeoff_land.enable_auto_arm)
-			if (param.takeoff_land.enable_auto_arm)
 			{
 				toggle_arm_disarm(true);
 			}
@@ -164,7 +165,6 @@ void PX4CtrlFSM::process()
 	case AUTO_HOVER:
 	{
         // 退出自动悬停模式判定
-		if (!rc_data.is_hover_mode || !odom_is_received(now_time))
 		if (!rc_data.is_hover_mode || !odom_is_received(now_time))
 		{
 			state = MANUAL_CTRL;
@@ -215,7 +215,6 @@ void PX4CtrlFSM::process()
 		set_hov_with_odom();
         // 若丢失位置信息，则直接强行进入手动控制模式
 		if (!rc_data.is_hover_mode || !odom_is_received(now_time))
-		if (!rc_data.is_hover_mode || !odom_is_received(now_time))
 		{
 			state = MANUAL_CTRL;
 			toggle_offboard_mode(false);
@@ -223,7 +222,6 @@ void PX4CtrlFSM::process()
 			ROS_WARN("[px4ctrl] From CMD_CTRL(L3) to MANUAL_CTRL(L1)!");
 		}
         // 无命令输入，则进入自动悬停模式
-		else if (!rc_data.is_command_mode || !cmd_is_received(now_time))
 		else if (!rc_data.is_command_mode || !cmd_is_received(now_time))
 		{
 			state = AUTO_HOVER;
@@ -255,6 +253,8 @@ void PX4CtrlFSM::process()
 		else if (odom_data.p(2) >= (takeoff_land.start_pose(2) + param.takeoff_land.height)) // reach the desired height
 		{
 			state = AUTO_HOVER;
+			controller.resetThrustMapping();
+			thrust_estimator_start_time_ = now_time + ros::Duration(kThrustEstimatorStartDelay);
 			set_hov_with_odom();
 			ROS_INFO("\033[32m[px4ctrl] AUTO_TAKEOFF --> AUTO_HOVER(L2)\033[32m");
 
@@ -322,7 +322,6 @@ void PX4CtrlFSM::process()
 	}
     case EMERGENCY_LAND:
     {
-    {
         return;
     }
 
@@ -331,9 +330,19 @@ void PX4CtrlFSM::process()
 	}
 
 	// STEP2: estimate thrust model
-	if (state == AUTO_HOVER || state == CMD_CTRL)
+	const bool thrust_estimator_active =
+		(state == AUTO_HOVER || state == CMD_CTRL) &&
+		state_data.current_state.armed &&
+		state_data.current_state.mode == "OFFBOARD" &&
+		now_time >= thrust_estimator_start_time_;
+
+	if (thrust_estimator_active)
 	{
 		controller.estimateThrustModel(imu_data.a, bat_data.volt, param);
+	}
+	else
+	{
+		controller.clearThrustHistory();
 	}
 
 	// STEP3: solve and update new control commands
@@ -369,6 +378,11 @@ void PX4CtrlFSM::process()
 	else
 	{
 		publish_attitude_ctrl(u, now_time);
+	}
+
+	if (thrust_estimator_active)
+	{
+		controller.recordThrust(now_time, u.thrust);
 	}
 
 	// STEP5: Detect if the drone has landed
@@ -516,16 +530,14 @@ void PX4CtrlFSM::set_hov_with_rc()
 	double delta_t = (now - last_set_hover_pose_time).toSec();
 	last_set_hover_pose_time = now;
 
-    // 按步长进行自动悬停的遥控器控制
-    // 该方法产生的速度与推杆量大小无关，只与推杆方向有关
-	hover_pose(0) += rc_data.ch[param.rule_pitch_] * param.max_manual_vel * delta_t * (param.rc_reverse.pitch ? 1 : -1);
+	// 按步长进行自动悬停的遥控器控制
+	// 该方法产生的速度与推杆量大小无关，只与推杆方向有关
 	hover_pose(0) += rc_data.ch[param.rule_pitch_] * param.max_manual_vel * delta_t * (param.rc_reverse.pitch ? 1 : -1);
 	hover_pose(1) += rc_data.ch[param.rule_roll_] * param.max_manual_vel * delta_t * (param.rc_reverse.roll ? 1 : -1);
 	hover_pose(2) += rc_data.ch[param.rule_throttle_] * param.max_manual_vel * delta_t * (param.rc_reverse.throttle ? 1 : -1);
 	hover_pose(3) += rc_data.ch[param.rule_yaw_] * param.max_manual_vel * delta_t * (param.rc_reverse.yaw ? 1 : -1);
 
     // 在此处强制限制了z轴的偏移量，但是具体控制还不清楚有没有限制
-	if (hover_pose(2) < -0.3)
 	if (hover_pose(2) < -0.3)
 		hover_pose(2) = -0.3;
 

@@ -35,6 +35,50 @@ def obstacle_bounds(obstacle, size):
     }
 
 
+def boundary_bounds(config):
+    field = config["field"]
+    boundary = config.get("boundary_obstacles", {})
+    bounds = []
+    step = float(config.get("sampling_step_m", 0.05))
+    x_min = float(field["x_min_m"])
+    x_max = float(field["x_max_m"])
+    y_min = float(field["y_min_m"])
+    y_max = float(field["y_max_m"])
+    z_min = float(field["z_min_m"])
+    z_max = float(field["z_max_m"])
+
+    def add_box(name, bx_min, bx_max, by_min, by_max, bz_min, bz_max):
+        bounds.append(
+            {
+                "name": name,
+                "x_min": bx_min,
+                "x_max": bx_max,
+                "y_min": by_min,
+                "y_max": by_max,
+                "z_min": bz_min,
+                "z_max": bz_max,
+                "right_front": (bx_max, by_max),
+            }
+        )
+
+    if boundary.get("enable_floor", False):
+        thickness = max(step, float(boundary.get("floor_thickness_m", step)))
+        add_box("floor", x_min, x_max, y_min, y_max, z_min, min(z_max, z_min + thickness))
+
+    if boundary.get("enable_ceiling", False):
+        thickness = max(step, float(boundary.get("ceiling_thickness_m", step)))
+        add_box("ceiling", x_min, x_max, y_min, y_max, max(z_min, z_max - thickness), z_max)
+
+    if boundary.get("enable_walls", False):
+        thickness = max(step, float(boundary.get("wall_thickness_m", step)))
+        add_box("wall_x_min", x_min - thickness, x_min, y_min - thickness, y_max + thickness, z_min, z_max)
+        add_box("wall_x_max", x_max, x_max + thickness, y_min - thickness, y_max + thickness, z_min, z_max)
+        add_box("wall_y_min", x_min - thickness, x_max + thickness, y_min - thickness, y_min, z_min, z_max)
+        add_box("wall_y_max", x_min - thickness, x_max + thickness, y_max, y_max + thickness, z_min, z_max)
+
+    return bounds
+
+
 def generate_points(bounds, step):
     points = []
     for box in bounds:
@@ -91,7 +135,7 @@ def write_summary(path, config, bounds, points):
                 field["z_max_m"],
             )
         )
-        f.write("Launch lengths: map_x_length={:.3f}, map_y_length={:.3f}, map_z_length={:.3f}\n".format(x_len, y_len, z_len))
+        f.write("Field dimensions: x_length={:.3f}, y_length={:.3f}, z_length={:.3f}\n".format(x_len, y_len, z_len))
         f.write("Point count: {}\n\n".format(len(points)))
         for box in bounds:
             f.write(
@@ -152,12 +196,16 @@ def render_top_png(path, config, bounds):
 
     colors = [(224, 87, 71), (69, 137, 209), (79, 170, 91)]
     for idx, box in enumerate(bounds):
+        if box["name"] in ("floor", "ceiling"):
+            continue
         p0 = world_to_px(box["x_min"], box["y_max"])
         p1 = world_to_px(box["x_max"], box["y_min"])
-        draw.rectangle((*p0, *p1), fill=colors[idx % len(colors)], outline=(0, 0, 0), width=3)
-        rf = world_to_px(*box["right_front"])
-        draw.ellipse((rf[0] - 6, rf[1] - 6, rf[0] + 6, rf[1] + 6), fill=(0, 0, 0))
-        draw.text((rf[0] + 8, rf[1] - 18), f"{box['name']} RF", fill=(0, 0, 0))
+        color = (90, 90, 90) if box["name"].startswith("wall_") else colors[idx % len(colors)]
+        draw.rectangle((*p0, *p1), fill=color, outline=(0, 0, 0), width=3)
+        if not box["name"].startswith("wall_"):
+            rf = world_to_px(*box["right_front"])
+            draw.ellipse((rf[0] - 6, rf[1] - 6, rf[0] + 6, rf[1] + 6), fill=(0, 0, 0))
+            draw.text((rf[0] + 8, rf[1] - 18), f"{box['name']} RF", fill=(0, 0, 0))
         center = world_to_px((box["x_min"] + box["x_max"]) / 2.0, (box["y_min"] + box["y_max"]) / 2.0)
         draw.text((center[0] - 26, center[1] - 8), box["name"], fill=(255, 255, 255))
 
@@ -257,6 +305,7 @@ def main():
 
     config = json.loads(config_path.read_text(encoding="utf-8"))
     bounds = [obstacle_bounds(obs, config["obstacle_size_m"]) for obs in config["obstacles"]]
+    bounds.extend(boundary_bounds(config))
     points = generate_points(bounds, float(config["sampling_step_m"]))
 
     csv_path = out_dir / "real_field_obstacles.csv"

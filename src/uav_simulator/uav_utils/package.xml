@@ -1,22 +1,16 @@
 <?xml version="1.0"?>
 <package format="2">
-  <name>real_uav_bridge</name>
+  <name>uav_utils</name>
   <version>0.0.0</version>
-  <description>UDP bridge between the ground planner and onboard PX4 controllers.</description>
+  <description>Header-only utility helpers used by the simulator and px4ctrl.</description>
 
   <maintainer email="uav@example.com">uav</maintainer>
   <license>GPLv3</license>
 
   <buildtool_depend>catkin</buildtool_depend>
-
   <depend>roscpp</depend>
   <depend>rospy</depend>
-  <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
-  <depend>sensor_msgs</depend>
-  <depend>quadrotor_msgs</depend>
-  <depend>pcl_ros</depend>
-  <depend>pcl_conversions</depend>
 
   <export/>
 </package>

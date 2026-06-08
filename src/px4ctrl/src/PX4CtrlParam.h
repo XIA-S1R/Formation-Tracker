@@ -74,6 +74,10 @@ public:
 	double mass;
 	double gra;
 	double max_angle;
+	double max_xy_vel;
+	double max_xy_acc;
+	double max_z_vel;
+	double max_z_acc;
 	double ctrl_freq_max;
 	double max_manual_vel;
 	double low_voltage;

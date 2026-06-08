@@ -154,6 +154,10 @@ public:
 
 	bool almostZeroThrust(const double thrust_value) const;
 
+	void recordThrust(const ros::Time &stamp, const double thrust);
+
+	void clearThrustHistory(void);
+
 	void resetThrustMapping(void);
 
 private:

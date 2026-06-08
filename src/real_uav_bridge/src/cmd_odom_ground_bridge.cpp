@@ -20,7 +20,11 @@ class GroundBridge {
     pnh_.param("cmd_topic", cmd_topic_, std::string("position_cmd"));
     pnh_.param("odom_topic", odom_topic_, std::string("odom"));
     pnh_.param("trigger_topic", trigger_topic_, std::string("traj_start_trigger"));
+    pnh_.param("enable_topic", enable_topic_, std::string("/triger"));
+    pnh_.param("send_before_enable", send_before_enable_, false);
     pnh_.param("stats_period", stats_period_, 2.0);
+
+    command_enabled_.store(send_before_enable_);
 
     send_fd_ = rub::createUdpSocket();
     recv_fd_ = rub::createUdpSocket();
@@ -34,15 +38,20 @@ class GroundBridge {
 
     cmd_sub_ = nh_.subscribe(cmd_topic_, 20, &GroundBridge::cmdCallback, this,
                              ros::TransportHints().tcpNoDelay());
+    if (!send_before_enable_ && !enable_topic_.empty()) {
+      enable_sub_ = nh_.subscribe(enable_topic_, 5, &GroundBridge::enableCallback, this,
+                                  ros::TransportHints().tcpNoDelay());
+    }
     odom_pub_ = nh_.advertise<nav_msgs::Odometry>(odom_topic_, 20);
     trigger_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(trigger_topic_, 10);
     stats_timer_ = nh_.createTimer(ros::Duration(std::max(0.5, stats_period_)),
                                    &GroundBridge::statsCallback, this);
 
     recv_thread_ = std::thread(&GroundBridge::recvLoop, this);
-    ROS_WARN("[ground_bridge] cmd %s -> %s:%d, UDP listen=%d, odom -> %s, trigger -> %s",
+    ROS_WARN("[ground_bridge] cmd %s -> %s:%d, UDP listen=%d, odom -> %s, trigger -> %s, gate=%s",
              cmd_topic_.c_str(), drone_ip_.c_str(), cmd_port_, listen_port_,
-             odom_topic_.c_str(), trigger_topic_.c_str());
+             odom_topic_.c_str(), trigger_topic_.c_str(),
+             command_enabled_.load() ? "open" : enable_topic_.c_str());
   }
 
   ~GroundBridge() {
@@ -56,8 +65,18 @@ class GroundBridge {
 
  private:
   void cmdCallback(const quadrotor_msgs::PositionCommandConstPtr& msg) {
+    if (!command_enabled_.load()) {
+      ++cmd_dropped_count_;
+      return;
+    }
     if (rub::sendPacket(send_fd_, drone_addr_, rub::PacketType::POSITION_CMD, *msg)) {
       ++cmd_sent_count_;
+    }
+  }
+
+  void enableCallback(const geometry_msgs::PoseStampedConstPtr&) {
+    if (!command_enabled_.exchange(true)) {
+      ROS_WARN("[ground_bridge] command gate opened by %s", enable_topic_.c_str());
     }
   }
 
@@ -106,15 +125,18 @@ class GroundBridge {
   }
 
   void statsCallback(const ros::TimerEvent&) {
-    ROS_INFO("[ground_bridge] sent_cmd=%llu recv_odom=%llu recv_trigger=%llu",
+    ROS_INFO("[ground_bridge] sent_cmd=%llu dropped_cmd=%llu recv_odom=%llu recv_trigger=%llu gate=%s",
              static_cast<unsigned long long>(cmd_sent_count_.load()),
+             static_cast<unsigned long long>(cmd_dropped_count_.load()),
              static_cast<unsigned long long>(odom_recv_count_.load()),
-             static_cast<unsigned long long>(trigger_recv_count_.load()));
+             static_cast<unsigned long long>(trigger_recv_count_.load()),
+             command_enabled_.load() ? "open" : "closed");
   }
 
   ros::NodeHandle nh_;
   ros::NodeHandle pnh_;
   ros::Subscriber cmd_sub_;
+  ros::Subscriber enable_sub_;
   ros::Publisher odom_pub_;
   ros::Publisher trigger_pub_;
   ros::Timer stats_timer_;
@@ -123,16 +145,20 @@ class GroundBridge {
   std::string cmd_topic_;
   std::string odom_topic_;
   std::string trigger_topic_;
+  std::string enable_topic_;
   int cmd_port_ = 18000;
   int listen_port_ = 18100;
   double stats_period_ = 2.0;
+  bool send_before_enable_ = false;
 
   int send_fd_ = -1;
   int recv_fd_ = -1;
   sockaddr_in drone_addr_;
   std::thread recv_thread_;
   std::atomic<bool> running_{true};
+  std::atomic<bool> command_enabled_{false};
   std::atomic<uint64_t> cmd_sent_count_{0};
+  std::atomic<uint64_t> cmd_dropped_count_{0};
   std::atomic<uint64_t> odom_recv_count_{0};
   std::atomic<uint64_t> trigger_recv_count_{0};
 };

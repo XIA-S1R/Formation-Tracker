@@ -4,6 +4,7 @@ project(real_uav_bridge)
 add_compile_options(-std=c++14)
 
 find_package(catkin REQUIRED COMPONENTS
+  rospy
   roscpp
   geometry_msgs
   nav_msgs
@@ -15,7 +16,7 @@ find_package(catkin REQUIRED COMPONENTS
 find_package(PCL REQUIRED COMPONENTS io)
 
 catkin_package(
-  CATKIN_DEPENDS roscpp geometry_msgs nav_msgs sensor_msgs quadrotor_msgs pcl_ros pcl_conversions
+  CATKIN_DEPENDS rospy roscpp geometry_msgs nav_msgs sensor_msgs quadrotor_msgs pcl_ros pcl_conversions
 )
 
 include_directories(
@@ -46,3 +47,8 @@ add_executable(static_pointcloud_map_publisher
 )
 add_dependencies(static_pointcloud_map_publisher ${catkin_EXPORTED_TARGETS})
 target_link_libraries(static_pointcloud_map_publisher ${catkin_LIBRARIES} ${PCL_LIBRARIES})
+
+catkin_install_python(PROGRAMS
+  scripts/mocap_udp_odom_receiver.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)

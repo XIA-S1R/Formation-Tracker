@@ -1,0 +1,59 @@
+<launch>
+  <arg name="drone0_ip" default="192.168.1.101"/>
+  <arg name="drone1_ip" default="192.168.1.102"/>
+  <arg name="drone2_ip" default="192.168.1.103"/>
+  <arg name="drone0_cmd_port" default="18000"/>
+  <arg name="drone1_cmd_port" default="18001"/>
+  <arg name="drone2_cmd_port" default="18002"/>
+  <arg name="drone0_ground_port" default="18100"/>
+  <arg name="drone1_ground_port" default="18101"/>
+  <arg name="drone2_ground_port" default="18102"/>
+  <arg name="enable_topic" default="/triger"/>
+  <arg name="send_before_enable" default="false"/>
+  <arg name="stats_period" default="2.0"/>
+
+  <group ns="drone0">
+    <node pkg="real_uav_bridge" type="cmd_odom_ground_bridge"
+          name="position_cmd_sender" output="screen">
+      <param name="drone_ip" value="$(arg drone0_ip)"/>
+      <param name="cmd_port" value="$(arg drone0_cmd_port)"/>
+      <param name="listen_port" value="$(arg drone0_ground_port)"/>
+      <param name="cmd_topic" value="position_cmd"/>
+      <param name="odom_topic" value="unused_udp_odom"/>
+      <param name="trigger_topic" value="traj_start_trigger"/>
+      <param name="enable_topic" value="$(arg enable_topic)"/>
+      <param name="send_before_enable" value="$(arg send_before_enable)"/>
+      <param name="stats_period" value="$(arg stats_period)"/>
+    </node>
+  </group>
+
+  <group ns="drone1">
+    <node pkg="real_uav_bridge" type="cmd_odom_ground_bridge"
+          name="position_cmd_sender" output="screen">
+      <param name="drone_ip" value="$(arg drone1_ip)"/>
+      <param name="cmd_port" value="$(arg drone1_cmd_port)"/>
+      <param name="listen_port" value="$(arg drone1_ground_port)"/>
+      <param name="cmd_topic" value="position_cmd"/>
+      <param name="odom_topic" value="unused_udp_odom"/>
+      <param name="trigger_topic" value="traj_start_trigger"/>
+      <param name="enable_topic" value="$(arg enable_topic)"/>
+      <param name="send_before_enable" value="$(arg send_before_enable)"/>
+      <param name="stats_period" value="$(arg stats_period)"/>
+    </node>
+  </group>
+
+  <group ns="drone2">
+    <node pkg="real_uav_bridge" type="cmd_odom_ground_bridge"
+          name="position_cmd_sender" output="screen">
+      <param name="drone_ip" value="$(arg drone2_ip)"/>
+      <param name="cmd_port" value="$(arg drone2_cmd_port)"/>
+      <param name="listen_port" value="$(arg drone2_ground_port)"/>
+      <param name="cmd_topic" value="position_cmd"/>
+      <param name="odom_topic" value="unused_udp_odom"/>
+      <param name="trigger_topic" value="traj_start_trigger"/>
+      <param name="enable_topic" value="$(arg enable_topic)"/>
+      <param name="send_before_enable" value="$(arg send_before_enable)"/>
+      <param name="stats_period" value="$(arg stats_period)"/>
+    </node>
+  </group>
+</launch>

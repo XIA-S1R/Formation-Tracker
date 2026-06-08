@@ -84,7 +84,9 @@ class State_Data_t
 {
 public:
   mavros_msgs::State current_state;
+  mavros_msgs::State last_state;
   mavros_msgs::State state_before_offboard;
+  bool have_last_state{false};
 
   State_Data_t();
   void feed(mavros_msgs::StateConstPtr pMsg);

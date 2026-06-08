@@ -13,9 +13,14 @@
   <depend>roscpp</depend>
   <depend>std_msgs</depend>
   <depend>object_detection_msgs</depend>
+  <depend>tracking_msgs</depend>
+  <depend>quadrotor_msgs</depend>
+  <depend>mapping</depend>
   <depend>message_filters</depend>
   <depend>nav_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>pcl_conversions</depend>
+  <depend>pcl_ros</depend>
   <exec_depend>message_runtime</exec_depend>
 
 </package>

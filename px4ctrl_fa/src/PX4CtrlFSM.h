@@ -78,6 +78,8 @@ public:
 	bool recv_new_odom();
 	State_t get_state() { return state; }
 	bool get_landed() { return takeoff_land.landed; };
+	bool fcu_in_offboard() const;
+	bool fcu_entered_offboard() const;
 
     // connect to ground station
     ros::Publisher px4ctrl_data_pub_;

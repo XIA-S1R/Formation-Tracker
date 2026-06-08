@@ -1,5 +1,14 @@
 #include "controller.h"
 
+namespace
+{
+constexpr double kInitialThrustMappingCovariance = 1.0;
+constexpr double kMinThrustForHoverEstimate = 0.15;
+constexpr double kMaxThrustForHoverEstimate = 0.75;
+constexpr double kMinEstimatedHoverPercentage = 0.1;
+constexpr double kMaxEstimatedHoverPercentage = 0.8;
+}
+
 using namespace std;
 
 Controller::Controller(Parameter_t &param_) : param(param_)
@@ -61,11 +70,6 @@ quadrotor_msgs::Px4ctrlDebug Controller::update_alg1(
 
   u.q = imu.q * odom.q.inverse() * desired_attitude; // Align with FCU frame
   u.bodyrates += feedback_bodyrates;
-
-  // Used for thrust-accel mapping estimation
-  timed_thrust.push(std::pair<ros::Time, double>(ros::Time::now(), u.thrust));
-  while (timed_thrust.size() > 100)
-    timed_thrust.pop();
 
   return debug; //debug
 };
@@ -171,10 +175,6 @@ void Controller::update_alg2(
     u.q = imu.q * odom.q.inverse() * desired_attitude; // Align with FCU frame
   }
 
-  // Used for thrust-accel mapping estimation
-  timed_thrust.push(std::pair<ros::Time, double>(ros::Time::now(), u.thrust));
-  while (timed_thrust.size() > 100)
-    timed_thrust.pop();
 };
 
 void Controller::computeAeroCompensatedReferenceInputs(
@@ -424,22 +424,28 @@ Eigen::Vector3d Controller::computePIDErrorAcc(
 
   // x acceleration
   double x_pos_error = std::isnan(des.p(0)) ? 0.0 : std::max(std::min(des.p(0) - odom.p(0), 1.0), -1.0);
-  double x_vel_error = std::max(std::min((des.v(0) + Kp(0) * x_pos_error) - odom.v(0), 1.0), -1.0);
-  acc_error(0) = Kv(0) * x_vel_error;
+  double x_des_vel = des.v(0) + Kp(0) * x_pos_error;
+  x_des_vel = std::max(std::min(x_des_vel, param.max_xy_vel), -param.max_xy_vel);
+  double x_vel_error = x_des_vel - odom.v(0);
+  acc_error(0) = std::max(std::min(Kv(0) * x_vel_error, param.max_xy_acc), -param.max_xy_acc);
 
   // y acceleration
   double y_pos_error = std::isnan(des.p(1)) ? 0.0 : std::max(std::min(des.p(1) - odom.p(1), 1.0), -1.0);
-  double y_vel_error = std::max(std::min((des.v(1) + Kp(1) * y_pos_error) - odom.v(1), 1.0), -1.0);
-  acc_error(1) = Kv(1) * y_vel_error;
+  double y_des_vel = des.v(1) + Kp(1) * y_pos_error;
+  y_des_vel = std::max(std::min(y_des_vel, param.max_xy_vel), -param.max_xy_vel);
+  double y_vel_error = y_des_vel - odom.v(1);
+  acc_error(1) = std::max(std::min(Kv(1) * y_vel_error, param.max_xy_acc), -param.max_xy_acc);
 
   // z acceleration
   double z_pos_error = std::isnan(des.p(2)) ? 0.0 : std::max(std::min(des.p(2) - odom.p(2), 1.0), -1.0);
-  double z_vel_error = std::max(std::min((des.v(2) + Kp(2) * z_pos_error) - odom.v(2), 1.0), -1.0);
-  acc_error(2) = Kv(2) * z_vel_error;
+  double z_des_vel = des.v(2) + Kp(2) * z_pos_error;
+  z_des_vel = std::max(std::min(z_des_vel, param.max_z_vel), -param.max_z_vel);
+  double z_vel_error = z_des_vel - odom.v(2);
+  acc_error(2) = std::max(std::min(Kv(2) * z_vel_error, param.max_z_acc), -param.max_z_acc);
 
-  debug.des_v_x = (des.v(0) + Kp(0) * x_pos_error); //debug
-  debug.des_v_y = (des.v(1) + Kp(1) * y_pos_error);
-  debug.des_v_z = (des.v(2) + Kp(2) * z_pos_error);
+  debug.des_v_x = x_des_vel; //debug
+  debug.des_v_y = y_des_vel;
+  debug.des_v_z = z_des_vel;
 
   return acc_error;
 }
@@ -451,6 +457,7 @@ Eigen::Vector3d Controller::computeLimitedTotalAcc(
 {
   Eigen::Vector3d total_acc;
   total_acc = PIDErrorAcc + ref_acc - Gravity - drag_acc;
+  total_acc(2) = std::max(std::min(total_acc(2) - param.gra, param.max_z_acc), -param.max_z_acc) + param.gra;
 
   // Limit angle
   if (param.max_angle > 0)
@@ -608,19 +615,29 @@ bool Controller::estimateThrustModel(
       /***********************************/
       /* Model: est_a(2) = thr2acc * thr */
       /***********************************/
+      if (thr < kMinThrustForHoverEstimate || thr > kMaxThrustForHoverEstimate)
+      {
+        ROS_WARN_THROTTLE(1.0, "Skip thrust model sample. thrust=%f is outside hover-estimation range.", thr);
+        return false;
+      }
+
       double gamma = 1 / (rho2 + thr * P * thr);
       double K = gamma * P * thr;
-      thr2acc = thr2acc + K * (est_a(2) - thr * thr2acc);
-      P = (1 - K * thr) * P / rho2;
+      const double candidate_thr2acc = thr2acc + K * (est_a(2) - thr * thr2acc);
+      const double candidate_P = (1 - K * thr) * P / rho2;
       //printf("%6.3f,%6.3f,%6.3f,%6.3f\n", thr2acc, gamma, K, P);
       //fflush(stdout);
-      const double hover_percentage = param.gra / thr2acc;
-      if ( hover_percentage > 0.8 || hover_percentage < 0.1 )
+      const double hover_percentage = param.gra / candidate_thr2acc;
+      if (hover_percentage > kMaxEstimatedHoverPercentage || hover_percentage < kMinEstimatedHoverPercentage)
       {
-        ROS_ERROR("Estimated hover_percentage >0.8 or <0.1! Perhaps the accel vibration is too high!");
-        thr2acc = hover_percentage > 0.8 ? param.gra / 0.8 : thr2acc;
-        thr2acc = hover_percentage < 0.1 ? param.gra / 0.1 : thr2acc;
+        ROS_WARN_THROTTLE(1.0, "Reject thrust model sample. estimated hover_percentage=%f is outside [%f, %f].",
+                          hover_percentage, kMinEstimatedHoverPercentage, kMaxEstimatedHoverPercentage);
+        debug.hover_percentage = param.gra / thr2acc;
+        return false;
       }
+
+      thr2acc = candidate_thr2acc;
+      P = candidate_P;
       debug.hover_percentage = hover_percentage; // debug
       if ( param.thr_map.print_val )
       {
@@ -634,10 +651,26 @@ bool Controller::estimateThrustModel(
   return false;
 }
 
+void Controller::recordThrust(const ros::Time &stamp, const double thrust)
+{
+  timed_thrust.push(std::pair<ros::Time, double>(stamp, thrust));
+  while (timed_thrust.size() > 100)
+    timed_thrust.pop();
+}
+
+void Controller::clearThrustHistory(void)
+{
+  std::queue<std::pair<ros::Time, double>> empty;
+  timed_thrust.swap(empty);
+}
+
 // 重置简易推力模型
 void Controller::resetThrustMapping(void)
 {
+  clearThrustHistory();
   thr2acc = param.gra / param.thr_map.hover_percentage;
   thr_scale_compensate = 1.0;
-  P = 1e6;
+  P = kInitialThrustMappingCovariance;
+  debug.hover_percentage = param.thr_map.hover_percentage;
+  debug.thr_scale_compensate = thr_scale_compensate;
 }

@@ -12,11 +12,9 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   quadrotor_msgs
   geometry_msgs
-  nav_msgs
   sensor_msgs
   uav_utils
   mavros
-  mavros_msgs
 )
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
@@ -40,7 +38,7 @@ add_executable(px4ctrl_node
   src/input.cpp
 )
 
-add_dependencies(px4ctrl_node ${catkin_EXPORTED_TARGETS})
+add_dependencies(px4ctrl_node quadrotor_msgs)
 
 target_link_libraries(px4ctrl_node
   ${catkin_LIBRARIES}

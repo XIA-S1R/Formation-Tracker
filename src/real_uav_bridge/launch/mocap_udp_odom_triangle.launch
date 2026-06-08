@@ -1,0 +1,46 @@
+<launch>
+  <arg name="listen_ip" default="0.0.0.0"/>
+  <arg name="drone0_port" default="5005"/>
+  <arg name="drone1_port" default="5006"/>
+  <arg name="drone2_port" default="5007"/>
+  <arg name="drone0_tracker" default=""/>
+  <arg name="drone1_tracker" default=""/>
+  <arg name="drone2_tracker" default=""/>
+  <arg name="frame_id" default="world"/>
+
+  <group ns="drone0">
+    <node pkg="real_uav_bridge" type="mocap_udp_odom_receiver.py"
+          name="mocap_udp_odom_receiver" output="screen">
+      <param name="listen_ip" value="$(arg listen_ip)"/>
+      <param name="listen_port" value="$(arg drone0_port)"/>
+      <param name="tracker_name" value="$(arg drone0_tracker)"/>
+      <param name="odom_topic" value="odom"/>
+      <param name="frame_id" value="$(arg frame_id)"/>
+      <param name="child_frame_id" value="drone0"/>
+    </node>
+  </group>
+
+  <group ns="drone1">
+    <node pkg="real_uav_bridge" type="mocap_udp_odom_receiver.py"
+          name="mocap_udp_odom_receiver" output="screen">
+      <param name="listen_ip" value="$(arg listen_ip)"/>
+      <param name="listen_port" value="$(arg drone1_port)"/>
+      <param name="tracker_name" value="$(arg drone1_tracker)"/>
+      <param name="odom_topic" value="odom"/>
+      <param name="frame_id" value="$(arg frame_id)"/>
+      <param name="child_frame_id" value="drone1"/>
+    </node>
+  </group>
+
+  <group ns="drone2">
+    <node pkg="real_uav_bridge" type="mocap_udp_odom_receiver.py"
+          name="mocap_udp_odom_receiver" output="screen">
+      <param name="listen_ip" value="$(arg listen_ip)"/>
+      <param name="listen_port" value="$(arg drone2_port)"/>
+      <param name="tracker_name" value="$(arg drone2_tracker)"/>
+      <param name="odom_topic" value="odom"/>
+      <param name="frame_id" value="$(arg frame_id)"/>
+      <param name="child_frame_id" value="drone2"/>
+    </node>
+  </group>
+</launch>

@@ -73,6 +73,7 @@ class Nodelet : public nodelet::Nodelet {
   double search_desired_yaw_ = 0.0;            // 搜索模式期望偏航角
   double search_yaw_scan_range_deg_ = 45.0;    // 搜索模式偏航扫描半幅（度）
   double search_yaw_scan_freq_hz_ = 0.25;       // 搜索模式偏航扫描频率（Hz）
+  double search_altitude_floor_ = 2.0;         // 搜索模式安全高度下限
   double post_reacquire_boost_sec_ = 3.0;      // 退出搜索后的增强跟踪窗口
   bool post_reacquire_boost_active_ = false;   // 增强跟踪是否激活
   ros::Time post_reacquire_boost_end_time_ = ros::Time(0);
@@ -104,6 +105,9 @@ class Nodelet : public nodelet::Nodelet {
   bool obs_clip_enable_ = true;
   double obs_clip_range_ = 10.0;
   double obs_clip_margin_ = 0.5;
+  bool retry_dense_sampling_enable_ = true;
+  int retry_dense_sampling_multiplier_ = 2;
+  int retry_dense_sampling_max_k_ = 32;
   bool planner_visualization_ = false;
   ros::Time last_hard_replan_stamp_ = ros::Time(0);
   ros::Time last_map_stamp_ = ros::Time(0);
@@ -759,7 +763,7 @@ class Nodelet : public nodelet::Nodelet {
             const auto& sp = search_targets_.poses[idx];
             target_p.x() = sp.position.x;
             target_p.y() = sp.position.y;
-            target_p.z() = std::max(2.0, sp.position.z);
+            target_p.z() = std::max(search_altitude_floor_, sp.position.z);
             Eigen::Quaterniond sp_q(sp.orientation.w, sp.orientation.x, sp.orientation.y, sp.orientation.z);
             if (sp_q.norm() > 1e-6) {
               sp_q.normalize();
@@ -776,7 +780,7 @@ class Nodelet : public nodelet::Nodelet {
           if (dir.head<2>().norm() > 1e-2) {
             search_desired_yaw_ = std::atan2(dir.y(), dir.x());
           }
-          target_p.z() = std::max(2.0, odom_p.z());  // 保持安全高度
+          target_p.z() = std::max(search_altitude_floor_, odom_p.z());  // 保持安全高度
         }
         search_scan_base_yaw = std::atan2(std::sin(search_desired_yaw_), std::cos(search_desired_yaw_));
         use_search_yaw_scan = false;
@@ -1026,6 +1030,10 @@ class Nodelet : public nodelet::Nodelet {
     std::vector<Eigen::Vector3d> visible_ps;
     std::vector<double> thetas;
     Trajectory traj;
+    std::vector<Eigen::MatrixXd> hPolys;
+    std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> keyPts;
+    Eigen::MatrixXd finState;
+    finState.setZero(3, 3);
     if (generate_new_traj_success) {
       if (planner_visualization_ || debug_) {
         visPtr_->visualize_path(path, "astar");
@@ -1071,9 +1079,6 @@ class Nodelet : public nodelet::Nodelet {
       //   envPtr_->pts2path(way_pts, path);
       // }
       // NOTE corridor generating (only needed for hard constraint mode)
-      std::vector<Eigen::MatrixXd> hPolys;
-      std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> keyPts;
-
       if (!trajOptPtr_->use_soft_constraint_) {
         ROS_DEBUG("[drone %d] starting generateSFC", trajOptPtr_->drone_id_);
         envPtr_->generateSFC(path, 2.0, hPolys, keyPts);
@@ -1085,8 +1090,6 @@ class Nodelet : public nodelet::Nodelet {
       }
 
       // NOTE trajectory optimization
-      Eigen::MatrixXd finState;
-      finState.setZero(3, 3);
       finState.col(0) = path.back();
       finState.col(1) = target_v;
       ROS_DEBUG("[drone %d] starting traj optimization", trajOptPtr_->drone_id_);
@@ -1108,6 +1111,43 @@ class Nodelet : public nodelet::Nodelet {
     refreshGridmapCache(false);
     if (generate_new_traj_success) {
       valid = validcheck(traj, replan_stamp);
+      if (!valid && retry_dense_sampling_enable_ && trajOptPtr_->use_soft_constraint_) {
+        const int old_k = trajOptPtr_->K_;
+        const int retry_k = std::min(retry_dense_sampling_max_k_,
+                                     std::max(old_k + 1, old_k * retry_dense_sampling_multiplier_));
+        if (retry_k > old_k) {
+          const std::string first_reason = last_validcheck_fail_reason_;
+          const double first_t = last_validcheck_fail_t_;
+          const Eigen::Vector3d first_p = last_validcheck_fail_p_;
+          ROS_WARN("[drone %d planner] dense-sampling retry: first validcheck failed "
+                   "(reason=%s, t=%.2f, p=[%.2f %.2f %.2f]), K %d -> %d",
+                   trajOptPtr_->drone_id_, first_reason.c_str(), first_t,
+                   first_p.x(), first_p.y(), first_p.z(), old_k, retry_k);
+          trajOptPtr_->K_ = retry_k;
+          Trajectory retry_traj;
+          bool retry_success = trajOptPtr_->generate_traj(
+              iniState, finState, target_predcit, hPolys, path, retry_traj);
+          trajOptPtr_->K_ = old_k;
+          if (retry_success) {
+            bool retry_valid = validcheck(retry_traj, replan_stamp);
+            if (retry_valid) {
+              traj = retry_traj;
+              valid = true;
+              generate_new_traj_success = true;
+              ROS_WARN("[drone %d planner] dense-sampling retry success", trajOptPtr_->drone_id_);
+            } else {
+              ROS_WARN("[drone %d planner] dense-sampling retry still invalid "
+                       "(reason=%s, t=%.2f, p=[%.2f %.2f %.2f])",
+                       trajOptPtr_->drone_id_, last_validcheck_fail_reason_.c_str(),
+                       last_validcheck_fail_t_, last_validcheck_fail_p_.x(),
+                       last_validcheck_fail_p_.y(), last_validcheck_fail_p_.z());
+            }
+          } else {
+            ROS_WARN("[drone %d planner] dense-sampling retry optimization failed",
+                     trajOptPtr_->drone_id_);
+          }
+        }
+      }
     } else {
       replanStateMsg_.state = -2;
       replanState_pub_.publish(replanStateMsg_);
@@ -1576,16 +1616,23 @@ class Nodelet : public nodelet::Nodelet {
     nh.param("obs_clip_enable", obs_clip_enable_, true);
     nh.param("obs_clip_range", obs_clip_range_, 10.0);
     nh.param("obs_clip_margin", obs_clip_margin_, 0.5);
+    nh.param("retry_dense_sampling_enable", retry_dense_sampling_enable_, true);
+    nh.param("retry_dense_sampling_multiplier", retry_dense_sampling_multiplier_, 2);
+    nh.param("retry_dense_sampling_max_k", retry_dense_sampling_max_k_, 32);
     obs_clip_range_ = std::max(0.5, obs_clip_range_);
     obs_clip_margin_ = std::max(0.0, std::min(obs_clip_margin_, obs_clip_range_ - 0.1));
+    retry_dense_sampling_multiplier_ = std::max(2, retry_dense_sampling_multiplier_);
+    retry_dense_sampling_max_k_ = std::max(1, retry_dense_sampling_max_k_);
     nh.param("formation_heading_speed_thresh", formation_heading_speed_thresh_, 0.2);
     nh.param("search_yaw_scan_range_deg", search_yaw_scan_range_deg_, 45.0);
     nh.param("search_yaw_scan_freq_hz", search_yaw_scan_freq_hz_, 0.25);
+    nh.param("search_altitude_floor", search_altitude_floor_, 2.0);
     nh.param("post_reacquire_boost_sec", post_reacquire_boost_sec_, 3.0);
     nh.param("planner_visualization", planner_visualization_, false);
     post_reacquire_boost_sec_ = std::max(0.0, post_reacquire_boost_sec_);
     search_yaw_scan_range_deg_ = std::max(0.0, search_yaw_scan_range_deg_);
     search_yaw_scan_freq_hz_ = std::max(0.0, search_yaw_scan_freq_hz_);
+    search_altitude_floor_ = std::max(0.0, search_altitude_floor_);
     nh.getParam("debug", debug_);
     nh.getParam("fake", fake_);
     nh.getParam("vmax", vmax_);
